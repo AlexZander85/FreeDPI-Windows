@@ -63,6 +63,7 @@ pub struct AutoTune {
     /// Минимальный success rate для активации tune
     tune_threshold: f64,
     /// Максимальное количество попыток tune
+    #[allow(dead_code)]
     max_tune_attempts: u32,
 }
 

@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
 /// Имя сервиса WinDivert в SCM.
 const WINDIVERT_SERVICE_NAME: &str = "WinDivert";
@@ -127,8 +127,8 @@ pub fn install_driver() -> Result<()> {
         Err(e) => {
             let error_code = e.code().0;
             unsafe {
-                windows::Win32::System::Services::CloseServiceHandle(service);
-                windows::Win32::System::Services::CloseServiceHandle(scm);
+                let _ = windows::Win32::System::Services::CloseServiceHandle(service);
+                let _ = windows::Win32::System::Services::CloseServiceHandle(scm);
             }
 
             match error_code {
@@ -166,9 +166,9 @@ pub fn install_driver() -> Result<()> {
 
     // Cleanup: помечаем сервис для удаления (auto-cleanup как в sing-box)
     unsafe {
-        windows::Win32::System::Services::DeleteService(service);
-        windows::Win32::System::Services::CloseServiceHandle(service);
-        windows::Win32::System::Services::CloseServiceHandle(scm);
+        let _ = windows::Win32::System::Services::DeleteService(service);
+        let _ = windows::Win32::System::Services::CloseServiceHandle(service);
+        let _ = windows::Win32::System::Services::CloseServiceHandle(scm);
     }
 
     debug!("WinDivert driver installed (service marked for deletion)");

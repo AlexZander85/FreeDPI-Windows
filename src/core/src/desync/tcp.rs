@@ -19,15 +19,13 @@
 //!
 //! ## Источник
 
-use crate::desync::{DesyncConfig, DesyncResult, DesyncTechnique};
-use crate::desync::{parse_ip_header, parse_tcp_packet, build_ip_packet};
+#![allow(clippy::useless_conversion)]
+
+use crate::desync::DesyncResult;
+use crate::desync::{parse_ip_header, parse_tcp_packet};
 use pnet_packet::tcp::TcpFlags;
-use pnet_packet::ip::IpNextHeaderProtocols;
 use std::net::Ipv4Addr;
 use tracing::debug;
-
-/// Максимальный TCP payload для MTU-safe отправки.
-const MAX_TCP_PAYLOAD: usize = 1460;
 
 /// Pre-allocated template для TCP сегментов.
 /// Уменьшает аллокации при построении inject пакетов.
@@ -54,6 +52,7 @@ impl TcpSegmentWriter {
     }
 
     /// Заполняет буфер TCP сегментом с указанными параметрами.
+    #[allow(clippy::too_many_arguments)]
     pub fn write(&self, buf: &mut Vec<u8>, seq: u32, ack: u32,
                  flags: u8, payload: &[u8], ttl: u8, ident: u16) {
         buf.clear();
@@ -65,6 +64,7 @@ impl TcpSegmentWriter {
         buf[24..28].copy_from_slice(&seq.to_be_bytes());
         buf[28..32].copy_from_slice(&ack.to_be_bytes());
         buf[33] = flags;
+        buf.extend_from_slice(payload);
         let csum = crate::desync::ipv4_checksum(&buf[..20]);
         buf[10..12].copy_from_slice(&csum.to_be_bytes());
         let tc = crate::desync::tcp_checksum_v4(
@@ -73,7 +73,6 @@ impl TcpSegmentWriter {
             &buf[20..],
         );
         buf[36..38].copy_from_slice(&tc.to_be_bytes());
-        buf.extend_from_slice(payload);
     }
 }
 
@@ -212,7 +211,7 @@ pub fn fakedsplit(
     // Строим fake TLS ClientHello с указанным SNI
     let fake_payload = build_fake_clienthello(fake_sni);
 
-    // Fake сегмент с TTL-1
+    // Fake сегмент с TTL-1 — ТОТ ЖЕ SEQ что и оригинал
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
     let fake_seg = build_tcp_segment(
         ip.src, ip.dst, tcp.src_port, tcp.dst_port,
@@ -225,22 +224,11 @@ pub fn fakedsplit(
         generate_identification(ip.identification, 0),
     );
 
-    // Модифицируем оригинал: меняем SEQ + добавляем реальные данные
-    let new_seq = tcp.sequence.wrapping_add(fake_payload.len() as u32);
-    let modified = build_full_tcp_packet(
-        ip.src, ip.dst, tcp.src_port, tcp.dst_port,
-        new_seq,
-        tcp.acknowledgment,
-        TcpFlags::PSH | TcpFlags::ACK,
-        tcp.window,
-        tcp.payload,
-        ip.ttl,
-    );
-
     debug!("[Z4] FakeDataSplit: fake '{}' ({} bytes) + real ({} bytes)",
         fake_sni, fake_payload.len(), tcp.payload.len());
 
-    DesyncResult::modify_and_inject(modified, fake_seg)
+    // inject_only — оригинал проходит через Forward без модификации
+    DesyncResult::inject_only(fake_seg)
 }
 
 /// [Z6] TcpSeg: манипуляция TCP сегментацией.
@@ -249,7 +237,7 @@ pub fn fakedsplit(
 /// Разделяем payload на сегменты по `max_seg_size`. Отправляем все
 /// сегменты с PSH+ACK. DPI сбрасывает поток при превышении лимита
 /// сегментов. Сервер собирает всё по SEQ.
-pub fn tcpseg(packet: &bytes::Bytes, max_seg_size: usize, fake_ttl_offset: u8) -> DesyncResult {
+pub fn tcpseg(packet: &bytes::Bytes, max_seg_size: usize, _fake_ttl_offset: u8) -> DesyncResult {
     let ip = match parse_ip_header(packet) {
         Some(h) => h,
         None => return DesyncResult::passthrough(),
@@ -272,12 +260,6 @@ pub fn tcpseg(packet: &bytes::Bytes, max_seg_size: usize, fake_ttl_offset: u8) -
         let end = pos + max_seg_size;
         let seg = &tcp.payload[pos..end];
 
-        let fake_ttl = if inject.len().is_multiple_of(2) {
-            ip.ttl
-        } else {
-            ip.ttl.saturating_sub(fake_ttl_offset)
-        };
-
         let pkt = build_tcp_segment(
             ip.src, ip.dst, tcp.src_port, tcp.dst_port,
             tcp.sequence.wrapping_add(pos as u32),
@@ -285,7 +267,7 @@ pub fn tcpseg(packet: &bytes::Bytes, max_seg_size: usize, fake_ttl_offset: u8) -
             TcpFlags::PSH | TcpFlags::ACK,
             tcp.window,
             seg,
-            fake_ttl,
+            ip.ttl,
             generate_identification(ip.identification, inject.len()),
         );
         inject.push(pkt);
@@ -391,7 +373,7 @@ pub fn winsize(packet: &bytes::Bytes, new_window: u16) -> DesyncResult {
 
     debug!("[Z9] WinSize: {} → {}", tcp.window, new_window);
 
-    DesyncResult::modified_only(buf.to_vec())
+    DesyncResult::modified_only(buf)
 }
 
 /// [Z10] SynHide: скрыть SYN от DPI.
@@ -574,6 +556,48 @@ pub fn oob_injection(
 
 // ==================== Вспомогательные функции ====================
 
+/// Строит полный IP+TCP пакет — одна аллокация вместо трёх.
+#[allow(clippy::too_many_arguments)]
+fn build_ip_tcp_packet(
+    src_ip: Ipv4Addr, dst_ip: Ipv4Addr,
+    src_port: u16, dst_port: u16,
+    seq: u32, ack: u32, flags: u8, window: u16,
+    payload: &[u8], ttl: u8, identification: u16,
+) -> bytes::Bytes {
+    let tcp_header_len = 20;
+    let total_len = 20 + tcp_header_len + payload.len();
+    let mut buf = vec![0u8; total_len];
+
+    // IP header (bytes 0..20)
+    buf[0] = 0x45;
+    buf[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    buf[4..6].copy_from_slice(&identification.to_be_bytes());
+    buf[8] = ttl;
+    buf[9] = 6; // TCP
+    buf[12..16].copy_from_slice(&src_ip.octets());
+    buf[16..20].copy_from_slice(&dst_ip.octets());
+
+    // TCP header (bytes 20..40)
+    buf[20..22].copy_from_slice(&src_port.to_be_bytes());
+    buf[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    buf[24..28].copy_from_slice(&seq.to_be_bytes());
+    buf[28..32].copy_from_slice(&ack.to_be_bytes());
+    buf[32] = 0x50; // data offset = 5
+    buf[33] = flags;
+    buf[34..36].copy_from_slice(&window.to_be_bytes());
+
+    // Payload (bytes 40..)
+    buf[40..].copy_from_slice(payload);
+
+    // Checksums
+    let ip_csum = crate::desync::ipv4_checksum(&buf[..20]);
+    buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+    let tcp_csum = crate::desync::tcp_checksum_v4(src_ip, dst_ip, &buf[20..]);
+    buf[36..38].copy_from_slice(&tcp_csum.to_be_bytes());
+
+    bytes::Bytes::from(buf)
+}
+
 /// Строит полный IP+TCP пакет.
 #[allow(clippy::too_many_arguments)]
 fn build_full_tcp_packet(
@@ -588,30 +612,10 @@ fn build_full_tcp_packet(
     payload: &[u8],
     ttl: u8,
 ) -> bytes::Bytes {
-    let tcp_header_len = 20;
-    let mut tcp_buf = vec![0u8; tcp_header_len];
-    {
-        let mut tcp = MutableTcpPacket::new(&mut tcp_buf).unwrap();
-        tcp.set_source(src_port);
-        tcp.set_destination(dst_port);
-        tcp.set_sequence(seq);
-        tcp.set_acknowledgement(ack);
-        tcp.set_data_offset(5);
-        tcp.set_flags(flags);
-        tcp.set_window(window);
-        tcp.set_checksum(0);
-        tcp.set_urgent_ptr(0);
-        // tcp drops here
-    }
-    let checksum = crate::desync::tcp_checksum_v4(src_ip, dst_ip, &tcp_buf);
-    tcp_buf[16..18].copy_from_slice(&checksum.to_be_bytes());
-
-    let mut full_payload = tcp_buf.to_vec();
-    full_payload.extend_from_slice(payload);
-    build_ip_packet(src_ip, dst_ip, IpNextHeaderProtocols::Tcp, ttl, 0, &full_payload)
+    build_ip_tcp_packet(src_ip, dst_ip, src_port, dst_port, seq, ack, flags, window, payload, ttl, 0)
 }
 
-/// Строит TCP сегмент (без полного payload — будет injected отдельно).
+/// Строит TCP сегмент — одна аллокация.
 #[allow(clippy::too_many_arguments)]
 fn build_tcp_segment(
     src_ip: Ipv4Addr,
@@ -626,27 +630,7 @@ fn build_tcp_segment(
     ttl: u8,
     identification: u16,
 ) -> bytes::Bytes {
-    let tcp_header_len = 20;
-    let mut tcp_buf = vec![0u8; tcp_header_len];
-    {
-        let mut tcp = MutableTcpPacket::new(&mut tcp_buf).unwrap();
-        tcp.set_source(src_port);
-        tcp.set_destination(dst_port);
-        tcp.set_sequence(seq);
-        tcp.set_acknowledgement(ack);
-        tcp.set_data_offset(5);
-        tcp.set_flags(flags);
-        tcp.set_window(window);
-        tcp.set_checksum(0);
-        tcp.set_urgent_ptr(0);
-        // tcp drops here
-    }
-    let checksum = crate::desync::tcp_checksum_v4(src_ip, dst_ip, &tcp_buf);
-    tcp_buf[16..18].copy_from_slice(&checksum.to_be_bytes());
-
-    let mut full_payload = tcp_buf.to_vec();
-    full_payload.extend_from_slice(payload);
-    build_ip_packet(src_ip, dst_ip, IpNextHeaderProtocols::Tcp, ttl, identification, &full_payload)
+    build_ip_tcp_packet(src_ip, dst_ip, src_port, dst_port, seq, ack, flags, window, payload, ttl, identification)
 }
 
 /// Строит минимальный fake TLS ClientHello с указанным SNI.
@@ -744,9 +728,6 @@ fn build_sni_extension(sni_bytes: &[u8]) -> bytes::Bytes {
 fn generate_identification(base: u16, index: usize) -> u16 {
     base.wrapping_add(index as u16 + 1)
 }
-
-/// Утилита: mutable TCP packet wrapper.
-use pnet_packet::tcp::MutableTcpPacket;
 
 // ==================== P3: Оставшиеся TCP техники ====================
 
@@ -879,7 +860,7 @@ pub fn mss_clamp(
 
     debug!("[W2] MssClamp: MSS={}", mss_value);
 
-    DesyncResult::modified_only(buf.to_vec())
+    DesyncResult::modified_only(buf)
 }
 
 /// [W3] AckSuppress: подавление ACK.
@@ -1142,7 +1123,7 @@ pub fn win_scale_manip(
 
     debug!("[W7] WinScaleManip: window={}, scale=0", new_window);
 
-    DesyncResult::modified_only(buf.to_vec())
+    DesyncResult::modified_only(buf)
 }
 
 /// [RP3] Disorder: отправка сегментов в обратном порядке с TTL.
@@ -1586,7 +1567,7 @@ pub fn port_shuffle(
 
     debug!("[CT8] PortShuffle: {} → {}", tcp.src_port, new_port);
 
-    DesyncResult::modified_only(buf.to_vec())
+    DesyncResult::modified_only(buf)
 }
 
 /// [RP14] Wclamp: Window Clamp + Drop SACK.
@@ -1655,7 +1636,7 @@ pub fn wclamp(
 
     debug!("[RP14] Wclamp: window={}, SACK removed", new_window);
 
-    DesyncResult::modified_only(buf.to_vec())
+    DesyncResult::modified_only(buf)
 }
 
 /// [RP13] TsMd5: TCP Timestamp манипуляция.
@@ -1724,7 +1705,7 @@ pub fn ts_md5(
 
     debug!("[RP13] TsMd5: TSval={:#x}", ts_val);
 
-    DesyncResult::modified_only(buf.to_vec())
+    DesyncResult::modified_only(buf)
 }
 
 // ==================== Вспомогательные функции P3 ====================
@@ -1744,26 +1725,7 @@ fn build_tcp_segment_p3(
     ttl: u8,
     identification: u16,
 ) -> bytes::Bytes {
-    let tcp_header_len = 20;
-    let mut tcp_buf = vec![0u8; tcp_header_len];
-    {
-        let mut tcp = MutableTcpPacket::new(&mut tcp_buf).unwrap();
-        tcp.set_source(src_port);
-        tcp.set_destination(dst_port);
-        tcp.set_sequence(seq);
-        tcp.set_acknowledgement(ack);
-        tcp.set_data_offset(5);
-        tcp.set_flags(flags);
-        tcp.set_window(window);
-        tcp.set_checksum(0);
-        tcp.set_urgent_ptr(0);
-    }
-    let checksum = crate::desync::tcp_checksum_v4(src_ip, dst_ip, &tcp_buf);
-    tcp_buf[16..18].copy_from_slice(&checksum.to_be_bytes());
-
-    let mut full_payload = tcp_buf.to_vec();
-    full_payload.extend_from_slice(payload);
-    build_ip_packet(src_ip, dst_ip, IpNextHeaderProtocols::Tcp, ttl, identification, &full_payload)
+    build_ip_tcp_packet(src_ip, dst_ip, src_port, dst_port, seq, ack, flags, window, payload, ttl, identification)
 }
 
 /// Строит fake HTTP запрос для HostFake.
@@ -2089,7 +2051,7 @@ pub fn syn_ack_split(packet: &[u8]) -> DesyncResult {
 
     let ack_seg = build_tcp_segment_p3(
         ip.src, ip.dst, tcp.src_port, tcp.dst_port,
-        tcp.sequence + 1, tcp.acknowledgment + 1, TcpFlags::ACK,
+        tcp.sequence.wrapping_add(1), tcp.acknowledgment.wrapping_add(1), TcpFlags::ACK,
         tcp.window, &[], ip.ttl,
         generate_identification(ip.identification, 1),
     );

@@ -270,8 +270,8 @@ pub fn sni_microfrag(
     );
 
     DesyncResult {
-        modified: Some(bytes::Bytes::from(modified)),
-        inject: inject.into_iter().map(bytes::Bytes::from).collect(),
+        modified: Some(modified),
+        inject,
         drop: false,
     }
 }
@@ -463,7 +463,7 @@ pub fn sni_masking(packet: &[u8], mask_byte: u8) -> DesyncResult {
             }
 
             // Пересчитываем TCP checksum
-            let tcp_len = modified.len() - tcp_offset;
+            let _tcp_len = modified.len() - tcp_offset;
             let src_ip = ip.src;
             let dst_ip = ip.dst;
             let tcp_csum = crate::desync::tcp_checksum_v4(src_ip, dst_ip, &modified[tcp_offset..]);
@@ -509,4 +509,248 @@ mod tests {
         pkt[42] = 0x01; // Version: TLS 1.0
         pkt
     }
+}
+
+/// TLS Version Overwrite — перезапись version field в record header.
+///
+/// ## Принцип (Demergi)
+/// DPI фильтрует по record-layer version. Замена на TLS 1.3 (0x0304)
+/// сбивает fingerprinting. Комбинируется с Record Re-wrapping.
+pub fn tls_version_overwrite(packet: &[u8]) -> DesyncResult {
+    let ip = match parse_ip_header(packet) {
+        Some(h) => h,
+        None => return DesyncResult::passthrough(),
+    };
+    let tcp_data = &packet[ip.header_len..];
+    let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
+        Some(t) => t,
+        None => return DesyncResult::passthrough(),
+    };
+    let data_offset = tcp.get_data_offset() as usize * 4;
+    let payload = &tcp_data[data_offset..];
+
+    if payload.len() < 5 || payload[0] != 0x16 {
+        return DesyncResult::passthrough();
+    }
+
+    let mut modified = packet.to_vec();
+    let payload_start = ip.header_len + data_offset;
+    modified[payload_start + 1] = 0x03;
+    modified[payload_start + 2] = 0x04; // TLS 1.3
+
+    // Пересчитываем IP checksum
+    let ip_csum = ipv4_checksum(&modified[..20]);
+    modified[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+    debug!("[TLS] VersionOverwrite: TLS 1.3 spoof");
+    DesyncResult::modified_only(modified)
+}
+
+/// TLS Record Re-wrapping — каждый фрагмент получает валидный record header.
+///
+/// ## Принцип (GreenTunnel)
+/// Вместо простого TCP-level split, разбиваем TLS record payload на chunk_size
+/// байтных кусков. Каждый кусок оборачиваем в НОВЫЙ TLS record header:
+/// [ContentType(1) + Version(2) + Length(2) + chunk].
+///
+/// DPI, проверяющие TLS record boundaries, видят N валидных записей вместо одного.
+pub fn tls_record_rewrap(
+    packet: &[u8],
+    chunk_size: usize,
+    fake_ttl_offset: u8,
+) -> DesyncResult {
+    let ip = match parse_ip_header(packet) {
+        Some(h) => h,
+        None => return DesyncResult::passthrough(),
+    };
+    let tcp_data = &packet[ip.header_len..];
+    let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
+        Some(t) => t,
+        None => return DesyncResult::passthrough(),
+    };
+    let data_offset = tcp.get_data_offset() as usize * 4;
+    let payload = &tcp_data[data_offset..];
+
+    if payload.len() < 5 || payload[0] != 0x16 || chunk_size == 0 {
+        return DesyncResult::passthrough();
+    }
+
+    let content_type = payload[0];
+    let _version = [payload[1], payload[2]];
+    let record_payload = &payload[5..];
+
+    let mut rewrapped = Vec::with_capacity(record_payload.len() + record_payload.len() / chunk_size * 5);
+    let tls_13_version = [0x03, 0x04]; // TLS 1.3 — комбинируется с Version Spoof
+    for chunk in record_payload.chunks(chunk_size) {
+        rewrapped.push(content_type);
+        rewrapped.extend_from_slice(&tls_13_version);
+        rewrapped.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+        rewrapped.extend_from_slice(chunk);
+    }
+
+    let seq = tcp.get_sequence();
+    let ack = tcp.get_acknowledgement();
+    let window = tcp.get_window();
+
+    let inject_pkt = build_tcp_with_payload(
+        ip.src, ip.dst, tcp.get_source(), tcp.get_destination(),
+        seq, ack, TcpFlags::PSH | TcpFlags::ACK, window,
+        &rewrapped,
+        ip.ttl.saturating_sub(fake_ttl_offset),
+        ip.identification.wrapping_add(1),
+    );
+
+    debug!("[TLS] RecordRewrap: {} chunks × {} bytes", rewrapped.len() / (chunk_size + 5), chunk_size);
+    DesyncResult::inject_only(inject_pkt)
+}
+
+/// SNI-Targeted Record Fragmentation — разбиение SNI на 2B chunks.
+///
+/// ## Принцип (NoDPI)
+/// Извлекаем SNI extension из ClientHello, разбиваем доменное имя
+/// на 2-байтные куски. Каждый кусок оборачиваем в TLS 1.3 record header.
+/// DPI не может собрать SNI из фрагментов.
+pub fn sni_record_frag(
+    packet: &[u8],
+    chunk_size: usize,
+    fake_ttl_offset: u8,
+) -> DesyncResult {
+    let ip = match parse_ip_header(packet) {
+        Some(h) => h,
+        None => return DesyncResult::passthrough(),
+    };
+    let tcp_data = &packet[ip.header_len..];
+    let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
+        Some(t) => t,
+        None => return DesyncResult::passthrough(),
+    };
+    let data_offset = tcp.get_data_offset() as usize * 4;
+    let payload = &tcp_data[data_offset..];
+
+    if payload.len() < 5 || payload[0] != 0x16 {
+        return DesyncResult::passthrough();
+    }
+
+    // TLS record: [ContentType(1) + Version(2) + Length(2) + HandshakeType(1) + ...]
+    let record_payload = &payload[5..];
+    if record_payload.len() < 6 || record_payload[0] != 0x01 {
+        return DesyncResult::passthrough(); // Не ClientHello
+    }
+
+    // Ищем SNI extension: type = 0x0000
+    let mut pos = 38; // пропускаем: handshake_type(1) + len(3) + version(2) + random(32)
+    if pos >= record_payload.len() {
+        return DesyncResult::passthrough();
+    }
+
+    // Session ID
+    let session_id_len = record_payload[pos] as usize;
+    pos += 1 + session_id_len;
+    if pos + 2 > record_payload.len() {
+        return DesyncResult::passthrough();
+    }
+
+    // Cipher Suites
+    let cs_len = u16::from_be_bytes([record_payload[pos], record_payload[pos + 1]]) as usize;
+    pos += 2 + cs_len;
+    if pos + 1 > record_payload.len() {
+        return DesyncResult::passthrough();
+    }
+
+    // Compression Methods
+    let cm_len = record_payload[pos] as usize;
+    pos += 1 + cm_len;
+    if pos + 2 > record_payload.len() {
+        return DesyncResult::passthrough();
+    }
+
+    // Extensions Length
+    let ext_len = u16::from_be_bytes([record_payload[pos], record_payload[pos + 1]]) as usize;
+    pos += 2;
+    let ext_end = pos + ext_len;
+
+    // Walk extensions
+    while pos + 4 <= ext_end && pos + 4 <= record_payload.len() {
+        let ext_type = u16::from_be_bytes([record_payload[pos], record_payload[pos + 1]]);
+        let ext_len = u16::from_be_bytes([record_payload[pos + 2], record_payload[pos + 3]]) as usize;
+
+        if ext_type == 0x0000 && pos + 4 + ext_len <= record_payload.len() {
+            // SNI extension found
+            let sni_ext = &record_payload[pos + 4..pos + 4 + ext_len];
+            if sni_ext.len() > 5 {
+                // ServerNameList(2) + ServerNameType(1) + NameLen(2) + Name
+                let name_len = u16::from_be_bytes([sni_ext[3], sni_ext[4]]) as usize;
+                if name_len > 0 && 5 + name_len <= sni_ext.len() {
+                    let sni_start_in_payload = 5 + pos + 4 + 5; // record_offset + ext_start + sni_header
+                    let sni_end_in_payload = sni_start_in_payload + name_len;
+
+                    return build_sni_frag_result(
+                        packet, &tcp, &ip,
+                        data_offset, payload,
+                        sni_start_in_payload, sni_end_in_payload,
+                        chunk_size, fake_ttl_offset,
+                    );
+                }
+            }
+        }
+        pos += 4 + ext_len;
+    }
+
+    DesyncResult::passthrough()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_sni_frag_result(
+    _packet: &[u8],
+    tcp: &pnet_packet::tcp::TcpPacket,
+    ip: &crate::desync::ParsedIpHeader,
+    _data_offset: usize,
+    payload: &[u8],
+    sni_start: usize,
+    sni_end: usize,
+    chunk_size: usize,
+    fake_ttl_offset: u8,
+) -> DesyncResult {
+    let pre_sni = &payload[..sni_start];
+    let sni = &payload[sni_start..sni_end];
+    let post_sni = &payload[sni_end..];
+
+    let mut rewrapped = Vec::with_capacity(payload.len() + sni.len());
+    let header_13 = [0x16u8, 0x03, 0x04]; // TLS 1.3 record header
+
+    // Pre-SNI chunks
+    for chunk in pre_sni.chunks(chunk_size) {
+        rewrapped.extend_from_slice(&header_13);
+        rewrapped.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+        rewrapped.extend_from_slice(chunk);
+    }
+
+    // SNI chunks (именно SNI разбиваем на 2B)
+    for chunk in sni.chunks(chunk_size) {
+        rewrapped.extend_from_slice(&header_13);
+        rewrapped.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+        rewrapped.extend_from_slice(chunk);
+    }
+
+    // Post-SNI chunks
+    for chunk in post_sni.chunks(chunk_size) {
+        rewrapped.extend_from_slice(&header_13);
+        rewrapped.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+        rewrapped.extend_from_slice(chunk);
+    }
+
+    let seq = tcp.get_sequence();
+    let ack = tcp.get_acknowledgement();
+    let window = tcp.get_window();
+
+    let inject_pkt = build_tcp_with_payload(
+        ip.src, ip.dst, tcp.get_source(), tcp.get_destination(),
+        seq, ack, TcpFlags::PSH | TcpFlags::ACK, window,
+        &rewrapped,
+        ip.ttl.saturating_sub(fake_ttl_offset),
+        ip.identification.wrapping_add(1),
+    );
+
+    debug!("[TLS] SniRecordFrag: SNI {} bytes → {} chunks", sni.len(), sni.len().div_ceil(chunk_size));
+    DesyncResult::inject_only(inject_pkt)
 }

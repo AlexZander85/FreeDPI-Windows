@@ -27,6 +27,8 @@ trust-dns-resolver.workspace = true
 reqwest.workspace = true
 ipnet.workspace = true
 rand = "0.8"
+getrandom = "0.2"
+crossbeam = "0.8"
 
 [features]
 default = []

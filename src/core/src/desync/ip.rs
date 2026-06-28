@@ -49,7 +49,6 @@ pub fn frag_overlap(
         return DesyncResult::passthrough();
     }
 
-    // Fake CH payload
     let fake_payload = build_fake_ch(fake_sni);
 
     // Фрагмент 1: fake CH, offset=0, MF=1, TTL-1
@@ -57,21 +56,27 @@ pub fn frag_overlap(
     let frag1 = build_ip_fragment(
         ip.src, ip.dst, ip.protocol,
         ip.identification.wrapping_add(1),
-        0,      // offset=0
-        true,   // MF=1
+        0,
+        true,
         frag1_ttl,
         &fake_payload,
     );
 
-    // Фрагмент 2: реальные данные, offset=20 (8-байт. единицы = 2),
-    // MF=0, нормальный TTL
-    let overlap_offset = 20usize; // байт offset
-    let frag2_offset_units = (overlap_offset / 8) as u16; // в 8-байт. единицах
+    // Динамический overlap_offset на основе TCP header length
+    let tcp_start = ip.header_len;
+    let tcp_header_len = if packet.len() > tcp_start + 12 {
+        ((packet[tcp_start + 12] >> 4) & 0xF) as usize * 4
+    } else {
+        20
+    };
+    let overlap_offset = tcp_header_len;
+    let frag2_offset_units = overlap_offset.div_ceil(8) as u16;
+
     let frag2 = build_ip_fragment(
         ip.src, ip.dst, ip.protocol,
         ip.identification.wrapping_add(1),
         frag2_offset_units,
-        false,  // MF=0
+        false,
         ip.ttl,
         payload,
     );
@@ -101,26 +106,26 @@ pub fn bad_checksum(packet: &[u8]) -> DesyncResult {
 
     let mut modified = packet.to_vec();
 
-    // Инвертируем IP header checksum
-    let csum_offset = 10; // bytes 10-11 in IP header
+    let csum_offset = 10;
     if csum_offset + 2 <= modified.len() {
         let old_csum = u16::from_be_bytes([
             modified[csum_offset],
             modified[csum_offset + 1],
         ]);
-        let new_csum = old_csum.wrapping_add(0x1234); // намеренно неправильный
+        let delta = crate::desync::rand::random_range(1, 65535) as u16;
+        let new_csum = old_csum.wrapping_add(delta);
         modified[csum_offset..csum_offset + 2]
             .copy_from_slice(&new_csum.to_be_bytes());
     }
 
-    // Также инвертируем TCP checksum
     let tcp_checksum_offset = ip.header_len + 16;
     if tcp_checksum_offset + 2 <= modified.len() {
         let old_tcp_csum = u16::from_be_bytes([
             modified[tcp_checksum_offset],
             modified[tcp_checksum_offset + 1],
         ]);
-        let new_tcp_csum = old_tcp_csum.wrapping_add(0x5678);
+        let delta = crate::desync::rand::random_range(1, 65535) as u16;
+        let new_tcp_csum = old_tcp_csum.wrapping_add(delta);
         modified[tcp_checksum_offset..tcp_checksum_offset + 2]
             .copy_from_slice(&new_tcp_csum.to_be_bytes());
     }
@@ -192,7 +197,7 @@ pub fn ip_frag_primitives(
 
     let mut inject: Vec<bytes::Bytes> = Vec::new();
     let mut pos = 0;
-    let mut frag_index = 0;
+    let frag_id = ip.identification.wrapping_add(1);
 
     while pos < payload.len() {
         let end = (pos + frag_size).min(payload.len());
@@ -200,22 +205,21 @@ pub fn ip_frag_primitives(
         let is_last = end >= payload.len();
 
         let frag_ttl = if is_last {
-            ip.ttl // последний — нормальный TTL
+            ip.ttl
         } else {
-            ip.ttl.saturating_sub(fake_ttl_offset) // промежуточные — TTL-1
+            ip.ttl.saturating_sub(fake_ttl_offset)
         };
 
         let frag = build_ip_fragment(
             ip.src, ip.dst, ip.protocol,
-            ip.identification.wrapping_add(frag_index as u16 + 1),
-            (pos / 8) as u16, // offset в 8-байтовых единицах
-            !is_last,         // MF = 1 если не последний
+            frag_id,
+            (pos / 8) as u16,
+            !is_last,
             frag_ttl,
             frag_payload,
         );
         inject.push(frag);
         pos = end;
-        frag_index += 1;
     }
 
     debug!("[Z15] IpFragPrimitives: {} fragments × {} bytes max",

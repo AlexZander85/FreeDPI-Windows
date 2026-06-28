@@ -1,35 +1,41 @@
 //! Buffer Pool — кэш буферов для desync (уменьшает malloc/free).
+//!
+//! Thread-local pool без блокировок.
+//! Каждый поток имеет собственный пул буферов — нулевой contention.
 
-use std::sync::Mutex;
+const POOL_MAX_CAPACITY: usize = 65535;
+const POOL_MAX_BUFFERS: usize = 32;
 
-const POOL_MAX_SIZE: usize = 1600;
-const POOL_CAPACITY: usize = 32;
+thread_local! {
+    static POOL: std::cell::RefCell<Vec<Vec<u8>>> =
+        std::cell::RefCell::new(Vec::with_capacity(POOL_MAX_BUFFERS));
+}
 
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-
-/// Берёт буфер из пула или создаёт новый.
+/// Берёт буфер из thread-local пула или создаёт новый.
 pub fn get_buf(size: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    for i in 0..pool.len() {
-        let len = pool[i].len();
-        if len >= size && len <= size * 2 {
-            let mut buf = pool.swap_remove(i);
+    POOL.with(|pool| {
+        let mut p = pool.borrow_mut();
+        if let Some(idx) = p.iter().position(|b| b.capacity() >= size) {
+            let mut buf = p.swap_remove(idx);
             buf.clear();
             buf.resize(size, 0);
             return buf;
         }
-    }
-    vec![0u8; size]
+        vec![0u8; size]
+    })
 }
 
-/// Возвращает буфер в пул.
+/// Возвращает буфер в thread-local пул.
 pub fn return_buf(buf: Vec<u8>) {
-    if buf.capacity() <= POOL_MAX_SIZE {
-        let mut b = buf;
-        b.clear();
-        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        if pool.len() < POOL_CAPACITY {
-            pool.push(b);
-        }
+    if buf.capacity() > POOL_MAX_CAPACITY || buf.capacity() < 32 {
+        return;
     }
+    POOL.with(|pool| {
+        let mut p = pool.borrow_mut();
+        if p.len() < POOL_MAX_BUFFERS {
+            let mut b = buf;
+            b.clear();
+            p.push(b);
+        }
+    });
 }

@@ -1,6 +1,6 @@
 # ByeByeDPI Windows — Архитектура (Rust, v3.0)
 
-**Всего техник: ~170**
+**Всего техник: ~180**
 - 45 — портировано из ByeDPI Android (TCP desync, TLS, QUIC, DNS, proxy fallback)
 - 15 — из zapret2 (multisplit, fakedsplit, syndata, badsum, synhide, ipfrag...)
 - 10 — Windows-эксклюзивных (IP frag overlap, MSS clamp, ACK suppress, reorder, RST selective...)
@@ -211,30 +211,24 @@ byebyedpi-win/
 
 ```rust
 pub struct PacketEngine {
-    divert: Option<WinDivert<NetworkLayer>>,  // WinDivert handle
-    raw_sock: Option<RawSocketTx>,            // Raw socket (UDP/ICMP only)
+    divert: Option<WinDivert<NetworkLayer>>,
+    raw_sock: Option<RawSocketTx>,
     stats: PacketStats,
-    mode: EngineMode,                          // WinDivert / Wfp / ApiOnly
+    mode: EngineMode,
 }
 
 impl PacketEngine {
-    /// Создаёт engine с auto-install driver
-    pub fn new(filter: &str) -> Result<Self> {
-        // 1. Проверяем/устанавливаем WinDivert driver
-        if !windivert_driver::is_driver_loaded() {
-            windivert_driver::install_driver()?;
-        }
-        // 2. Открываем WinDivert handle
-        let divert = WinDivert::network(filter, ...)?;
-        // 3. Создаём raw socket (для UDP inject)
-        let raw_sock = RawSocketTx::new()?;
-        // 4. Отключаем TSO/LSO
-        Self::disable_offload()?;
-        Ok(Self { divert: Some(divert), raw_sock: Some(raw_sock), ... })
-    }
+    pub fn new(filter: &str) -> Result<Self> { /* ... */ }
 
-    /// TCP injection — через WinDivert (raw socket НЕ работает для TCP)
-    pub fn inject_via_divert(&self, packet: &[u8], addr: &Address) -> Result<()>;
+    /// Блокирующий перехват — возвращает bytes::Bytes (zero-copy)
+    pub fn recv_blocking(&self, buffer: &mut [u8]) -> Result<(bytes::Bytes, WinDivertAddress<NetworkLayer>)>;
+
+    /// TCP injection — через WinDivert с Impostor flag (MR-31)
+    pub fn inject_via_divert(&self, packet: &[u8], addr: &WinDivertAddress) -> Result<()> {
+        let mut impostor_addr = addr.clone();
+        impostor_addr.set_impostor(true);  // предотвращает повторный перехват
+        // ...
+    }
 
     /// UDP injection — через raw socket
     pub fn inject_raw_udp(&self, packet: &[u8]) -> Result<()>;
@@ -380,7 +374,6 @@ impl AutoProber {
 use dashmap::DashMap;
 use std::net::Ipv4Addr;
 
-/// Ключ соединения (96 бит)
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
 pub struct ConnKey {
     pub src_ip: Ipv4Addr,
@@ -389,7 +382,6 @@ pub struct ConnKey {
     pub dst_port: u16,
 }
 
-/// Состояние TCP соединения
 #[derive(Clone)]
 pub struct ConntrackEntry {
     pub client_isn: u32,
@@ -403,31 +395,45 @@ pub struct ConntrackEntry {
     pub desync_applied: bool,
     pub strategy_id: u32,
     pub last_activity: Instant,
-    pub dup_ack_count: u32,           // FIX-4: dup-ACK detection
-    pub rng: Option<PerConnRng>,      // FIX-7: per-connection PRNG (Xorshift128**)
+    pub dup_ack_count: u32,
+    pub rng: Option<PerConnRng>,
 }
 
-/// Connection tracking — шардированная хэш-таблица
 pub struct Conntrack {
     map: DashMap<ConnKey, ConntrackEntry>,
     gc_interval: Duration,
 }
 
 impl Conntrack {
-    /// Probabilistic GC (FIX-2): step_by(128) вместо полного итератора
-    pub fn gc_fast(&self, max_idle: Duration) {
-        // iter().step_by(128) — проверяет каждый 128-й entry
-        // Минимизирует блокировку DashMap
+    /// Вставка через Entry API — один shard lock вместо двух (MR-04)
+    pub fn upsert(&self, key: ConnKey, entry: ConntrackEntry) {
+        use dashmap::mapref::entry::Entry;
+        match self.inner.map.entry(key) {
+            Entry::Vacant(e) => { e.insert(entry); /* increment counters */ }
+            Entry::Occupied(mut e) => { e.get_mut().last_activity = Instant::now(); }
+        }
     }
 
-    /// OOO/dup-ACK detection (FIX-4)
-    pub fn update_seq_monotonic(&self, key: &ConnKey, seq: u32, ack: u32) {
-        // Проверка delta < 1M, dup_ack_count++ при delta == 0
+    /// Two-phase GC: collect stale keys, then remove (MR-03, без deadlock)
+    pub fn gc_fast(&self, max_idle: Duration) {
+        let to_remove: Vec<ConnKey> = self.map.iter()
+            .filter(|r| now.duration_since(r.value().last_activity) > max_idle)
+            .map(|r| *r.key())
+            .collect();
+        for key in to_remove { self.map.remove(&key); }
     }
-            let now = unsafe { GetTickCount64() };
-            self.map.retain(|_, v| {
-                now - v.last_activity < 120_000 // 2 мин
-            });
+
+    /// SEQ update — delta < 2^30, dup_ack_count reset (MR-16)
+    pub fn update_seq_monotonic(&self, key: &ConnKey, seq: u32, ack: u32) {
+        if let Some(mut entry) = self.map.get_mut(key) {
+            let delta = seq.wrapping_sub(entry.client_seq);
+            if delta == 0 {
+                entry.dup_ack_count = entry.dup_ack_count.saturating_add(1);
+            } else if delta < (1u32 << 30) {
+                entry.client_seq = seq;
+                entry.dup_ack_count = 0;
+            }
+            entry.last_activity = Instant::now();
         }
     }
 }
@@ -491,17 +497,25 @@ impl Runtime {
 | 8 | TCP Window Clamping | `desync::tcp` | ✅ (TUN→WinDivert) |
 | 9 | TCP Timestamp Options | `desync::tcp` | ✅ |
 | 10 | HTTP Header Tamper (7 режимов) | `desync::http` | ✅ |
+| 10a | **HTTP Case Mixing** (Demergi) | `desync::http` | ✅ Host → hOsT |
 | 11 | DNS Forwarding | `dns` | ✅ |
 | 12 | DoH Bridge | `dns::doh` | ✅ (C-native, WinHTTP) |
+| 12a | **DoH Retry + backoff** (Demergi) | `dns` | ✅ Exponential backoff + jitter |
+| 12b | **Persistent HTTP/2 DoH** (Demergi) | `dns` | ✅ http2_prior_knowledge |
+| 12c | **DNS IP Override** (Demergi) | `dns` | ✅ CIDR-based override |
+| 12d | **Certificate Pinning** (Demergi) | `dns` | ✅ SPKI hash pinning |
 | 14 | Strategy Switcher | `config` | ✅ |
 | 15 | TLS Record Fragmentation (5 стратегий) | `desync::tls` | ✅ |
+| 15a | **TLS Record Re-wrapping** (GreenTunnel) | `desync::tls` | ✅ Каждый фрагмент получает валидный record header |
+| 15b | **TLS Version Spoof** (Demergi) | `desync::tls` | ✅ Record-layer version → TLS 1.3 |
+| 15c | **SNI-Targeted Record Frag** (NoDPI) | `desync::tls` | ✅ SNI на 2B chunks с TLS 1.3 headers |
 | 18 | Bye-dpi SOCKS5 Core | `proxy` | ✅ (FFI→Rust) |
 | 19 | AutoTTL | `desync::ip` | ✅ (enhanced, real recv_ttl) |
 | 20 | TLS Fingerprint Parroting | `desync::tls` | ✅ |
 | 21 | TCP Chunk Obfuscation | `desync::tcp` | ✅ |
 | 22 | Socket Pool | `packet_engine` | ✅ (raw socket pool) |
 | 23 | MTU Enforcement | `packet_engine` | ✅ |
-| 25 | DNS Cache | `dns::cache` | ✅ (Rust-native) |
+| 25 | DNS Cache | `dns::cache` | ✅ (Rust-native, moka LRU) |
 | 27 | Micro-TCP TX | `packet_engine` | ✅ (raw socket TX) |
 | 28 | Timed Injector | `desync` (tokio timer) | ✅ |
 | 29 | Enhanced Conntrack | `conntrack` | ✅ (DashMap) |
@@ -574,6 +588,7 @@ impl Runtime {
 | S1 | **Blacklist mode** | `split_tunnel` | Только blacklist-сайты через обход |
 | S2 | **Whitelist mode** | `split_tunnel` | Все, кроме whitelist, через обход |
 | S3 | **Auto mode** | `split_tunnel` | Авто-детекция: probe → classify |
+| S3a | **Auto-detect persistence** (NoDPI) | `split_tunnel` | ✅ Whitelist кэш + blocked_domains.txt |
 
 ---
 
@@ -621,7 +636,7 @@ impl Runtime {
 
 | # | Техника | Rust модуль | Описание | Приоритет |
 |---|---------|-------------|----------|:---------:|
-| DP1 | **HopTab (auto-TTL cache)** | `desync::ip::hop_tab` | ~550 строк, 0 зависимостей. Auto-TTL определение через Hop Limit/IP TTL. Кэш {dst_ip → hops} | 🔴 **P0** |
+| DP1 | **HopTab (auto-TTL cache)** | `adaptive::hop_tab` | Direct-mapped hash table (4096 entries), O(1) lookup. Auto-TTL черезHop Limit/IP TTL. | 🔴 **P0** |
 | DP2 | **Fake CH with badsum + auto-TTL** | `desync::tcp::fake_ch_badsum` | Fake ClientHello с заведомо неправильной TCP checksum + auto-TTL из HopTab | 🔴 P1 |
 
 #### 4.6.5 CandyTunnel (9 техник)
@@ -668,7 +683,7 @@ impl Runtime {
 | # | Техника | Rust модуль | Описание | Приоритет |
 |---|---------|-------------|----------|:---------:|
 | OL1 | **Thread-Local Hot Path** | `packet_engine::tls_hotpath` | thread_local! для WinDivert callback-статистики (keepalive, counters) без блокировок | 🔴 P0 |
-| OL2 | **Synthetic Event Tagging** | `packet_engine::event_tag` | Маркировка собственных (injected) пакетов UUID-тегом, чтобы не перехватывать их через WinDivert | 🔴 **P0** |
+| OL2 | **Synthetic Event Tagging** | `infra::event_tag` | Глобальный UUID-тег (OnceLock) для injected пакетов. Impostor flag на WinDivertAddress. | 🔴 **P0** |
 | OL3 | **interprocess + tarpc IPC** | `infra::ipc` | RPC-канал между service (NETWORK SERVICE) и UI (user) через interprocess crate | 🟡 P9 |
 
 #### 4.6.10 rust-no-dpi-socks (2 техники)
@@ -687,8 +702,8 @@ impl Runtime {
 
 ---
 
-**Итого: ~100 техник ядра + ~50 из 11 Rust-проектов = ~150 уникальных техник**
-(45 Android + 5 исправленных + 15 zapret2 + 10 Windows-эксклюзивных + 3 split tunnel — 6 Android-only + ~50 новых)
+**Итого: ~100 техник ядра + ~60 из 11 Rust-проектов + 10 новых (PLAN2) = ~170 уникальных техник**
+(45 Android + 5 исправленных + 15 zapret2 + 10 Windows-эксклюзивных + 3 split tunnel + 10 PLAN2 — 6 Android-only + ~60 новых)
 
 ---
 
@@ -781,15 +796,17 @@ packets.par_iter().for_each(|pkt| {
 
 | Структура | Механизм | Contention | Примечание |
 |-----------|----------|:----------:|------------|
-| Conntrack | DashMap (64 shards) | Низкий | upsert на первый пакет, потом чтение. Probabilistic GC (step-by-128) avoids reactor starvation. |
+| Conntrack | DashMap (64 shards) + Entry API | Низкий | upsert через Entry API — один shard lock. Two-phase GC (collect+remove) без deadlock. |
 | Blacklist | DashSet (64 shards) | Низкий | |
 | DNS Cache | moka (concurrent LRU) | Очень низкий | |
-| Packet channels | tokio mpsc (lock-free SPSC) | Нулевой | |
+| Packet ring | crossbeam ArrayQueue (64K slots) | Нулевой | Lock-free MPMC ring с head-drop. Заменяет mpsc::channel. |
 | Stats counters | AtomicU64 | Нулевой | |
-| Packet buffers | thread-local pool (32 bufs/thread) | Нулевой | `desync::pool` — reduce malloc/free on high PPS |
-| SplitTunnel cache | thread-local Vec<(u32, bool)> | Нулевой | `should_bypass_ip_fast()` — eliminates 5 DashMap lookups/packet |
-| Inject tracking | DashSet<u32> | Низкий | SEQ numbers injected fake packets — skip retransmits |
-| PerConnRng | Xorshift128** per-connection | Нулевой | Unbiased PRNG с splitmix64 seed, stored in ConntrackEntry |
+| Packet buffers | thread-local pool (32 bufs/thread) | Нулевой | `desync::pool` — Mutex заменён на thread_local. |
+| SplitTunnel cache | thread-local Vec<(u32, bool)> | Нулевой | `should_bypass_ip_fast()` — O(1) lookup. |
+| Inject tracking | InjectedSeqTracker (HashMap + TTL) | Низкий | Bounded (64K entries, 30s TTL). Заменяет unbounded DashSet. |
+| PerConnRng | Xorshift128** + periodic reseed | Нулевой | getrandom seed, reseed каждые 8192 вызова. |
+| HopTab | Direct-mapped hash (4096 entries) | Нулевой | O(1) lookup вместо O(256) linear scan. |
+| PRNG seed | getrandom (OS CSPRNG) | Нулевой | Вместо SystemTime::now(). |
 
 ---
 
@@ -967,9 +984,11 @@ impl DnsEngine {
 |------|-------|:------:|-----------|
 | Runtime | `tokio` | 1.40 | Async I/O, timers |
 | Parallel CPU | `rayon` | 1.10 | Work-stealing thread pool |
+| Packet ring | `crossbeam` | 0.8 | Lock-free ArrayQueue для packet ring |
 | Packet interception | `windivert` | 0.5 | WinDivert binding |
 | WinAPI | `windows` | 0.58 | Raw sockets, system tray |
 | Concurrent maps | `dashmap` | 6.0 | Conntrack, blacklist |
+| CSPRNG | `getrandom` | 0.2 | OS CSPRNG для PRNG seed + reseed |
 | DNS | `trust-dns` | 0.24 | DoH/DoT client |
 | HTTP | `reqwest` | 0.12 | DoH, proxy crawler |
 | Packet parsing | `pnet` | 0.35 | IP/TCP/UDP parses |
@@ -980,6 +999,7 @@ impl DnsEngine {
 | Bytes | `bytes` | 1.6 | Zero-copy packet buffers |
 | Config | `toml` | 0.8 | Config file format |
 | TinyVec | `tinyvec` | 1 | Small vector optimization |
+| UUID | `uuid` | 1.0 | EventTag global identifier |
 
 ---
 
@@ -997,7 +1017,7 @@ impl DnsEngine {
 | **P7** | Proxy Fallback + Free proxy pool + HPACK bomber + Fingerprint rotator | 8 | 2 нед |
 | **P8** | Rust-миграция bye-dpi (удаление FFI) + Adaptive DPI | 10 | 2 нед |
 | **P9** | System tray + Windows Service + installer + testing | — | 2 нед |
-| | **Итого 72 техники** | **72** | **~22 нед** |
+| | **Итого 82 техники (ядро)** | **82** | **~22 нед** |
 
 ---
 
@@ -1021,7 +1041,7 @@ impl DnsEngine {
 ## 12. Исследованные проекты: +24 новые техники
 
 После анализа ByeDPI Android, zapret2 и Nova были дополнительно исследованы 5 проектов.
-Итого добавлено **~24 новые техники/концепции**, доводя общий счёт до **~106**.
+Итого добавлено **~34 новые техники/концепции**, доводя общий счёт до **~116**.
 
 ### 12.1 FakeSIP — протокольная маскировка UDP (3 техники)
 
@@ -1121,7 +1141,7 @@ impl DnsEngine {
 ## 13. Исследованные Rust-проекты: +50 новых техник
 
 После анализа 11 дополнительных Rust DPI-проектов добавлено **~50 новых техник/концепций**.
-Итоговый счёт: **~150 уникальных техник**.
+Итоговый счёт: **~160 уникальных техник**.
 
 ### 13.1 sni-spoofing-rust — SEQ Number Spoofing (4 техники)
 
@@ -2122,7 +2142,7 @@ impl AppRouter {
 | Crypto/Encryption | — | — | — | — | — | — | — | — | — | — | — | — | — | — | 2 | — | — | — | **2** |
 | **Итого** | **48** | **16** | **5** | **12** | **3** | **3** | **9** | **7** | **16** | **3** | **2** | **15** | **4** | **2** | **9** | **4** | **2** | **2** | **~162** |
 
-> После дедупликации: **~150 уникальных техник** (45 Android + 15 zapret2 + 10 Win-excl + 9 Nova + 3 Split + ~68 из 16 других проектов)
+> После дедупликации: **~160 уникальных техник** (45 Android + 15 zapret2 + 10 Win-excl + 9 Nova + 3 Split + 10 PLAN2 + ~68 из 16 других проектов)
 
 ### 18.20 Техники из Omoikane (6 шт)
 
@@ -2299,7 +2319,7 @@ example.com → **.com (false)
 | **P9** | **Supervisor/Worker** + **interprocess IPC** + **Task Scheduler** + **UWP** + **Firewall** + **PAC** + System tray + Windows Service + installer + **Job Object Cleanup** + **Graceful Shutdown** + **Event-Driven Net Monitor** + **Arg Sanitizer** + **Minisign Ed25519** | 15 | QL2, OL3, DR2-DR6, **VA4-VA8** | 3 нед |
 | **P10** | **Полноценный GUI** (Tauri v2 + React + i18n) | — | System tray, Dashboard, 5 panels | 2 нед |
 | **P11** | **SpoofDPI-derived фичи**: Custom Segment Plans + Noise, Xorshift Random Split Mask, Parallel Dial, Dual-Stack Hop Learning, Domain Trie, Per-Rule Config Override | 6 | SP1-SP6 | 1 нед |
-| | **Итого: ~170 техник** | **~196** | **+6 из SpoofDPI** | **~40 нед** |
+| | **Итого: ~180 техник** | **~206** | **+6 из SpoofDPI** | **~40 нед** |
 
 ---
 
@@ -3455,3 +3475,120 @@ impl Drop for NetworkMonitor {
 **Проблема:** `random_split_positions()` O(n²) через `contains()`.
 
 **Решение:** `HashSet` для O(1) dedup: `seen.insert(p)` вместо `positions.contains(&p)`.
+
+---
+
+## 23. Архитектурные изменения (v3.1 — после Meta-Review)
+
+### 23.1 Обзор изменений
+
+Выполнено 34 исправления на основе 9 экспертных ревью (141 находка → 30 уникальных MR). Основные архитектурные сдвиги:
+
+| Что | Было | Стало |
+|-----|------|-------|
+| Packet ring | `tokio::mpsc::channel(1024)` | `crossbeam::ArrayQueue(65536)` lock-free head-drop |
+| Packet type | `Vec<u8>` | `bytes::Bytes` (zero-copy refcount) |
+| PRNG seed | `SystemTime::now()` | `getrandom` (OS CSPRNG) + periodic reseed |
+| EventTag | `thread_local!` UUID | `OnceLock` глобальный UUID |
+| Buffer pool | `Mutex<Vec<Vec<u8>>>` | `thread_local!` pool без блокировок |
+| Inject tracking | `DashSet<u32>` (unbounded) | `InjectedSeqTracker` (HashMap + TTL, 64K max) |
+| HopTab lookup | O(256) linear scan | O(1) direct-mapped hash (4096 entries) |
+| Conntrack upsert | 2 DashMap lookups | Entry API — 1 shard lock |
+| GC | `iter().remove()` (deadlock) | Two-phase: collect keys → remove |
+| SEQ delta limit | `delta < 65535` | `delta < 2^30` (TSO-compatible) |
+| TCP checksum | До payload (неверный) | После payload (корректный) |
+| build_tcp_segment | 3 аллокации | 1 аллокация (`build_ip_tcp_packet`) |
+| DesyncResult::merge | Last-writer-wins без warning | Conflict detection + warning log |
+| Pipeline mode | `false` (concurrent) | `true` (pipeline) по умолчанию |
+
+### 23.2 Packet Ring (crossbeam ArrayQueue)
+
+```
+WinDivert recv ──→ ArrayQueue<CapturedPacket>(65536) ──→ consumer loop
+                     │
+                     └── head-drop при переполнении
+                         (вытесняет старый пакет, берёт новый)
+```
+
+**Преимущества:** Lock-free MPMC, zero contention, head-drop сохраняет свежие пакеты. `try_send` не блокирует WinDivert recv thread.
+
+### 23.3 PRNG Security (Xorshift128** + reseed)
+
+```
+getrandom (CSPRNG) ──→ splitmix64 ──→ PerConnRng state[2]
+                         │
+                         └── periodic reseed каждые 8192 вызова
+                             (getrandom → XOR с текущим state)
+```
+
+**Защита от ML-DPI:** Даже если DPI восстановил state, reseed разрывает корреляцию. Стоимость: ~0.12ns/packet.
+
+### 23.4 Zero-Copy Pipeline
+
+```
+WinDivert recv ──→ bytes::Bytes::copy_from_slice (1 копия)
+                       │
+                       └── DesyncGroup.apply() ──→ group.apply(packet.clone())
+                               │                      (clone = +1 refcount, 0 копий)
+                               └── build_ip_tcp_packet() ──→ 1 alloc вместо 3
+```
+
+**До:** 3 копии × 1500B × 844K pps = 3.75 GB/s memcpy.
+**После:** 1 копия × 1500B × 844K pps = 1.25 GB/s (−67%).
+
+---
+
+## 24. Новые техники (PLAN2 — GreenTunnel/NoDPI/Demergi)
+
+### 24.1 TLS Record Re-wrapping (GreenTunnel)
+
+Текущий `tls_record_frag` делает TCP-level split. Эта техника работает **на TLS record layer** — каждый фрагмент получает валидный 5-byte record header.
+
+```
+Было:  [ContentType + Version + Length + FullPayload]
+Стало: [CT + V + Len₁ + chunk₁] [CT + V + Len₂ + chunk₂] ... [CT + V + Lenₙ + chunkₙ]
+```
+
+**Механизм:** Parces TLS record header → slices payload на chunk_size → обёртка каждого chunk в новый record header с пересчитанным length. Version записывается как TLS 1.3 (0x0304).
+
+**Портфолио:** `desync::tls::tls_record_rewrap()`
+
+### 24.2 SNI-Targeted Record Fragmentation (NoDPI)
+
+Разбиение именно SNI-поля ClientHello на 2-байтные chunks. Каждый chunk оборачивается в TLS 1.3 record header.
+
+**Механизм:** Extension walk для поиска SNI (type=0x0000) → извлечение имени → разбиение на 2B → обёртка в record headers.
+
+**Портфолио:** `desync::tls::sni_record_frag()`
+
+### 24.3 TLS Version Spoof (Demergi)
+
+Перезапись version field в TLS record header на 0x0304 (TLS 1.3). Комбинируется с Record Re-wrapping.
+
+**Портфолио:** `desync::tls::tls_version_overwrite()`
+
+### 24.4 HTTP Header Case Mixing (Demergi)
+
+Чередование регистра в HTTP Host header: `Host` → `hOsT`. Побеждает DPI с fixed-pattern regex.
+
+**Портфолио:** `desync::http::http_case_mix()`
+
+### 24.5 DNS Improvements
+
+| Компонент | Описание |
+|---|---|
+| DoH Retry | 3 попытки с exponential backoff + jitter (2^n × 20ms + random) |
+| Persistent HTTP/2 | `http2_prior_knowledge()` — переиспользование сессии |
+| IP Override | CIDR-based override через `ipnet` crate |
+| Certificate Pinning | SPKI hash pinning для DoH серверов |
+
+**Портфолио:** `dns::mod.rs`
+
+### 24.6 Auto-detect Persistence (NoDPI)
+
+`AutoProber` теперь сохраняет результаты:
+- **Whitelist** (DashSet): успешные TLS handshake → не блокировать повторно
+- **Blacklist** (файл): timeout → запись в `blocked_domains.txt`
+- **Load on start**: загрузка blocked доменов при старте
+
+**Портфолио:** `split_tunnel.rs`

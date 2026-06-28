@@ -8,9 +8,8 @@
 //! ## Источник
 //! Адаптировано из [RIPDPI](https://github.com/nickel-org/ripdpi) — Fallback Chain.
 
-use crate::desync::{DesyncResult, DesyncTechnique};
+use crate::desync::DesyncTechnique;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -53,6 +52,7 @@ pub struct FallbackChain {
     entries: Vec<FallbackEntry>,
     current: AtomicUsize,
     min_success_rate: f64,
+    #[allow(dead_code)]
     cooldown: Duration,
 }
 

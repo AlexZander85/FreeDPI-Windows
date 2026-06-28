@@ -42,7 +42,7 @@ moka = { version = "0.12", features = ["future", "sync"] }
 pnet_packet = "0.35"
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "default-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "default-tls", "http2"] }
 
 # DNS
 trust-dns-resolver = "0.23"

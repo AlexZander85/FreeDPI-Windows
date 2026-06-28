@@ -80,9 +80,12 @@ impl DesyncResult {
         Self { modified: None, inject: Vec::new(), drop: true }
     }
 
-    /// Объединяет два результата.
+    /// Объединяет два результата с detection конфликтов.
     pub fn merge(&mut self, other: Self) {
         if other.modified.is_some() {
+            if self.modified.is_some() {
+                tracing::warn!("DesyncResult::merge: conflict — two techniques modified the packet, last writer wins");
+            }
             self.modified = other.modified;
         }
         self.inject.extend(other.inject);
@@ -119,10 +122,11 @@ pub enum DesyncTechnique {
     RstDropIpId, TtlJitter, DscpRandom, MutualSpoof,
     // === TLS ===
     TlsRecordFrag, TlsRecordPad, SniMasking, SniMicrofrag,
+    TlsRecordRewrap, TlsVersionSpoof, SniRecordFrag,
     // === HTTP (P4) ===
     H2SettingsFlood, H2RstPadding, H2WindowUpdateFlood,
     H2PriorityAbuse, H2Goaway, ChunkObfuscation, H2FrameOrdering,
-    Http11Pipeline, ContentLengthFuzz, HttpUpgradeAbuse,
+    Http11Pipeline, ContentLengthFuzz, HttpUpgradeAbuse, HttpCaseMix,
     // === QUIC (P5) ===
     QuicBlocking, QuicVersionDowngrade, QuicRetryInject,
     QuicConnectionClose, QuicStreamReset, QuicMaxStreams,
@@ -156,11 +160,14 @@ impl DesyncTechnique {
             Self::DscpRandom => "DscpRandom", Self::MutualSpoof => "MutualSpoof",
             Self::TlsRecordFrag => "TlsRecordFrag", Self::TlsRecordPad => "TlsRecordPad",
             Self::SniMasking => "SniMasking", Self::SniMicrofrag => "SniMicrofrag",
+            Self::TlsRecordRewrap => "TlsRecordRewrap", Self::TlsVersionSpoof => "TlsVersionSpoof",
+            Self::SniRecordFrag => "SniRecordFrag",
             Self::H2SettingsFlood => "H2SettingsFlood", Self::H2RstPadding => "H2RstPadding",
             Self::H2WindowUpdateFlood => "H2WindowUpdateFlood", Self::H2PriorityAbuse => "H2PriorityAbuse",
             Self::H2Goaway => "H2Goaway", Self::ChunkObfuscation => "ChunkObfuscation",
             Self::H2FrameOrdering => "H2FrameOrdering", Self::Http11Pipeline => "Http11Pipeline",
             Self::ContentLengthFuzz => "ContentLengthFuzz", Self::HttpUpgradeAbuse => "HttpUpgradeAbuse",
+            Self::HttpCaseMix => "HttpCaseMix",
             Self::QuicBlocking => "QuicBlocking", Self::QuicVersionDowngrade => "QuicVersionDowngrade",
             Self::QuicRetryInject => "QuicRetryInject", Self::QuicConnectionClose => "QuicConnectionClose",
             Self::QuicStreamReset => "QuicStreamReset", Self::QuicMaxStreams => "QuicMaxStreams",
@@ -193,11 +200,14 @@ impl DesyncTechnique {
             Self::DscpRandom => "CandyTunnel", Self::MutualSpoof => "CandyTunnel",
             Self::TlsRecordFrag => "zapret", Self::TlsRecordPad => "zapret",
             Self::SniMasking => "offveil", Self::SniMicrofrag => "omoikane",
+            Self::TlsRecordRewrap => "greentunnel", Self::TlsVersionSpoof => "demergi",
+            Self::SniRecordFrag => "nodpi",
             Self::H2SettingsFlood => "NaiveProxy", Self::H2RstPadding => "NaiveProxy",
             Self::H2WindowUpdateFlood => "NaiveProxy", Self::H2PriorityAbuse => "NaiveProxy",
             Self::H2Goaway => "NaiveProxy", Self::ChunkObfuscation => "b4",
             Self::H2FrameOrdering => "RIPDPI", Self::Http11Pipeline => "byedpi",
             Self::ContentLengthFuzz => "byedpi", Self::HttpUpgradeAbuse => "byedpi",
+            Self::HttpCaseMix => "demergi",
             Self::QuicBlocking => "zapret", Self::QuicVersionDowngrade => "zapret",
             Self::QuicRetryInject => "zapret", Self::QuicConnectionClose => "zapret",
             Self::QuicStreamReset => "zapret", Self::QuicMaxStreams => "zapret",
@@ -222,11 +232,12 @@ impl DesyncTechnique {
             | Self::IpFragPrimitives | Self::RstDropIpId | Self::TtlJitter
             | Self::DscpRandom | Self::MutualSpoof | Self::ReverseFragmentOrder => TechniqueCategory::Ip,
             Self::TlsRecordFrag | Self::TlsRecordPad | Self::SniMasking
-            | Self::SniMicrofrag => TechniqueCategory::Tls,
+            | Self::SniMicrofrag | Self::TlsRecordRewrap | Self::TlsVersionSpoof
+            | Self::SniRecordFrag => TechniqueCategory::Tls,
             Self::H2SettingsFlood | Self::H2RstPadding | Self::H2WindowUpdateFlood
             | Self::H2PriorityAbuse | Self::H2Goaway | Self::ChunkObfuscation
             | Self::H2FrameOrdering | Self::Http11Pipeline | Self::ContentLengthFuzz
-            | Self::HttpUpgradeAbuse => TechniqueCategory::Http,
+            | Self::HttpUpgradeAbuse | Self::HttpCaseMix => TechniqueCategory::Http,
             Self::QuicBlocking | Self::QuicVersionDowngrade | Self::QuicRetryInject
             | Self::QuicConnectionClose | Self::QuicStreamReset
             | Self::QuicMaxStreams | Self::Udp2Icmp => TechniqueCategory::Quic,
@@ -265,6 +276,10 @@ pub struct DesyncConfig {
     pub fake_ttl_offset: u8,
     /// Задержка между инъекциями (мкс)
     pub inject_delay_us: u64,
+    /// Количество PRNG вызовов между reseed'ами.
+    /// 0 = отключено (для benchmarking).
+    /// 8192 = рекомендуется для production (~10ms при 844K pps).
+    pub reseed_interval: u64,
 }
 
 impl Default for DesyncConfig {
@@ -277,6 +292,7 @@ impl Default for DesyncConfig {
             bad_checksum: false,
             fake_ttl_offset: 1,
             inject_delay_us: 1000,
+            reseed_interval: 8192,
         }
     }
 }

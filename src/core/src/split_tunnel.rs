@@ -254,44 +254,92 @@ impl Default for SplitTunnel {
 }
 
 /// Prober для Auto-режима.
-///
-/// Проверяет доступность сайта через TCP connect + TLS ClientHello.
-pub struct AutoProber;
+pub struct AutoProber {
+    /// Успешно пробированные домены (whitelist — не блокировать повторно).
+    whitelist: dashmap::DashSet<String>,
+    /// Путь к файлу с blocked доменами.
+    blocked_file: Option<String>,
+}
 
 impl AutoProber {
-    /// Проверяет, доступен ли сайт напрямую (без DPI-обхода).
-    pub async fn probe(domain: &str, ip: Ipv4Addr) -> ProbeResult {
+    pub fn new(blocked_file: Option<String>) -> Self {
+        Self {
+            whitelist: dashmap::DashSet::new(),
+            blocked_file,
+        }
+    }
+
+    /// Проверяет доступность сайта. Результаты сохраняются в whitelist/blacklist.
+    pub async fn probe(&self, domain: &str, ip: Ipv4Addr) -> ProbeResult {
+        if self.whitelist.contains(domain) {
+            return ProbeResult::Direct;
+        }
+
+        let result = Self::probe_raw(domain, ip).await;
+
+        match result {
+            ProbeResult::Direct => {
+                self.whitelist.insert(domain.to_string());
+                debug!("AutoProbe: {} → Direct (whitelisted)", domain);
+            }
+            ProbeResult::Blocked => {
+                if let Some(ref path) = self.blocked_file {
+                    self.append_to_file(path, domain);
+                }
+                debug!("AutoProbe: {} → Blocked", domain);
+            }
+        }
+        result
+    }
+
+    async fn probe_raw(domain: &str, ip: Ipv4Addr) -> ProbeResult {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
 
-        // 1. TCP connect с таймаутом 3 сек
         let stream = tokio::time::timeout(
             Duration::from_secs(3),
             TcpStream::connect((ip, 443)),
-        )
-        .await;
+        ).await;
 
         let Ok(Ok(mut stream)) = stream else {
             return ProbeResult::Blocked;
         };
 
-        // 2. Отправляем минимальный TLS ClientHello с SNI
         let ch = build_probe_client_hello(domain);
         if stream.write(&ch).await.is_err() {
             return ProbeResult::Blocked;
         }
 
-        // 3. Ждём ответ 2 сек
         let mut buf = [0u8; 1024];
         let response = tokio::time::timeout(
             Duration::from_secs(2),
             stream.read(&mut buf),
-        )
-        .await;
+        ).await;
 
         match response {
             Ok(Ok(n)) if n > 5 && buf[0] == 0x16 => ProbeResult::Direct,
             _ => ProbeResult::Blocked,
+        }
+    }
+
+    fn append_to_file(&self, path: &str, domain: &str) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true).append(true).open(path)
+        {
+            let _ = writeln!(file, "{}", domain);
+        }
+    }
+
+    /// Загружает blocked домены из файла в SplitTunnel blacklist.
+    pub fn load_blocked_file(path: &str, tunnel: &SplitTunnel) {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            for line in content.lines() {
+                let domain = line.trim().to_string();
+                if !domain.is_empty() && !domain.starts_with('#') {
+                    tunnel.add_to_blacklist(domain);
+                }
+            }
         }
     }
 }

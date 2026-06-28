@@ -225,7 +225,7 @@ impl TargetEscalation {
     /// Проверяет, нужно ли деэскалировать (cooldown истёк).
     pub fn check_deescalate(&mut self, target: &str) -> bool {
         let now = Instant::now();
-        let should_de = self.targets.get(target).map_or(false, |s| {
+        let should_de = self.targets.get(target).is_some_and(|s| {
             if let Some(last_esc) = s.last_escalated {
                 // Деэскалируем если: прошло > cooldown И RST за окно < порога
                 now - last_esc > self.cooldown && s.count_in_window() < self.rst_threshold / 2

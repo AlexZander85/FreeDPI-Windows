@@ -40,6 +40,8 @@ pub struct DnsEngine {
     doh_client: reqwest::Client,
     dot_resolver: trust_dns_resolver::TokioAsyncResolver,
     cache: Cache<String, DnsResult>,
+    ip_overrides: Vec<(ipnet::Ipv4Net, std::net::Ipv4Addr)>,
+    doh_pins: Vec<String>,
 }
 
 impl DnsEngine {
@@ -51,6 +53,7 @@ impl DnsEngine {
     pub fn new() -> Self {
         let doh_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            .http2_prior_knowledge()
             .build()
             .expect("Failed to create reqwest client for DoH");
 
@@ -68,7 +71,19 @@ impl DnsEngine {
             doh_client,
             dot_resolver,
             cache,
+            ip_overrides: Vec::new(),
+            doh_pins: Vec::new(),
         }
+    }
+
+    /// Добавляет IP override для CIDR.
+    pub fn add_ip_override(&mut self, cidr: ipnet::Ipv4Net, override_ip: std::net::Ipv4Addr) {
+        self.ip_overrides.push((cidr, override_ip));
+    }
+
+    /// Добавляет SPKI hash для certificate pinning DoH серверов.
+    pub fn add_doh_pin(&mut self, pin: String) {
+        self.doh_pins.push(pin);
     }
 
     /// Разрешает домен в IP адрес.
@@ -87,21 +102,33 @@ impl DnsEngine {
             return Some(cached.ip);
         }
 
-        let doh = self.resolve_doh(domain);
-        let dot = self.resolve_dot(domain);
+        let max_retries = 3u8;
+        for retry in 0..max_retries {
+            let doh = self.resolve_doh(domain);
+            let dot = self.resolve_dot(domain);
 
-        let result = tokio::select! {
-            r = doh => r,
-            r = dot => r,
-        };
+            let result = tokio::select! {
+                r = doh => r,
+                r = dot => r,
+            };
 
-        if let Some(ip) = result {
-            debug!("DNS resolved: {} → {}", domain, ip);
-            self.cache
-                .insert(domain.to_string(), DnsResult { ip, ttl: 300 })
-                .await;
+            if let Some(ip) = result {
+                let final_ip = self.apply_overrides(ip);
+                debug!("DNS resolved: {} → {} (attempt {})", domain, final_ip, retry + 1);
+                self.cache
+                    .insert(domain.to_string(), DnsResult { ip: final_ip, ttl: 300 })
+                    .await;
+                return Some(final_ip);
+            }
+
+            if retry + 1 < max_retries {
+                let delay_ms = 2u64.pow(retry as u32 + 1) * 20;
+                let jitter = crate::desync::rand::random_range(0, 20) as u64;
+                tokio::time::sleep(Duration::from_millis(delay_ms + jitter)).await;
+                debug!("DNS retry {} for {}", retry + 1, domain);
+            }
         }
-        result
+        None
     }
 
     /// Разрешает через DoH (DNS-over-HTTPS Cloudflare JSON API).
@@ -153,6 +180,18 @@ impl DnsEngine {
     /// Количество записей в кэше.
     pub fn cache_len(&self) -> u64 {
         self.cache.entry_count()
+    }
+
+    fn apply_overrides(&self, ip: IpAddr) -> IpAddr {
+        if let IpAddr::V4(v4) = ip {
+            for (cidr, override_ip) in &self.ip_overrides {
+                if cidr.contains(&v4) {
+                    debug!("DNS override: {} → {}", v4, override_ip);
+                    return IpAddr::V4(*override_ip);
+                }
+            }
+        }
+        ip
     }
 }
 

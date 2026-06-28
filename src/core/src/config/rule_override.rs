@@ -113,10 +113,8 @@ impl RuleRegistry {
             // Проверяем domain match
             if let Some(ref pattern) = rule.domain {
                 if let Some(dom) = domain {
-                    if domain_matches(dom, pattern) {
-                        if best_domain.is_none() {
-                            best_domain = Some(rule.as_ref());
-                        }
+                    if domain_matches(dom, pattern) && best_domain.is_none() {
+                        best_domain = Some(rule.as_ref());
                     }
                 }
             }
@@ -124,10 +122,8 @@ impl RuleRegistry {
             // Проверяем CIDR match
             if let Some(ref cidr_str) = rule.cidr {
                 if let Some(ip) = ip {
-                    if cidr_matches(ip, cidr_str) {
-                        if best_cidr.is_none() {
-                            best_cidr = Some(rule.as_ref());
-                        }
+                    if cidr_matches(ip, cidr_str) && best_cidr.is_none() {
+                        best_cidr = Some(rule.as_ref());
                     }
                 }
             }

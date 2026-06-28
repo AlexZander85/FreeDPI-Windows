@@ -100,10 +100,11 @@ pub fn quic_initial_inject(
 
     // Fake UDP дейтаграмм
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_src_port = crate::desync::rand::random_range(1024, 65535) as u16;
     let fake_udp = build_udp_packet(
         ip.src, ip.dst,
-        12345, // fake source port
-        443,   // destination port
+        fake_src_port,
+        443,
         &fake_payload,
         fake_ttl,
         ip.identification.wrapping_add(1),
@@ -145,7 +146,7 @@ pub fn quic_short_header_poison(
 
     // Извлекаем source port из UDP
     let udp = pnet_packet::udp::UdpPacket::new(&packet[ip.header_len..]);
-    let src_port = udp.map(|u| u.get_source()).unwrap_or(12345);
+    let src_port = udp.map(|u| u.get_source()).unwrap_or(crate::desync::rand::random_range(1024, 65535) as u16);
 
     let fake_udp = build_udp_packet(
         ip.src, ip.dst, src_port, 443,
@@ -177,18 +178,21 @@ pub fn quic_padding_flood(
     let mut inject: Vec<bytes::Bytes> = Vec::with_capacity(count);
 
     for i in 0..count {
-        // Padding: от 1 до 20 байт случайных данных
-        let pad_size = ((i * 7 + 3) % 20) + 1;
-        let fake_payload: Vec<u8> = (0..pad_size).map(|j| (j * 0x13) as u8).collect();
+        let mut rng = crate::desync::rand::PerConnRng::new(i as u64);
+        let pad_size = (rng.next_unbiased(20) + 1) as usize;
+        let mut fake_payload = vec![0u8; pad_size];
+        for byte in &mut fake_payload { *byte = rng.next_u64() as u8; }
 
         let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+        let src_port = rng.next_range(1024, 65535) as u16;
+        let ip_id = rng.next_u64() as u16;
         let fake_udp = build_udp_packet(
             ip.src, ip.dst,
-            12345 + i as u16,
+            src_port,
             443,
             &fake_payload,
             fake_ttl,
-            ip.identification.wrapping_add(i as u16 + 1),
+            ip_id,
         );
         inject.push(fake_udp);
     }
@@ -230,7 +234,7 @@ pub fn udp_coalescing(
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
     let combined_udp = build_udp_packet(
         ip.src, ip.dst,
-        12345, 443,
+        crate::desync::rand::random_range(1024, 65535) as u16, 443,
         &combined,
         fake_ttl,
         ip.identification.wrapping_add(1),
@@ -265,7 +269,7 @@ pub fn doppelganger_grease(
 
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src, ip.dst, 12345, 443,
+        ip.src, ip.dst, crate::desync::rand::random_range(1024, 65535) as u16, 443,
         &fake_payload, fake_ttl,
         ip.identification.wrapping_add(1),
     );
@@ -435,7 +439,7 @@ pub fn quic_version_downgrade(
 
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src, ip.dst, 12345, 443,
+        ip.src, ip.dst, crate::desync::rand::random_range(1024, 65535) as u16, 443,
         &fake_payload, fake_ttl,
         ip.identification.wrapping_add(1),
     );
@@ -499,7 +503,7 @@ pub fn quic_retry_inject(
 
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src, ip.dst, 443, 12345,
+        ip.src, ip.dst, 443, crate::desync::rand::random_range(1024, 65535) as u16,
         &fake_payload, fake_ttl,
         ip.identification.wrapping_add(1),
     );
@@ -586,7 +590,7 @@ pub fn quic_connection_close(
 
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src, ip.dst, 12345, 443,
+        ip.src, ip.dst, crate::desync::rand::random_range(1024, 65535) as u16, 443,
         &initial, fake_ttl,
         ip.identification.wrapping_add(1),
     );
@@ -640,7 +644,7 @@ pub fn quic_stream_reset(
 
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src, ip.dst, 12345, 443,
+        ip.src, ip.dst, crate::desync::rand::random_range(1024, 65535) as u16, 443,
         &short, fake_ttl,
         ip.identification.wrapping_add(1),
     );
@@ -714,7 +718,7 @@ pub fn quic_max_streams(
 
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src, ip.dst, 12345, 443,
+        ip.src, ip.dst, crate::desync::rand::random_range(1024, 65535) as u16, 443,
         &initial, fake_ttl,
         ip.identification.wrapping_add(1),
     );
@@ -774,7 +778,7 @@ pub fn quic_new_connection_id(
 
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src, ip.dst, 12345, 443,
+        ip.src, ip.dst, crate::desync::rand::random_range(1024, 65535) as u16, 443,
         &short, fake_ttl,
         ip.identification.wrapping_add(1),
     );
@@ -814,9 +818,12 @@ fn build_quic_initial(dcid: &[u8], _sni: &str) -> Vec<u8> {
     // Packet Number: 0
     payload.push(0);
 
-    // Payload: at least 16 bytes padding (initial packets must be ≥ 1200 bytes)
-    // For fake injection, we use minimal payload
-    payload.extend_from_slice(&[0u8; 16]);
+    // RFC 9000 §14.1: Initial packets must be ≥ 1200 bytes
+    const QUIC_MIN_INITIAL_SIZE: usize = 1200;
+    let current_len = payload.len();
+    if current_len < QUIC_MIN_INITIAL_SIZE {
+        payload.resize(QUIC_MIN_INITIAL_SIZE, 0);
+    }
 
     // Fill length (remaining bytes after length field)
     let length = payload.len() - length_offset - 2;
@@ -900,7 +907,7 @@ mod tests {
         let pkt = build_udp_packet(
             Ipv4Addr::new(192, 168, 1, 1),
             Ipv4Addr::new(8, 8, 8, 8),
-            12345, 443,
+            crate::desync::rand::random_range(1024, 65535) as u16, 443,
             &[0x01, 0x02],
             64, 1,
         );
@@ -938,7 +945,7 @@ mod tests {
         pkt[12..16].copy_from_slice(&[192, 168, 1, 1]);
         pkt[16..20].copy_from_slice(&[8, 8, 8, 8]);
         // UDP header
-        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        pkt[20..22].copy_from_slice(&(crate::desync::rand::random_range(1024, 65535) as u16).to_be_bytes());
         pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
         pkt[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
         // QUIC payload

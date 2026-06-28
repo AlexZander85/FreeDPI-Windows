@@ -39,6 +39,15 @@ pub struct DnsConfig {
     /// TTL кэша в секундах
     #[serde(default = "default_cache_ttl")]
     pub cache_ttl: u64,
+    /// Использовать persistent HTTP/2 для DoH (повторное использование сессии)
+    #[serde(default = "default_true")]
+    pub doh_persistent: bool,
+    /// IP overrides для DNS: CIDR → IP (формат: "1.2.3.0/24=5.6.7.8")
+    #[serde(default)]
+    pub dns_ip_overrides: Vec<String>,
+    /// SPKI hashes для certificate pinning DoH серверов (base64 SHA256)
+    #[serde(default)]
+    pub doh_pins: Vec<String>,
 }
 
 fn default_doh_url() -> String {
@@ -215,6 +224,7 @@ impl Config {
             bad_checksum: false,
             fake_ttl_offset: self.desync.fake_ttl_offset,
             inject_delay_us: self.desync.inject_delay_us,
+            reseed_interval: 8192,
         };
 
         let techniques: Vec<DesyncTechnique> = self.desync.techniques.iter()
@@ -273,6 +283,9 @@ impl Default for DnsConfig {
             doh_url: default_doh_url(),
             dot_addr: default_dot_addr(),
             cache_ttl: default_cache_ttl(),
+            doh_persistent: true,
+            dns_ip_overrides: Vec::new(),
+            doh_pins: Vec::new(),
         }
     }
 }

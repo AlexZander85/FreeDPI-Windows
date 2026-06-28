@@ -149,10 +149,7 @@ impl PacketEngine {
     }
 
     /// Блокирующий перехват пакета.
-    ///
-    /// Должен быть запущен через `tokio::task::spawn_blocking`.
-    /// Возвращает копию пакета (Vec<u8>) и адресную информацию.
-    pub fn recv_blocking(&self, buffer: &mut [u8]) -> Result<(Vec<u8>, WinDivertAddress<NetworkLayer>)> {
+    pub fn recv_blocking(&self, buffer: &mut [u8]) -> Result<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> {
         let Some(ref divert) = self.divert else {
             anyhow::bail!("WinDivert not initialized (API-only mode)");
         };
@@ -160,7 +157,7 @@ impl PacketEngine {
             .recv(buffer)
             .context("WinDivert recv failed")?;
         self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
-        Ok((packet.data.to_vec(), packet.address))
+        Ok((bytes::Bytes::copy_from_slice(&packet.data), packet.address))
     }
 
     /// Блокирующая отправка модифицированного пакета.
@@ -207,8 +204,10 @@ impl PacketEngine {
         let Some(ref divert) = self.divert else {
             anyhow::bail!("WinDivert not initialized (API-only mode)");
         };
+        let mut impostor_addr = addr.clone();
+        impostor_addr.set_impostor(true);
         let wd_packet = WinDivertPacket {
-            address: addr.clone(),
+            address: impostor_addr,
             data: std::borrow::Cow::Borrowed(packet),
         };
         let sent = divert.send(&wd_packet).context("WinDivert inject failed")?;

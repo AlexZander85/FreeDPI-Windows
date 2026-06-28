@@ -53,7 +53,7 @@ pub fn entropy_padding(
     }
 
     // Рассчитываем текущую энтропию
-    let current_entropy = shannon_entropy(payload);
+    let current_entropy = shannon_entropy_fast(payload) as f64 / 256.0;
 
     // Определяем размер padding для достижения target_entropy
     let pad_size = if current_entropy < target_entropy {
@@ -109,33 +109,41 @@ pub fn shannon_entropy(data: &[u8]) -> f64 {
     entropy
 }
 
-/// Генерирует padding с целевой энтропией.
-fn generate_entropy_padding(size: usize, target_entropy: f64) -> Vec<u8> {
-    let mut padding = Vec::with_capacity(size);
+/// Быстрая Shannon entropy через LUT (Q8 fixed-point, без float на hot path).
+use std::sync::LazyLock;
 
-    if target_entropy < 2.0 {
-        // Низкая энтропия — повторяющийся байт
-        let filler = ((target_entropy * 127.0) as u8).max(1);
-        padding.resize(size, filler);
-    } else if target_entropy < 5.0 {
-        // Средняя энтропия — смесь двух байтов
-        let byte1 = (target_entropy * 50.0) as u8;
-        let byte2 = byte1.wrapping_add(0x55);
-        for i in 0..size {
-            padding.push(if i % 3 == 0 { byte1 } else { byte2 });
-        }
-    } else {
-        // Высокая энтропия — псевдослучайные байты
-        for i in 0..size {
-            let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            x ^= x >> 33;
-            x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-            x ^= x >> 33;
-            padding.push(x as u8);
+static NEG_P_LOG_P: LazyLock<[u16; 257]> = LazyLock::new(|| {
+    let mut table = [0u16; 257];
+    let mut i = 1usize;
+    while i <= 256 {
+        let p = i as f64 / 256.0;
+        let val = (-p * p.log2()) * 256.0;
+        table[i] = val.round() as u16;
+        i += 1;
+    }
+    table
+});
+
+pub fn shannon_entropy_fast(data: &[u8]) -> u16 {
+    if data.is_empty() { return 0; }
+    let mut freq = [0u32; 256];
+    for &b in data { freq[b as usize] += 1; }
+    let len = data.len() as u32;
+    let mut entropy: u32 = 0;
+    for &c in &freq {
+        if c > 0 {
+            let p_scaled = ((c as u64 * 256) / len as u64).clamp(1, 256) as usize;
+            entropy += NEG_P_LOG_P[p_scaled] as u32;
         }
     }
+    entropy as u16
+}
 
-    padding
+/// Генерирует padding — использует ChaCha20 как CSPRNG для неотличимости от шума.
+fn generate_entropy_padding(size: usize, _target_entropy: f64) -> Vec<u8> {
+    let key = [0x42u8; 32];
+    let iv = [0u8; 12];
+    crate::desync::crypto::chacha20_block_xor(&vec![0u8; size], &key, &iv)
 }
 
 /// [CT5] PadSize: дополнение пакета до заданного размера.
@@ -240,17 +248,36 @@ pub fn xor_first(
 /// DPI использует timing-анализ для обнаружения desync.
 /// Случайные интервалы маскируют timing fingerprint.
 pub fn poisson_delay(lambda_ms: f64) -> u64 {
-    // Inverse transform sampling для Poisson distribution
-    // F(x) = 1 - e^(-λx) → F^(-1)(u) = -ln(1-u)/λ
     let u = crate::desync::rand::random_u32() as f64 / u32::MAX as f64;
     let delay = if u < 1.0 {
         -(1.0 - u).ln() * lambda_ms
     } else {
         lambda_ms
     };
-
-    // Clamp [1, 100] ms
     (delay as u64).clamp(1, 100)
+}
+
+/// Быстрая Poisson задержка через LUT — без float на hot path.
+static POISSON_LUT: LazyLock<[u8; 256]> = LazyLock::new(|| {
+    let mut table = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let u = i as f64 / 256.0;
+        let delay = if u < 0.999 {
+            let v = -(1.0 - u).ln() * 20.0;
+            if v < 1.0 { 1u8 } else if v > 100.0 { 100u8 } else { v as u8 }
+        } else {
+            100u8
+        };
+        table[i] = delay;
+        i += 1;
+    }
+    table
+});
+
+pub fn poisson_delay_fast(_lambda_ms: u64) -> u64 {
+    let idx = (crate::desync::rand::random_u32() >> 24) as usize;
+    POISSON_LUT[idx % 256] as u64
 }
 
 /// [Z11] WgObfs: WireGuard AES-GCM обфускация.

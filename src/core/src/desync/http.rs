@@ -327,7 +327,7 @@ fn apply_title_case(
             let byte_idx = data_offset + i;
             if byte_idx < packet.len() {
                 let b = packet[byte_idx];
-                if b >= b'a' && b <= b'z' {
+                if b.is_ascii_lowercase() {
                     packet[byte_idx] = b - 32;
                 }
             }
@@ -341,9 +341,9 @@ fn apply_title_case(
                 let byte_idx = data_offset + j;
                 if byte_idx < packet.len() {
                     let b = packet[byte_idx];
-                    if after_dash && b >= b'a' && b <= b'z' {
+                    if after_dash && b.is_ascii_lowercase() {
                         packet[byte_idx] = b - 32;
-                    } else if !after_dash && b >= b'A' && b <= b'Z' {
+                    } else if !after_dash && b.is_ascii_uppercase() {
                         packet[byte_idx] = b + 32;
                     }
                 }
@@ -580,21 +580,13 @@ fn recalc_tcp_checksum(packet: &mut [u8], tcp_offset: usize, src_ip: Ipv4Addr, d
 
 /// Строит fake HPACK entries для HpackBomber.
 fn build_fake_hpack_entries() -> bytes::Bytes {
-    let mut entries = Vec::new();
-
-    // HPACK: :method = GET (Indexed, index 2)
-    entries.push(0x82);
-
-    // HPACK: :path = / (Indexed, index 4)
-    entries.push(0x84);
-
-    // HPACK: :scheme = https (Indexed, index 7)
-    entries.push(0x87);
-
-    // HPACK: :authority = fake (Literal Header with Indexing)
-    // Index 1 (:authority), value = "a" repeated 10 times
-    entries.push(0x41); // 0100 0001 = Literal with Indexing, index 1
-    entries.push(0x09); // value length = 9
+    let mut entries = vec![
+        0x82, // HPACK: :method = GET (Indexed, index 2)
+        0x84, // HPACK: :path = / (Indexed, index 4)
+        0x87, // HPACK: :scheme = https (Indexed, index 7)
+        0x41, // HPACK: :authority (Literal with Indexing, index 1)
+        0x09, // value length = 9
+    ];
     entries.extend_from_slice(b"aaaaaaaaa");
 
     bytes::Bytes::from(entries)
@@ -975,8 +967,8 @@ pub fn chunk_obfuscation(
     debug!("[B1] ChunkObfuscation: {} segments × {} bytes", split_count, seg_size);
 
     DesyncResult {
-        modified: Some(bytes::Bytes::from(modified)),
-        inject: inject.into_iter().map(bytes::Bytes::from).collect(),
+        modified: Some(modified),
+        inject,
         drop: false,
     }
 }
@@ -1034,6 +1026,46 @@ pub fn h2_frame_ordering(
     debug!("[RP12] H2FrameOrdering: reordered HEADERS frame");
 
     DesyncResult::inject_only(seg)
+}
+
+/// HTTP Header Case Mixing — чередование регистра в Host header (Demergi).
+pub fn http_case_mix(packet: &[u8]) -> DesyncResult {
+    let ip = match parse_ip_header(packet) {
+        Some(h) => h,
+        None => return DesyncResult::passthrough(),
+    };
+    let tcp_data = &packet[ip.header_len..];
+    let tcp = match parse_tcp_packet(tcp_data) {
+        Some(t) => t,
+        None => return DesyncResult::passthrough(),
+    };
+    let data_offset = tcp.data_offset;
+    let payload = &tcp_data[data_offset..];
+
+    if payload.len() < 10 {
+        return DesyncResult::passthrough();
+    }
+
+    let mut modified = packet.to_vec();
+    let payload_start = ip.header_len + data_offset;
+
+    for i in 0..payload.len().saturating_sub(5) {
+        if payload[i..i + 5].eq_ignore_ascii_case(b"Host:") {
+            let host_bytes = b"Host";
+            for j in 0..4 {
+                let byte = if j % 2 == 0 {
+                    host_bytes[j].to_ascii_lowercase()
+                } else {
+                    host_bytes[j].to_ascii_uppercase()
+                };
+                modified[payload_start + i + j] = byte;
+            }
+            debug!("[HTTP] CaseMix: Host → hOsT");
+            return DesyncResult::modified_only(modified);
+        }
+    }
+
+    DesyncResult::passthrough()
 }
 
 /// [NP7] Http11Pipeline: HTTP/1.1 pipeline abuse.

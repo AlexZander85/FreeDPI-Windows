@@ -151,6 +151,7 @@ pub struct ProxyFallback {
     /// Таймаут на подключение к прокси
     connect_timeout: Duration,
     /// Максимальное количество retry
+    #[allow(dead_code)]
     max_retries: u32,
 }
 
@@ -268,8 +269,10 @@ pub struct FreeProxyPool {
     /// Хранилище прокси
     proxies: Arc<DashMap<String, ProxyEntry>>,
     /// URL'ы для скачивания списков
+    #[allow(dead_code)]
     source_urls: Vec<String>,
     /// Интервал обновления
+    #[allow(dead_code)]
     update_interval: Duration,
 }
 
@@ -337,6 +340,11 @@ impl FreeProxyPool {
     /// Количество прокси в пуле.
     pub fn len(&self) -> usize {
         self.proxies.len()
+    }
+
+    /// Пуст ли пул.
+    pub fn is_empty(&self) -> bool {
+        self.proxies.is_empty()
     }
 
     /// Количество здоровых прокси.
@@ -413,6 +421,11 @@ impl FingerprintRotator {
     /// Количество fingerprint'ов.
     pub fn len(&self) -> usize {
         self.fingerprints.len()
+    }
+
+    /// Пуст ли ротатор.
+    pub fn is_empty(&self) -> bool {
+        self.fingerprints.is_empty()
     }
 
     /// Chrome 120 fingerprint.

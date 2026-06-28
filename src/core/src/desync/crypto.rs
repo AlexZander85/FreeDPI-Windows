@@ -221,9 +221,9 @@ fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
 }
 
 /// ChaCha20 XOR encryption (simplified, no Poly1305).
-fn chacha20_block_xor(data: &[u8], key: &[u8; 32], nonce: &[u8; 12]) -> Vec<u8> {
+pub fn chacha20_block_xor(data: &[u8], key: &[u8; 32], nonce: &[u8; 12]) -> Vec<u8> {
     let mut output = data.to_vec();
-    let blocks = (data.len() + 63) / 64;
+    let blocks = data.len().div_ceil(64);
 
     for block_idx in 0..blocks {
         let keystream = chacha20_block(key, block_idx as u32, nonce);
