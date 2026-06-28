@@ -1,0 +1,37 @@
+# === Rust build artifacts ===
+/target/
+src/target/
+**/target/
+**/*.rs.bk
+
+# === Node.js ===
+node_modules/
+dist/
+.vite/
+
+# === Tauri build ===
+src/ui/src-tauri/target/
+
+# === IDE / Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# === Beads / Ag (local dev tools) ===
+.beads/
+.ag/
+
+# === Local secrets / temp ===
+*.env
+*.env.local
+secrets/
+logs/
+*.log
+
+# === OS files ===
+Desktop.ini
+ehthumbs.db

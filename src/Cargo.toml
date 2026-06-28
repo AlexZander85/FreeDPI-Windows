@@ -1,0 +1,89 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "api",
+    "service",
+]
+exclude = ["ui/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["ByeByeDPI Team"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.52", features = ["full"] }
+
+# Parallel CPU processing
+rayon = "1.10"
+
+# WinDivert packet interception
+windivert = "0.7.0-beta.4"
+
+# Windows API (must match windivert's requirement: 0.62)
+windows = { version = "0.62", features = [
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+]}
+
+# Concurrent data structures
+dashmap = "6"
+moka = { version = "0.12", features = ["future", "sync"] }
+
+# Packet parsing (only packet module, no capture — avoids Packet.lib dependency)
+pnet_packet = "0.35"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "default-tls"] }
+
+# DNS
+trust-dns-resolver = "0.23"
+
+# HTTP API server
+axum = "0.8"
+tower = "0.5"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Zero-copy buffers
+bytes = "1.6"
+
+# Small vector optimization
+tinyvec = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# UUID for API resources
+uuid = { version = "1", features = ["v4"] }
+
+# Time
+chrono = "0.4"
+
+# CPU detection
+num_cpus = "1.16"
+
+# CIDR matching
+ipnet = "2.10"
+
+# IPC (Named Pipes)
+interprocess = "2"

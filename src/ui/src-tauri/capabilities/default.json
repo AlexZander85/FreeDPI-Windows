@@ -1,0 +1,9 @@
+{
+  "identifier": "com.byebyedpi.app",
+  "description": "ByeByeDPI Tauri capabilities",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "opener:default"
+  ]
+}

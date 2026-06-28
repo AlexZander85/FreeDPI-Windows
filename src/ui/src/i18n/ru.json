@@ -1,0 +1,118 @@
+{
+  "app": {
+    "title": "ByeByeDPI",
+    "version": "v0.1.0"
+  },
+  "nav": {
+    "status": "Статус",
+    "strategies": "Стратегии",
+    "connections": "Соединения",
+    "geo": "Гео-маршрутизация",
+    "settings": "Настройки"
+  },
+  "status": {
+    "title": "Статус движка",
+    "running": "Работает",
+    "stopped": "Остановлен",
+    "uptime": "Время работы",
+    "packets": "Обработано пакетов",
+    "connections": "Активные соединения",
+    "windivert": "WinDivert",
+    "raw_socket": "Raw Socket",
+    "ok": "OK",
+    "error": "Ошибка",
+    "packets_per_sec": "пакетов/с",
+    "hours": "ч",
+    "minutes": "м",
+    "seconds": "с"
+  },
+  "stats": {
+    "title": "Статистика трафика",
+    "received": "Получено",
+    "forwarded": "Переслано",
+    "injected": "Инжектировано",
+    "dropped": "Сброшено",
+    "tls_outbound": "TLS исходящий",
+    "errors": "Ошибки"
+  },
+  "strategies": {
+    "title": "Стратегии обхода DPI",
+    "count": "{{count}} техник",
+    "tcp": "TCP",
+    "ip": "IP",
+    "tls": "TLS",
+    "http": "HTTP",
+    "quic": "QUIC",
+    "obfs": "Обфускация",
+    "crypto": "Крипто",
+    "source": "Источник",
+    "multi_split": "MultiSplit",
+    "multi_disorder": "MultiDisorder",
+    "fake_sni": "Fake SNI",
+    "oob_injection": "OOB инъекция",
+    "frag_overlap": "IP фрагментация",
+    "bad_checksum": "Неверный checksum",
+    "ttl_manipulation": "Манипуляция TTL",
+    "tls_record_frag": "TLS Record фрагментация",
+    "h2_settings_flood": "HTTP/2 SETTINGS flood",
+    "quic_blocking": "Блокировка QUIC",
+    "chaCha20": "ChaCha20 шифрование",
+    "disorder": "Disorder",
+    "byte_by_byte": "По байту",
+    "port_shuffle": "Ротация портов",
+    "ttl_jitter": "TTL Jitter",
+    "dscp_random": "Случайный DSCP",
+    "udp2icmp": "UDP→ICMP",
+    "xor_first": "XOR первые N",
+    "wg_obfs": "WireGuard обфускация"
+  },
+  "connections": {
+    "title": "Активные соединения",
+    "source": "Источник",
+    "destination": "Назначение",
+    "state": "Состояние",
+    "desync": "Desync",
+    "total": "Всего: {{count}}",
+    "syn_sent": "SYN отправлен",
+    "established": "Установлено",
+    "closing": "Закрытие",
+    "no_connections": "Нет активных соединений"
+  },
+  "geo": {
+    "title": "Гео-маршрутизация",
+    "russia": "Россия",
+    "europe": "Европа",
+    "us": "США",
+    "global": "Глобальный",
+    "excluded": "Исключён",
+    "domains": "{{count}} доменов",
+    "bad_routes": "Плохие маршруты: {{count}}"
+  },
+  "settings": {
+    "title": "Настройки",
+    "general": "Основные",
+    "advanced": "Дополнительно",
+    "windivert_filter": "Фильтр WinDivert",
+    "split_size": "Размер сплита",
+    "split_count": "Количество сегментов",
+    "fake_sni": "Fake SNI",
+    "fake_ttl_offset": "Fake TTL смещение",
+    "api_port": "Порт API",
+    "dns_doh_url": "DNS-over-HTTPS URL",
+    "dns_dot_addr": "DNS-over-TLS адрес",
+    "dns_cache_ttl": "TTL кэша DNS (с)",
+    "save": "Сохранить",
+    "saved": "Сохранено!",
+    "reset": "Сбросить по умолчанию"
+  },
+  "language": {
+    "label": "Язык",
+    "en": "English",
+    "ru": "Русский"
+  },
+  "theme": {
+    "light": "Светлая",
+    "dark": "Тёмная",
+    "system": "Системная"
+  }
+}

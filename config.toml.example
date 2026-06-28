@@ -1,0 +1,25 @@
+# ByeByeDPI Configuration
+
+[api]
+port = 11337
+api_key = ""
+enabled = true
+
+[windivert]
+filter = "ip && (tcp.DstPort == 443 or tcp.SrcPort == 443 or udp.DstPort == 53 or udp.DstPort == 443)"
+queue_length = 8192
+queue_time = 2000
+
+[dns]
+doh_url = "https://cloudflare-dns.com/dns-query"
+dot_addr = "1.1.1.1:853"
+cache_ttl = 300
+
+[split_tunnel]
+mode = "blacklistonly"
+
+[desync]
+fake_sni = "www.google.com"
+split_size = 1
+split_count = 3
+fake_ttl_offset = 1

@@ -1,0 +1,118 @@
+{
+  "app": {
+    "title": "ByeByeDPI",
+    "version": "v0.1.0"
+  },
+  "nav": {
+    "status": "Status",
+    "strategies": "Strategies",
+    "connections": "Connections",
+    "geo": "Geo-Routing",
+    "settings": "Settings"
+  },
+  "status": {
+    "title": "Engine Status",
+    "running": "Running",
+    "stopped": "Stopped",
+    "uptime": "Uptime",
+    "packets": "Packets Processed",
+    "connections": "Active Connections",
+    "windivert": "WinDivert",
+    "raw_socket": "Raw Socket",
+    "ok": "OK",
+    "error": "Error",
+    "packets_per_sec": "packets/sec",
+    "hours": "h",
+    "minutes": "m",
+    "seconds": "s"
+  },
+  "stats": {
+    "title": "Traffic Statistics",
+    "received": "Received",
+    "forwarded": "Forwarded",
+    "injected": "Injected",
+    "dropped": "Dropped",
+    "tls_outbound": "TLS Outbound",
+    "errors": "Errors"
+  },
+  "strategies": {
+    "title": "Desync Strategies",
+    "count": "{{count}} techniques",
+    "tcp": "TCP",
+    "ip": "IP",
+    "tls": "TLS",
+    "http": "HTTP",
+    "quic": "QUIC",
+    "obfs": "Obfuscation",
+    "crypto": "Crypto",
+    "source": "Source",
+    "multi_split": "MultiSplit",
+    "multi_disorder": "MultiDisorder",
+    "fake_sni": "Fake SNI",
+    "oob_injection": "OOB Injection",
+    "frag_overlap": "Fragmentation Overlap",
+    "bad_checksum": "Bad Checksum",
+    "ttl_manipulation": "TTL Manipulation",
+    "tls_record_frag": "TLS Record Fragment",
+    "h2_settings_flood": "H2 Settings Flood",
+    "quic_blocking": "QUIC Blocking",
+    "chaCha20": "ChaCha20 Encryption",
+    "disorder": "Disorder",
+    "byte_by_byte": "Byte-by-Byte",
+    "port_shuffle": "Port Shuffle",
+    "ttl_jitter": "TTL Jitter",
+    "dscp_random": "DSCP Random",
+    "udp2icmp": "UDP→ICMP",
+    "xor_first": "XOR First N",
+    "wg_obfs": "WireGuard Obfs"
+  },
+  "connections": {
+    "title": "Active Connections",
+    "source": "Source",
+    "destination": "Destination",
+    "state": "State",
+    "desync": "Desync",
+    "total": "Total: {{count}}",
+    "syn_sent": "SYN Sent",
+    "established": "Established",
+    "closing": "Closing",
+    "no_connections": "No active connections"
+  },
+  "geo": {
+    "title": "Geo-Routing",
+    "russia": "Russia",
+    "europe": "Europe",
+    "us": "United States",
+    "global": "Global",
+    "excluded": "Excluded",
+    "domains": "{{count}} domains",
+    "bad_routes": "Bad routes: {{count}}"
+  },
+  "settings": {
+    "title": "Settings",
+    "general": "General",
+    "advanced": "Advanced",
+    "windivert_filter": "WinDivert Filter",
+    "split_size": "Split Size",
+    "split_count": "Split Count",
+    "fake_sni": "Fake SNI",
+    "fake_ttl_offset": "Fake TTL Offset",
+    "api_port": "API Port",
+    "dns_doh_url": "DNS-over-HTTPS URL",
+    "dns_dot_addr": "DNS-over-TLS Address",
+    "dns_cache_ttl": "DNS Cache TTL (s)",
+    "save": "Save",
+    "saved": "Saved!",
+    "reset": "Reset to Defaults"
+  },
+  "language": {
+    "label": "Language",
+    "en": "English",
+    "ru": "Русский"
+  },
+  "theme": {
+    "light": "Light",
+    "dark": "Dark",
+    "system": "System"
+  }
+}

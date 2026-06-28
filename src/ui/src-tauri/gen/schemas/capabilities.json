@@ -1,0 +1,1 @@
+{"com.byebyedpi.app":{"identifier":"com.byebyedpi.app","description":"ByeByeDPI Tauri capabilities","local":true,"windows":["main"],"permissions":["core:default","opener:default"]}}
