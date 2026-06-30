@@ -100,8 +100,8 @@ impl Default for ProbeConfig {
             tcp16_min_timeout: Duration::from_millis(1500),
 
             // Accumulation
-            hot_ttl: Duration::from_secs(86400),       // 24h
-            probe_interval: Duration::from_secs(300),   // 5 min
+            hot_ttl: Duration::from_secs(86400),      // 24h
+            probe_interval: Duration::from_secs(300), // 5 min
             promote_threshold: 50,
             family_threshold: 10,
 

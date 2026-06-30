@@ -62,9 +62,7 @@ impl TlsProbe {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
                 let err_str = e.to_string().to_lowercase();
-                let verdict = if err_str.contains("reset") {
-                    TlsFailureCode::Reset
-                } else if err_str.contains("refused") {
+                let verdict = if err_str.contains("reset") || err_str.contains("refused") {
                     TlsFailureCode::Reset
                 } else {
                     TlsFailureCode::SilentDrop
@@ -176,40 +174,43 @@ impl TlsProbe {
         let domain = domain.to_string();
         let timeout = self.config.tls_connect_timeout;
 
-        let result = tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || {
-            // Build TLS connector with specific version
-            let connector = native_tls::TlsConnector::builder()
-                .min_protocol_version(Some(protocol))
-                .max_protocol_version(Some(protocol))
-                .danger_accept_invalid_certs(true)
-                .build();
+        let result = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || {
+                // Build TLS connector with specific version
+                let connector = native_tls::TlsConnector::builder()
+                    .min_protocol_version(Some(protocol))
+                    .max_protocol_version(Some(protocol))
+                    .danger_accept_invalid_certs(true)
+                    .build();
 
-            let connector = match connector {
-                Ok(c) => c,
-                Err(_) => return TlsFailureCode::Garbage,
-            };
+                let connector = match connector {
+                    Ok(c) => c,
+                    Err(_) => return TlsFailureCode::Garbage,
+                };
 
-            // TCP connect
-            let tcp_stream = match std::net::TcpStream::connect(addr) {
-                Ok(s) => s,
-                Err(e) => {
-                    let err = e.to_string().to_lowercase();
-                    if err.contains("reset") {
-                        return TlsFailureCode::Reset;
+                // TCP connect
+                let tcp_stream = match std::net::TcpStream::connect(addr) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let err = e.to_string().to_lowercase();
+                        if err.contains("reset") {
+                            return TlsFailureCode::Reset;
+                        }
+                        if err.contains("refused") {
+                            return TlsFailureCode::Reset;
+                        }
+                        return TlsFailureCode::SilentDrop;
                     }
-                    if err.contains("refused") {
-                        return TlsFailureCode::Reset;
-                    }
-                    return TlsFailureCode::SilentDrop;
+                };
+
+                // TLS handshake
+                match connector.connect(&domain, tcp_stream) {
+                    Ok(_stream) => TlsFailureCode::HandshakeOk,
+                    Err(e) => classify_handshake_error(&e),
                 }
-            };
-
-            // TLS handshake
-            match connector.connect(&domain, tcp_stream) {
-                Ok(_stream) => TlsFailureCode::HandshakeOk,
-                Err(e) => classify_handshake_error(&e),
-            }
-        }))
+            }),
+        )
         .await;
 
         match result {
@@ -222,15 +223,14 @@ impl TlsProbe {
     /// Fallback probe using reqwest (confirms TLS works).
     async fn probe_reqwest(&self, domain: &str) -> bool {
         let url = format!("https://{}/", domain);
-        match tokio::time::timeout(
-            self.config.tls_connect_timeout,
-            self.http_client.get(&url).send(),
+        matches!(
+            tokio::time::timeout(
+                self.config.tls_connect_timeout,
+                self.http_client.get(&url).send(),
+            )
+            .await,
+            Ok(Ok(_))
         )
-        .await
-        {
-            Ok(Ok(_)) => true,
-            _ => false,
-        }
     }
 }
 
@@ -266,7 +266,10 @@ fn classify_handshake_error(e: &native_tls::HandshakeError<std::net::TcpStream>)
                 return TlsFailureCode::Alert;
             }
 
-            if err_str.contains("decode") || err_str.contains("oversized") || err_str.contains("illegal") {
+            if err_str.contains("decode")
+                || err_str.contains("oversized")
+                || err_str.contains("illegal")
+            {
                 return TlsFailureCode::Garbage;
             }
 

@@ -53,9 +53,7 @@ impl Tcp16Probe {
 
         let result = tokio::time::timeout(
             Duration::from_secs(15),
-            tokio::task::spawn_blocking(move || {
-                probe_blocking(addr, &domain, &config)
-            }),
+            tokio::task::spawn_blocking(move || probe_blocking(addr, &domain, &config)),
         )
         .await;
 
@@ -94,7 +92,10 @@ fn probe_blocking(addr: SocketAddr, domain: &str, config: &ProbeConfig) -> Tcp16
     let mut rtt_count: u32 = 0;
 
     for _ in 0..2 {
-        let req = format!("HEAD / HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n", domain);
+        let req = format!(
+            "HEAD / HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
+            domain
+        );
         let start = std::time::Instant::now();
 
         let mut stream = match tcp_stream.try_clone() {
@@ -143,7 +144,10 @@ fn probe_blocking(addr: SocketAddr, domain: &str, config: &ProbeConfig) -> Tcp16
                 let detected_kb = (i as u64 * pad_size as u64) / 1024;
                 debug!(
                     "TCP16 detected at {}KB for {} (request {}/{}) - stream clone failed",
-                    detected_kb, domain, i + 1, total_requests
+                    detected_kb,
+                    domain,
+                    i + 1,
+                    total_requests
                 );
                 return Tcp16ProbeResult {
                     detected: true,
@@ -155,8 +159,7 @@ fn probe_blocking(addr: SocketAddr, domain: &str, config: &ProbeConfig) -> Tcp16
         };
 
         // Set write timeout
-        let _ = stream
-            .set_write_timeout(Some(timeout_per_req));
+        let _ = stream.set_write_timeout(Some(timeout_per_req));
 
         match stream.write_all(req.as_bytes()) {
             Ok(()) => {
@@ -203,8 +206,7 @@ fn generate_padding(size: usize) -> Vec<u8> {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
-    std::time::SystemTime::now()
-        .hash(&mut hasher);
+    std::time::SystemTime::now().hash(&mut hasher);
     let seed = hasher.finish();
 
     (0..size)

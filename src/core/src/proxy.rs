@@ -403,12 +403,7 @@ impl FreeProxyPool {
                     Ok(a) => a,
                     Err(_) => return,
                 };
-                match tokio::time::timeout(
-                    timeout,
-                    tokio::net::TcpStream::connect(parsed),
-                )
-                .await
-                {
+                match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(parsed)).await {
                     Ok(Ok(_)) => {
                         if let Some(entry) = proxies.get(&addr_clone) {
                             entry.mark_success(0);
@@ -663,7 +658,6 @@ pub fn parse_proxy_list(text: &str) -> Vec<ProxyEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::IpAddr;
 
     #[test]
     fn test_proxy_fallback_empty() {

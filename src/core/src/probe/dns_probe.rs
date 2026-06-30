@@ -464,10 +464,7 @@ mod tests {
     fn test_cross_validate_ok() {
         let udp = vec![Ipv4Addr::new(8, 8, 8, 8)];
         let doh = vec![Ipv4Addr::new(8, 8, 8, 8)];
-        assert_eq!(
-            cross_validate(&udp, &doh, false, false),
-            DnsFailureCode::Ok
-        );
+        assert_eq!(cross_validate(&udp, &doh, false, false), DnsFailureCode::Ok);
     }
 
     #[test]

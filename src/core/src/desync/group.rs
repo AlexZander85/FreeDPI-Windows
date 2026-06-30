@@ -336,9 +336,13 @@ impl DesyncGroup {
     fn apply_single(&self, technique: &DesyncTechnique, packet: &bytes::Bytes) -> DesyncResult {
         let c = &self.config;
         match technique {
-            DesyncTechnique::MultiSplit => {
-                tcp::multisplit(packet, c.split_size, c.split_count, c.fake_ttl_offset, c.inter_delay_us)
-            }
+            DesyncTechnique::MultiSplit => tcp::multisplit(
+                packet,
+                c.split_size,
+                c.split_count,
+                c.fake_ttl_offset,
+                c.inter_delay_us,
+            ),
             DesyncTechnique::MultiDisorder => {
                 tcp::multidisorder(packet, c.split_size, c.split_count, c.fake_ttl_offset)
             }
@@ -444,7 +448,13 @@ impl DesyncGroup {
                 DesyncResult::passthrough()
             }
             DesyncTechnique::ReverseFragmentOrder => {
-                let r = tcp::multisplit(packet, c.split_size, c.split_count, c.fake_ttl_offset, c.inter_delay_us);
+                let r = tcp::multisplit(
+                    packet,
+                    c.split_size,
+                    c.split_count,
+                    c.fake_ttl_offset,
+                    c.inter_delay_us,
+                );
                 tcp::reverse_fragment_order(r)
             }
             DesyncTechnique::HostFakeSplit => {

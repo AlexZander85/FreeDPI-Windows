@@ -136,8 +136,10 @@ mod tests {
 
     #[test]
     fn test_probe_config_timeout() {
-        let mut config = ProbeConfig::default();
-        config.tcp_connect_timeout = Duration::from_millis(100);
+        let config = ProbeConfig {
+            tcp_connect_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
         let probe = TcpProbe::new(&config);
 
         // Non-routable IP — should timeout

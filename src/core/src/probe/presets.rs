@@ -298,6 +298,10 @@ mod tests {
     #[test]
     fn test_total_domain_count() {
         let count = total_domain_count();
-        assert!(count >= 139, "Total should be at least 139 domains, got {}", count);
+        assert!(
+            count >= 139,
+            "Total should be at least 139 domains, got {}",
+            count
+        );
     }
 }

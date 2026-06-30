@@ -120,8 +120,10 @@ impl FallbackChain {
     }
 
     pub fn from_techniques(techniques: Vec<DesyncTechnique>) -> Self {
-        let entries: Vec<Mutex<FallbackEntry>> =
-            techniques.into_iter().map(|t| Mutex::new(FallbackEntry::new(t))).collect();
+        let entries: Vec<Mutex<FallbackEntry>> = techniques
+            .into_iter()
+            .map(|t| Mutex::new(FallbackEntry::new(t)))
+            .collect();
         Self {
             entries,
             ..Self::new()
