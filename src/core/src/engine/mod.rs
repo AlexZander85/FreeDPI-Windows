@@ -39,6 +39,7 @@ pub enum PacketDecision {
     Desync {
         inject: Vec<bytes::Bytes>,
         inject_protocol: InjectProtocol,
+        inter_delay_us: u32,
     },
     Drop,
 }
@@ -258,8 +259,13 @@ impl ProcessingPipeline {
                         Ok(PacketDecision::Desync {
                             inject,
                             inject_protocol,
+                            inter_delay_us,
                         }) => {
-                            for inject_pkt in &inject {
+                            for (i, inject_pkt) in inject.iter().enumerate() {
+                                if i > 0 && inter_delay_us > 0 {
+                                    tokio::time::sleep(Duration::from_micros(inter_delay_us as u64))
+                                        .await;
+                                }
                                 match inject_protocol {
                                     InjectProtocol::Tcp => {
                                         self.inject_tcp_packet(inject_pkt.clone(), &captured.addr)
@@ -368,9 +374,11 @@ impl ProcessingPipeline {
         if let Some(modified) = result.modified {
             return Ok(PacketDecision::Modify(modified));
         }
+        let inter_delay = result.inter_delay_us;
         Ok(PacketDecision::Desync {
             inject: result.inject,
             inject_protocol: InjectProtocol::Udp,
+            inter_delay_us: inter_delay,
         })
     }
 
@@ -389,9 +397,11 @@ impl ProcessingPipeline {
         if let Some(modified) = result.modified {
             return Ok(PacketDecision::Modify(modified));
         }
+        let inter_delay = result.inter_delay_us;
         Ok(PacketDecision::Desync {
             inject: result.inject,
             inject_protocol: InjectProtocol::Tcp,
+            inter_delay_us: inter_delay,
         })
     }
 
@@ -530,6 +540,8 @@ impl ProcessingPipeline {
             return Ok(PacketDecision::Drop);
         }
 
+        let inter_delay = result.inter_delay_us;
+
         if let Some(modified) = result.modified {
             if result.inject.is_empty() {
                 return Ok(PacketDecision::Modify(modified));
@@ -537,12 +549,14 @@ impl ProcessingPipeline {
             return Ok(PacketDecision::Desync {
                 inject: result.inject,
                 inject_protocol: InjectProtocol::Tcp,
+                inter_delay_us: inter_delay,
             });
         }
 
         Ok(PacketDecision::Desync {
             inject: result.inject,
             inject_protocol: InjectProtocol::Tcp,
+            inter_delay_us: inter_delay,
         })
     }
 

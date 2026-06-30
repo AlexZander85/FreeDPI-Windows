@@ -3800,3 +3800,86 @@ GET /api/v1/probe/history
 - Preset domain counts (telegram=52, discord=21, social=16)
 - Accumulator eTLD+1 expansion
 - Strategy map recommendations
+
+---
+
+## 26. Fallback Chain + MultiSplit + ProxyPool enhancements
+
+### 26.1 Fallback Chain — bug fix + exponential backoff
+
+**Проблема:** `record_success()` и `record_failure()` **не инкрементировали** `success_count`/`fail_count`. Fallback фактически работал как round-robin (все записи имели success_rate = 1.0).
+
+**Исправление:**
+```rust
+// БЫЛО: только логировал
+pub fn record_success(&self, _latency_us: u64) { debug!(...); }
+pub fn record_failure(&self) { self.advance(); }
+
+// СТАЛО: инкрементирует счётчики
+pub fn record_success(&self, latency_us: u64) {
+    entry.success_count += 1;  // ← инкремент
+    // + сброс backoff + сброс sliding window
+}
+pub fn record_failure(&self) {
+    self.entries[idx].lock().unwrap().fail_count += 1;  // ← инкремент
+    // + sliding window record + advance + backoff
+}
+```
+
+**Новые компоненты:**
+- `Mutex<FallbackEntry>` — interior mutability для `&self` safety
+- `ErrorWindow` — sliding window ошибок (VecDeque<Instant>, 30s window)
+- Exponential backoff: `min(cap, base × 2^attempts)` + full jitter
+- Non-blocking cooldown: `next_allowed: Mutex<Instant>` — advance() проверяет перед переключением
+- `snapshot()` теперь включает `success_count`, `fail_count`, `error_window_count`
+
+### 26.2 MultiSplit — inter_delay_us
+
+**Новый параметр** `inter_delay_us: u32` в `multisplit()` — задержка между инъекциями (мкс).
+
+**Цепочка данных:**
+```
+DesyncConfig.inter_delay_us
+  → multisplit(packet, split_size, split_count, fake_ttl_offset, inter_delay_us)
+    → DesyncResult.inter_delay_us
+      → PacketDecision::Desync { inter_delay_us }
+        → engine inject loop: sleep(inter_delay_us) между inject'ами
+```
+
+**Использование:** Default = 0 (без задержки). Opt-in через конфиг для time-based DPI:
+```toml
+[desync]
+inter_delay_us = 5000  # 5ms между инъекциями (для time-based DPI)
+```
+
+**Архитектурное решение:** inter_delay_us хранится в `DesyncResult` (не в конфиге), потому что каждая техника может требовать разного delay. Multisplit передаёт значение из `DesyncConfig`, другие техники игнорируют (default 0).
+
+### 26.3 FreeProxyPool — custom lists + refresh + health check
+
+**Новые методы:**
+| Метод | Описание |
+|-------|----------|
+| `load_from_file(path)` | Парсинг `host:port` строк из локального файла |
+| `load_from_url(url)` | reqwest GET → split lines → parse → add |
+| `refresh()` | Reload всех sources (URL + custom files) |
+| `needs_refresh()` | Проверка `update_interval` elapsed |
+| `health_check_all(timeout_ms)` | Parallel TCP connect к каждому прокси |
+| `with_custom_sources(vec)` | Конструктор с пользовательскими путями |
+
+**Конфигурация:**
+```toml
+[proxy.free_pool]
+enabled = true
+source_urls = ["https://...socks5.txt"]
+custom_lists = ["/path/to/my_proxies.txt"]  # ← новое
+refresh_interval = 300
+```
+
+**Поток данных:**
+```
+FreeProxyPool::refresh()
+  ├── load_from_url(source_urls[0])  → add()
+  ├── load_from_url(source_urls[1])  → add()
+  └── load_from_file(custom_lists[0]) → add()
+       └── last_refresh = Instant::now()
+```

@@ -303,6 +303,7 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
     DesyncResult {
         modified: Some(modified),
         inject,
+        inter_delay_us: 0,
         drop: false,
     }
 }

@@ -19,9 +19,9 @@
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Тип прокси-провайдера.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -272,15 +272,18 @@ pub struct ProxySnapshot {
 /// ## Принцип
 /// Скачиваем списки бесплатных SOCKS5/HTTP прокси,
 /// проверяем их доступность, храним healthy прокси.
+/// Поддержка пользовательских списков (файлы + URL).
 pub struct FreeProxyPool {
     /// Хранилище прокси
     proxies: Arc<DashMap<String, ProxyEntry>>,
     /// URL'ы для скачивания списков
-    #[allow(dead_code)]
     source_urls: Vec<String>,
+    /// Пути к пользовательским файлам со списками прокси
+    custom_sources: Vec<String>,
     /// Интервал обновления
-    #[allow(dead_code)]
     update_interval: Duration,
+    /// Время последнего обновления
+    last_refresh: Mutex<Instant>,
 }
 
 impl FreeProxyPool {
@@ -294,13 +297,131 @@ impl FreeProxyPool {
                 "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt"
                     .to_string(),
             ],
+            custom_sources: Vec::new(),
             update_interval: Duration::from_secs(300),
+            last_refresh: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Создаёт пул с пользовательскими источниками.
+    pub fn with_custom_sources(custom_sources: Vec<String>) -> Self {
+        Self {
+            custom_sources,
+            ..Self::new()
         }
     }
 
     /// Добавляет прокси в пул.
     pub fn add(&self, entry: ProxyEntry) {
         self.proxies.insert(entry.addr.to_string(), entry);
+    }
+
+    /// Загружает прокси из текстового файла (one per line: host:port).
+    pub fn load_from_file(&self, path: &std::path::Path) -> Result<usize, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        let proxies = parse_proxy_list(&content);
+        let count = proxies.len();
+        for entry in proxies {
+            self.add(entry);
+        }
+        info!("Loaded {} proxies from {}", count, path.display());
+        Ok(count)
+    }
+
+    /// Загружает прокси из URL.
+    pub async fn load_from_url(&self, url: &str) -> Result<usize, String> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+        let text = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch {}: {}", url, e))?
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read response from {}: {}", url, e))?;
+
+        let proxies = parse_proxy_list(&text);
+        let count = proxies.len();
+        for entry in proxies {
+            self.add(entry);
+        }
+        info!("Loaded {} proxies from {}", count, url);
+        Ok(count)
+    }
+
+    /// Обновляет пул из всех источников (URL + файлы).
+    pub async fn refresh(&self) -> usize {
+        let mut total = 0;
+
+        // Загрузка из URL
+        for url in &self.source_urls {
+            match self.load_from_url(url).await {
+                Ok(count) => total += count,
+                Err(e) => warn!("Failed to refresh from {}: {}", url, e),
+            }
+        }
+
+        // Загрузка из пользовательских файлов
+        for path_str in &self.custom_sources {
+            let path = std::path::Path::new(path_str);
+            match self.load_from_file(path) {
+                Ok(count) => total += count,
+                Err(e) => warn!("Failed to load custom list: {}", e),
+            }
+        }
+
+        // Обновляем время последнего refresh
+        {
+            let mut last = self.last_refresh.lock().unwrap();
+            *last = Instant::now();
+        }
+
+        total
+    }
+
+    /// Проверяет, пора ли обновлять пул.
+    pub fn needs_refresh(&self) -> bool {
+        let last = self.last_refresh.lock().unwrap();
+        last.elapsed() >= self.update_interval
+    }
+
+    /// Проверяет здоровье всех прокси (TCP connect с таймаутом).
+    pub async fn health_check_all(&self, timeout_ms: u64) {
+        let addrs: Vec<String> = self.proxies.iter().map(|e| e.key().clone()).collect();
+        let timeout = Duration::from_millis(timeout_ms);
+
+        for addr in addrs {
+            let addr_clone = addr.clone();
+            let proxies = self.proxies.clone();
+            tokio::spawn(async move {
+                let parsed: std::net::SocketAddr = match addr_clone.parse() {
+                    Ok(a) => a,
+                    Err(_) => return,
+                };
+                match tokio::time::timeout(
+                    timeout,
+                    tokio::net::TcpStream::connect(parsed),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        if let Some(entry) = proxies.get(&addr_clone) {
+                            entry.mark_success(0);
+                        }
+                    }
+                    _ => {
+                        if let Some(entry) = proxies.get(&addr_clone) {
+                            entry.mark_failed();
+                        }
+                    }
+                }
+            });
+        }
     }
 
     /// Получает случайный здоровый прокси.

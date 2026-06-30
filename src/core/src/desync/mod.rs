@@ -50,6 +50,8 @@ pub struct DesyncResult {
     pub modified: Option<bytes::Bytes>,
     /// Дополнительные пакеты для инъекции.
     pub inject: Vec<bytes::Bytes>,
+    /// Задержка между инъекциями (мкс). 0 = без задержки.
+    pub inter_delay_us: u32,
     /// Дропнуть пакет (не отправлять).
     pub drop: bool,
 }
@@ -59,6 +61,7 @@ impl DesyncResult {
         Self {
             modified: None,
             inject: Vec::new(),
+            inter_delay_us: 0,
             drop: false,
         }
     }
@@ -67,6 +70,7 @@ impl DesyncResult {
         Self {
             modified: Some(modified.into()),
             inject: Vec::new(),
+            inter_delay_us: 0,
             drop: false,
         }
     }
@@ -75,6 +79,7 @@ impl DesyncResult {
         Self {
             modified: None,
             inject: vec![inject.into()],
+            inter_delay_us: 0,
             drop: false,
         }
     }
@@ -86,6 +91,7 @@ impl DesyncResult {
         Self {
             modified: Some(modified.into()),
             inject: vec![inject.into()],
+            inter_delay_us: 0,
             drop: false,
         }
     }
@@ -94,6 +100,7 @@ impl DesyncResult {
         Self {
             modified: None,
             inject,
+            inter_delay_us: 0,
             drop: false,
         }
     }
@@ -102,6 +109,7 @@ impl DesyncResult {
         Self {
             modified: None,
             inject: Vec::new(),
+            inter_delay_us: 0,
             drop: true,
         }
     }
@@ -451,8 +459,10 @@ pub struct DesyncConfig {
     pub bad_checksum: bool,
     /// TTL offset для fake пакетов (обычно 1 — на 1 меньше реального)
     pub fake_ttl_offset: u8,
-    /// Задержка между инъекциями (мкс)
+    /// Задержка между инъекциями (мкс) — jitter перед forward
     pub inject_delay_us: u64,
+    /// Задержка между отдельными inject пакетами (мкс). 0 = без задержки.
+    pub inter_delay_us: u32,
     /// Количество PRNG вызовов между reseed'ами.
     /// 0 = отключено (для benchmarking).
     /// 8192 = рекомендуется для production (~10ms при 844K pps).
@@ -469,6 +479,7 @@ impl Default for DesyncConfig {
             bad_checksum: false,
             fake_ttl_offset: 1,
             inject_delay_us: 1000,
+            inter_delay_us: 0,
             reseed_interval: 8192,
         }
     }

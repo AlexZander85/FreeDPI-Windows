@@ -96,6 +96,7 @@ impl PipelineState {
         DesyncResult {
             modified: Some(self.packet),
             inject: self.injects,
+            inter_delay_us: 0,
             drop: self.drop,
         }
     }
@@ -222,6 +223,7 @@ impl DesyncGroup {
                     c.split_size,
                     c.split_count,
                     c.fake_ttl_offset,
+                    c.inter_delay_us,
                 );
                 state.invalidate_header_cache();
                 self.merge_into_state(state, result);
@@ -335,7 +337,7 @@ impl DesyncGroup {
         let c = &self.config;
         match technique {
             DesyncTechnique::MultiSplit => {
-                tcp::multisplit(packet, c.split_size, c.split_count, c.fake_ttl_offset)
+                tcp::multisplit(packet, c.split_size, c.split_count, c.fake_ttl_offset, c.inter_delay_us)
             }
             DesyncTechnique::MultiDisorder => {
                 tcp::multidisorder(packet, c.split_size, c.split_count, c.fake_ttl_offset)
@@ -442,7 +444,7 @@ impl DesyncGroup {
                 DesyncResult::passthrough()
             }
             DesyncTechnique::ReverseFragmentOrder => {
-                let r = tcp::multisplit(packet, c.split_size, c.split_count, c.fake_ttl_offset);
+                let r = tcp::multisplit(packet, c.split_size, c.split_count, c.fake_ttl_offset, c.inter_delay_us);
                 tcp::reverse_fragment_order(r)
             }
             DesyncTechnique::HostFakeSplit => {

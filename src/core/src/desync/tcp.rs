@@ -38,6 +38,7 @@ use tracing::debug;
 /// - `split_size`: размер каждого сегмента (байт)
 /// - `split_count`: количество сегментов
 /// - `fake_ttl_offset`: уменьшение TTL для не-последних сегментов
+/// - `inter_delay_us`: задержка между инъекциями (мкс, 0 = без задержки)
 ///
 /// ## Returns
 /// - `modified`: последний сегмент (с реальным началом данных, нормальный TTL)
@@ -47,6 +48,7 @@ pub fn multisplit(
     split_size: usize,
     split_count: usize,
     fake_ttl_offset: u8,
+    inter_delay_us: u32,
 ) -> DesyncResult {
     let ip = match parse_ip_header(packet) {
         Some(h) => h,
@@ -107,15 +109,17 @@ pub fn multisplit(
     );
 
     debug!(
-        "[Z1] MultiSplit: {} segs × {} bytes → {} injects",
+        "[Z1] MultiSplit: {} segs × {} bytes → {} injects (delay={}us)",
         actual_count,
         split_size,
-        inject.len()
+        inject.len(),
+        inter_delay_us
     );
 
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
         inject: inject.into_iter().map(bytes::Bytes::from).collect(),
+        inter_delay_us,
         drop: false,
     }
 }
@@ -133,7 +137,7 @@ pub fn multidisorder(
     fake_ttl_offset: u8,
 ) -> DesyncResult {
     // Используем multisplit + переставляем inject в обратном порядке
-    let mut result = multisplit(packet, split_size, split_count, fake_ttl_offset);
+    let mut result = multisplit(packet, split_size, split_count, fake_ttl_offset, 0);
     result.inject.reverse();
     debug!(
         "[Z2] MultiDisorder: {} segments reversed",
@@ -268,6 +272,7 @@ pub fn tcpseg(packet: &bytes::Bytes, max_seg_size: usize, _fake_ttl_offset: u8) 
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
         inject: inject.into_iter().map(bytes::Bytes::from).collect(),
+        inter_delay_us: 0,
         drop: false,
     }
 }
@@ -1218,6 +1223,7 @@ pub fn disorder(packet: &bytes::Bytes, split_at: usize, fake_ttl_offset: u8) -> 
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
         inject: vec![bytes::Bytes::from(seg2)],
+        inter_delay_us: 0,
         drop: false,
     }
 }
@@ -1291,6 +1297,7 @@ pub fn multidisorder_new(
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
         inject: segments.into_iter().map(bytes::Bytes::from).collect(),
+        inter_delay_us: 0,
         drop: false,
     }
 }
@@ -1508,6 +1515,7 @@ pub fn byte_by_byte(packet: &bytes::Bytes, max_bytes: usize, fake_ttl_offset: u8
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
         inject: inject.into_iter().map(bytes::Bytes::from).collect(),
+        inter_delay_us: 0,
         drop: false,
     }
 }
@@ -2142,6 +2150,7 @@ pub fn syn_ack_split(packet: &[u8]) -> DesyncResult {
     DesyncResult {
         modified: None,
         inject: vec![bytes::Bytes::from(syn_seg), bytes::Bytes::from(ack_seg)],
+        inter_delay_us: 0,
         drop: false,
     }
 }

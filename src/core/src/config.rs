@@ -232,6 +232,7 @@ impl Config {
             bad_checksum: false,
             fake_ttl_offset: self.desync.fake_ttl_offset,
             inject_delay_us: self.desync.inject_delay_us,
+            inter_delay_us: 0,
             reseed_interval: 8192,
         };
 
