@@ -4,7 +4,7 @@
 
 ### Advanced DPI Bypass Engine for Windows
 
-**Rust** • **~180 Techniques** • **5-10 Gbps** • **Zero-Copy Pipeline**
+**Rust** • **~185 Techniques** • **5-10 Gbps** • **Zero-Copy Pipeline**
 
 [![Rust](https://img.shields.io/badge/Rust-2024-blue?logo=rust)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
@@ -22,9 +22,10 @@
 
 | | |
 |---|---|
-| ⚡ **Скорость** | Обработка до **10 Gbps** (~850K пакетов/сек) grâce zero-copy pipeline и lock-free структурам |
+| ⚡ **Скорость** | Обработка до **10 Gbps** (~850K пакетов/сек) благодаря zero-copy pipeline и lock-free структурам |
 | 🦀 **Rust** | Memory safety, zero-cost abstractions, отсутствие GC пауз |
-| 🎯 **~180 техник** | TCP desync, TLS fragmentation, QUIC bypass, HTTP obfuscation, DNS protection |
+| 🎯 **~185 техник** | TCP desync, TLS fragmentation, QUIC bypass, HTTP obfuscation, DNS protection |
+| 🔍 **DPI Probe** | Превентивное определение типа DPI-блокировки (5-phase pipeline) |
 | 🧠 **Умные функции** | Auto-TTL, adaptive DPI detection, probe/tune/run, geo-routing |
 | 🖥️ **GUI + CLI** | System tray UI (Tauri) + Windows Service + REST API |
 | 🔒 **Split Tunneling** | Blacklist/whitelist/auto режимы с persistent blocked domains |
@@ -43,7 +44,8 @@
 |---|---|
 | ⚡ **Speed** | Up to **10 Gbps** (~850K pps) via zero-copy pipeline and lock-free structures |
 | 🦀 **Rust** | Memory safety, zero-cost abstractions, no GC pauses |
-| 🎯 **~180 Techniques** | TCP desync, TLS fragmentation, QUIC bypass, HTTP obfuscation, DNS protection |
+| 🎯 **~185 Techniques** | TCP desync, TLS fragmentation, QUIC bypass, HTTP obfuscation, DNS protection |
+| 🔍 **DPI Probe** | Preventive DPI blockage type detection (5-phase pipeline) |
 | 🧠 **Smart Features** | Auto-TTL, adaptive DPI detection, probe/tune/run, geo-routing |
 | 🖥️ **GUI + CLI** | System tray UI (Tauri) + Windows Service + REST API |
 | 🔒 **Split Tunneling** | Blacklist/whitelist/auto modes with persistent blocked domains |
@@ -87,8 +89,59 @@
 │  │  Split Tunnel (blacklist/whitelist/auto + persistence)     │ │
 │  │  Adaptive DPI (probe/tune/run, auto-ttl, hop cache)        │ │
 │  └────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │  DPI Probe Module (5-phase pipeline)                       │ │
+│  │  DNS Integrity → TCP Connect → TLS Handshake → HTTP → Data │ │
+│  │  + Discriminator (ServerActive vs PathActive)              │ │
+│  │  + Strategy Map → Recommended desync technique             │ │
+│  │  + 24h Accumulation + eTLD+1 family expansion              │ │
+│  └────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 🔍 DPI Probe Module
+
+Превентивное определение типа DPI-блокировки для конкретного домена/IP перед запуском desync.
+
+### Pipeline
+
+```
+Domain → DNS (UDP vs DoH) → TCP Connect → TLS (1.3 → 1.2) → HTTP GET → Data-Volume
+                                    │                              │
+                                    └── Version12Only detected     └── Strategy Recommendation
+```
+
+### Возможности
+
+| Компонент | Описание |
+|-----------|----------|
+| **DNS Probe** | Cross-validation UDP/53 vs DoH, детект poisoning/NXDOMAIN spoof/interception |
+| **TLS Probe** | Staged handshake (TLS 1.3 → 1.2), детект Version12Only (DPI атакует ClientHello) |
+| **HTTP Probe** | HTTP 451, cutoff, foreign redirect, RKN stub detection |
+| **Data-Volume** | Обнаружение DPI, обрывающего соединение после N КБ |
+| **Discriminator** | Server-active vs Path-active (MITM=Clear, RST=Blocked, Alert=Ambiguous) |
+| **Strategy Map** | Рекомендация desync-стратегии по типу блокировки |
+| **Accumulator** | 24h накопление verdict'ов + eTLD+1 family expansion |
+| **Presets** | 8 встроенных списков (Telegram 52, Discord 21, Social 16 доменов) |
+
+### API
+
+```
+POST /api/v1/probe          — полный probe одного домена
+POST /api/v1/probe/batch    — batch probe по preset спискам
+GET  /api/v1/probe/presets  — список preset'ов
+GET  /api/v1/probe/history  — история probe'ов
+```
+
+### GUI
+
+- **ProbePanel**: Domain input + "Быстрая"/"Полная" кнопки, pipeline visualization, verdict, recommendations, history
+- **Dashboard Widget**: Мини-виджет с последним результатом probe
+- **System Tray**: "Проверить DPI" пункт меню
+- **Custom Lists**: CRUD для пользовательских списков доменов
 
 ---
 
@@ -117,6 +170,9 @@ Probe/Tune/Run three-phase, Auto-TTL (HopTab), **adaptive strategy selection**, 
 
 ### Split Tunneling
 Blacklist / Whitelist / Auto mode, **persistent blocked_domains.txt**, whitelist cache.
+
+### DPI Probe (5-phase pipeline)
+DNS Integrity → TCP Connect → TLS Staged Handshake → HTTP Application Layer → Data-Volume detection. Discriminator (ServerActive vs PathActive). Strategy Map. 24h Accumulation. 8 preset lists (139+ domains).
 
 ---
 
@@ -196,6 +252,20 @@ cache_ttl = 300
 
 [split_tunnel]
 mode = "Auto"
+
+[probe]
+enabled = true
+auto_probe_domains = ["youtube.com", "telegram.org", "rutracker.org"]
+auto_probe_interval = 300  # seconds
+dns_udp_servers = ["8.8.8.8", "1.1.1.1", "9.9.9.9"]
+dns_doh_urls = ["https://cloudflare-dns.com/dns-query"]
+tcp_connect_timeout = 3000  # ms
+tls_connect_timeout = 5000  # ms
+http_read_timeout = 8000    # ms
+tcp16_enabled = false       # heavy, opt-in
+accumulation_enabled = true
+promote_threshold = 50
+hot_ttl = 86400             # 24h in seconds
 ```
 
 ---
@@ -229,16 +299,36 @@ FreeDPI-Windows/
 │   │       │   ├── ip.rs     # IP-level (10 techniques)
 │   │       │   ├── obfs.rs   # Obfuscation (entropy, padding)
 │   │       │   └── crypto.rs # ChaCha20, XOR
+│   │       ├── probe/        # DPI Probe Module (5-phase pipeline)
+│   │       │   ├── mod.rs    # ProbeModule orchestrator
+│   │       │   ├── config.rs # ProbeConfig (21 fields)
+│   │       │   ├── classifier.rs  # FailureCode enums (34 variants)
+│   │       │   ├── dns_probe.rs   # DNS Integrity (UDP vs DoH)
+│   │       │   ├── tcp_probe.rs   # TCP parallel dial racing
+│   │       │   ├── tls_probe.rs   # TLS staged handshake (1.3→1.2)
+│   │       │   ├── http_probe.rs  # HTTP application layer
+│   │       │   ├── tcp16_probe.rs # Data-Volume (16×4KB)
+│   │       │   ├── discriminator.rs  # ServerActive vs PathActive
+│   │       │   ├── accumulator.rs    # 24h accumulation + eTLD+1
+│   │       │   ├── strategy_map.rs   # FailureCode → Strategy
+│   │       │   ├── presets.rs        # 8 preset lists (139+ domains)
+│   │       │   └── rkn_stub.rs       # ISP stub detection
 │   │       ├── dns/          # DoH/DoT + cache
 │   │       ├── adaptive/     # Auto-TTL, probe/tune/run
 │   │       ├── conntrack.rs  # Connection tracking
 │   │       ├── packet_engine.rs # WinDivert + raw sockets
 │   │       └── split_tunnel.rs  # Blacklist/whitelist/auto
+│   ├── api/                  # REST API (Axum)
+│   │   └── src/lib.rs        # 12 endpoints including /probe
 │   ├── service/              # Windows Service
-│   └── ui/                   # System tray (Tauri)
+│   └── ui/                   # System tray (Tauri v2 + React)
+│       └── src/components/
+│           ├── ProbePanel.tsx    # DPI Probe UI
+│           ├── ProbePanel.css    # Probe styles
+│           └── Dashboard.tsx     # Dashboard with ProbeWidget
 ├── vendor/WinDivert/         # WinDivert driver (bundled)
 ├── installer.nsi             # NSIS installer script
-└── ARCHITECTURE.md           # Full technical documentation
+└── ARCHITECTURE.md           # Full technical documentation (3800+ lines)
 ```
 
 ---

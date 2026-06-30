@@ -30,6 +30,12 @@ docs/
 review/
 review2/
 
+# === Implementation plans (keep local) ===
+IMPLEMENTATION_PLAN_DPI-PROBE.md
+add.md
+add_plan.md
+dpi_detection.md
+
 # === Local secrets / temp ===
 *.env
 *.env.local
