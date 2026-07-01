@@ -56,27 +56,18 @@
 | Пакетный менеджер | ❌ | ✅ | ✅ Cargo |
 | Размер бинарника | ~200 KB | ~8-15 MB | ~2-5 MB |
 
-### Как будем портировать bye-dpi C ядро (19 файлов)
+### Портирование bye-dpi C ядра (100% Rust)
 
-**Стратегия: FFI → Rust миграция**
+**Статус:** Полностью завершено. Все 19 C-файлов ядра ByeDPI переписаны на безопасный, высокопроизводительный и идиоматичный Rust. Модуль `ffi-bridge` и оригинальные исходники C `byedpi` полностью удалены из проекта. Вся обработка пакетов и логика десинхронизации работают напрямую на Rust.
 
 ```
-Фаза P0-P2:  Rust инфраструктура + C FFI bridge
-             ┌─────────────────────────────────┐
-             │  Rust (tokio, WinDivert, ...)    │
-             │       │ unsafe { ... }          │
-             │       ▼                         │
-             │  bye-dpi.lib (19 C файлов)       │
-             └─────────────────────────────────┘
-
-Фаза P8:     Полностью на Rust
-             ┌─────────────────────────────────┐
-             │  Rust (всё)                      │
-             │  - desync.rs                     │
-             │  - tls_parrot.rs                 │
-             │  - conntrack.rs                  │
-             │  - raw_injector.rs               │
-             └─────────────────────────────────┘
+┌─────────────────────────────────┐
+│  Rust (Полный стек)             │
+│  - desync/* (все техники)       │
+│  - packet_engine.rs             │
+│  - conntrack.rs                 │
+│  - engine/mod.rs (pipeline)     │
+└─────────────────────────────────┘
 ```
 
 ---
@@ -201,12 +192,6 @@ FreeDPI-win/
 │       │   ├── doh.rs
 │       │   └── cache.rs
 │       └── config.rs             # Configuration loader
-├── ffi-bridge/
-│   ├── Cargo.toml                # FFI bridge to bye-dpi C
-│   ├── build.rs                  # cc crate: compile C files
-│   └── src/
-│       ├── lib.rs                # safe Rust wrappers
-│       └── ffi_gen.rs            # bindgen output
 ├── service/
 │   ├── Cargo.toml                # Windows Service binary
 │   └── src/main.rs
@@ -214,12 +199,10 @@ FreeDPI-win/
 │   ├── Cargo.toml                # System tray binary
 │   └── src/main.rs
 └── vendor/
-    ├── windivert/              # WinDivert driver (bundled)
-    │   ├── WinDivert64.sys     # Kernel-mode driver
-    │   ├── WinDivert.dll       # User-mode library
-    │   └── WinDivert.lib       # Static library
-    └── byedpi/                 # Original C source (deprecated, not used)
-        └── src/...
+    └── windivert/              # WinDivert driver (bundled)
+        ├── WinDivert64.sys     # Kernel-mode driver
+        ├── WinDivert.dll       # User-mode library
+        └── WinDivert.lib       # Static library
 ```
 
 ### 3.2 Packet Engine (WinDivert + Raw Socket)
@@ -514,7 +497,7 @@ impl Runtime {
 | 10 | HTTP Header Tamper (7 режимов) | `desync::http` | ✅ |
 | 10a | **HTTP Case Mixing** (Demergi) | `desync::http` | ✅ Host → hOsT |
 | 11 | DNS Forwarding | `dns` | ✅ |
-| 12 | DoH Bridge | `dns::doh` | ✅ (C-native, WinHTTP) |
+| 12 | DoH Bridge | `dns::doh` | ✅ (Rust-native) |
 | 12a | **DoH Retry + backoff** (Demergi) | `dns` | ✅ Exponential backoff + jitter |
 | 12b | **Persistent HTTP/2 DoH** (Demergi) | `dns` | ✅ http2_prior_knowledge |
 | 12c | **DNS IP Override** (Demergi) | `dns` | ✅ CIDR-based override |
@@ -524,7 +507,7 @@ impl Runtime {
 | 15a | **TLS Record Re-wrapping** (GreenTunnel) | `desync::tls` | ✅ Каждый фрагмент получает валидный record header |
 | 15b | **TLS Version Spoof** (Demergi) | `desync::tls` | ✅ Record-layer version → TLS 1.3 |
 | 15c | **SNI-Targeted Record Frag** (NoDPI) | `desync::tls` | ✅ SNI на 2B chunks с TLS 1.3 headers |
-| 18 | Bye-dpi SOCKS5 Core | `proxy` | ✅ (FFI→Rust) |
+| 18 | Bye-dpi SOCKS5 Core | `proxy` | ✅ (Rust-native) |
 | 19 | AutoTTL | `desync::ip` | ✅ (enhanced, real recv_ttl) |
 | 20 | TLS Fingerprint Parroting | `desync::tls` | ✅ |
 | 21 | TCP Chunk Obfuscation | `desync::tcp` | ✅ |
@@ -3883,3 +3866,24 @@ FreeProxyPool::refresh()
   └── load_from_file(custom_lists[0]) → add()
        └── last_refresh = Instant::now()
 ```
+
+### 27. Итог выполнения планов миграции и закрытия заглушек (v1.0)
+
+В результате успешного выполнения основного плана (`IMPLEMENTATION_PLAN.md`) и дополнений к нему (`T37`–`T44`) архитектура проекта была приведена к финальному целевому состоянию:
+
+1. **100% Rust-native ядро:**
+   - Полностью удалены внешние исходные коды ByeDPI на Си (`vendor/byedpi`) и вспомогательная библиотека `ffi-bridge`.
+   - Проект больше не содержит `unsafe`-вызовов Си-библиотек десинхронизации. Все техники обхода реализуются внутри Rust-модулей в `src/core/src/desync/`.
+   - Зависимость `rand = "0.8"` удалена, а генерация случайных чисел полностью сведена к потокобезопасному `crate::desync::rand` (использует 53 бита `ChaCha8Rng` энтропии для некриптографических `f64` в Thompson Sampling).
+
+2. **Нативная служба Windows (freedpi-service):**
+   - Управление службой Windows реализовано напрямую через системные вызовы Windows API (`StartServiceCtrlDispatcherW`, `RegisterServiceCtrlHandlerExW`, `SetServiceStatus`, `CreateServiceW`) вместо внешних контейнеров.
+   - Поддерживает автоматическую установку (`--install`) и удаление (`--uninstall`) из SCM, корректно обрабатывая сигналы запуска и остановки, а при обычном вызове переходит в консольный foreground-режим.
+
+3. **Закрытие всех 12 архитектурных заглушек (T44):**
+   - **QUIC Initial Protection:** Полностью реализовано выведение ключей (`client_iv`, `client_hp`, `client_key`) по стандарту RFC 9001 на основе SHA-256 HKDF и шифрование пакетов по протоколу AES-128-GCM.
+   - **JA4 Fingerprint:** Стандартизирован расчёт отпечатков с переходом на SHA-256 хеширование для стабильных результатов между запусками программы.
+   - **Zero-Copy & Zero-Alloc Buffers:** Буферы для перехваченных и генерируемых пакетов возвращаются в пул `PacketBufferPool` явным образом на всех путях отбрасывания пакетов (включая переполнения очередей воркеров), что исключает утечки памяти.
+   - **BadChecksum:** Исправлена передача битых инжектов в `group.rs`, обеспечивая корректное применение техники к сетевому трафику.
+   - **MSS Clamping:** Избавлен от операций `splice()` и производит вставку MSS-опции через последовательное выделение памяти в один проход.
+   - **TTL Manipulation:** Использование инкрементального обновления контрольной суммы по RFC 1624 для оптимизации производительности в hot path.
