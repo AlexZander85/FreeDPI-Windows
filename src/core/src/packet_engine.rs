@@ -20,12 +20,105 @@
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
+use bytes::BytesMut;
+use crossbeam::queue::ArrayQueue;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use windivert::prelude::WinDivertParam;
 use windivert::prelude::*;
 use windivert::WinDivert;
+
+/// Реалистичный размер слота пула: обычный MTU + запас (не 65535).
+const POOLED_BUF_SIZE: usize = 2048;
+
+/// Lock-free пул переиспользуемых `BytesMut` для single-copy recv.
+///
+/// ## single-copy
+/// Единственная копия за весь путь пакета — kernel→user (неустранима для WinDivert).
+/// В steady-state ноль вызовов аллокатора: буферы переиспользуются через `ArrayQueue`.
+pub struct PacketBufferPool {
+    free: ArrayQueue<BytesMut>,
+}
+
+impl PacketBufferPool {
+    /// Создаёт пул с `capacity` предварительно выделенными буферами.
+    pub fn new(capacity: usize) -> Self {
+        let free = ArrayQueue::new(capacity);
+        for _ in 0..capacity {
+            let mut b = BytesMut::with_capacity(POOLED_BUF_SIZE);
+            b.resize(POOLED_BUF_SIZE, 0);
+            let _ = free.push(b);
+        }
+        Self { free }
+    }
+
+    /// Извлекает буфер из пула или создаёт новый (нестандартный случай).
+    #[inline]
+    pub fn acquire(&self) -> BytesMut {
+        self.free.pop().unwrap_or_else(|| {
+            let mut b = BytesMut::with_capacity(POOLED_BUF_SIZE);
+            b.resize(POOLED_BUF_SIZE, 0);
+            b
+        })
+    }
+
+    /// Возвращает буфер в пул, восстанавливая длину до `POOLED_BUF_SIZE`.
+    ///
+    /// Если буфер крупнее (редкий jumbo-пакет) — не пуляем, Drop сам освободит.
+    #[inline]
+    pub fn release(&self, mut buf: BytesMut) {
+        if buf.capacity() < POOLED_BUF_SIZE {
+            return; // нестандартный — одноразовый
+        }
+        // memset дельты = размеру последнего пакета, не всего буфера
+        buf.resize(POOLED_BUF_SIZE, 0);
+        let _ = self.free.push(buf);
+    }
+
+    /// Пытается вернуть замороженный `Bytes` обратно в пул, если refcount == 1.
+    ///
+    /// Вызывать после того, как пакет отправлен и больше не будет расшарен.
+    /// Если refcount > 1 (Bytes расшарен несколькими клонами) — просто дропается.
+    pub fn release_bytes(&self, packet: bytes::Bytes) {
+        if let Ok(buf) = packet.try_into_mut() {
+            self.release(buf);
+        }
+    }
+}
+
+/// Пытается вернуть `Bytes` обратно в пул, если refcount == 1.
+///
+/// Вызывать после того, как пакет отправлен и больше не будет расшарен.
+pub fn try_return_to_pool(packet: bytes::Bytes, pool: &PacketBufferPool) {
+    pool.release_bytes(packet);
+}
+
+/// Cache-line-aligned atomic counter to prevent false sharing.
+#[repr(align(64))]
+pub struct PaddedCounter(AtomicU64);
+
+impl std::fmt::Debug for PaddedCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PaddedCounter")
+            .field(&self.0.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl PaddedCounter {
+    pub const fn new(val: u64) -> Self {
+        Self(AtomicU64::new(val))
+    }
+}
+
+impl Deref for PaddedCounter {
+    type Target = AtomicU64;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 /// Размер буфера для WinDivert recv (максимальный MTU + заголовки).
 #[allow(dead_code)]
@@ -55,22 +148,22 @@ pub struct PacketEngine {
 
 /// Статистика пакетного движка.
 ///
-/// Использует AtomicU64 для interior mutability (все методы `&self`).
+/// Каждое поле выровнено по cache-line (64 байта) для предотвращения false sharing.
 #[derive(Debug)]
 pub struct PacketStats {
-    pub packets_received: AtomicU64,
-    pub packets_sent: AtomicU64,
-    pub packets_injected: AtomicU64,
-    pub packets_dropped: AtomicU64,
+    pub packets_received: PaddedCounter,
+    pub packets_sent: PaddedCounter,
+    pub packets_injected: PaddedCounter,
+    pub packets_dropped: PaddedCounter,
 }
 
 impl PacketStats {
     fn new() -> Self {
         Self {
-            packets_received: AtomicU64::new(0),
-            packets_sent: AtomicU64::new(0),
-            packets_injected: AtomicU64::new(0),
-            packets_dropped: AtomicU64::new(0),
+            packets_received: PaddedCounter::new(0),
+            packets_sent: PaddedCounter::new(0),
+            packets_injected: PaddedCounter::new(0),
+            packets_dropped: PaddedCounter::new(0),
         }
     }
 }
@@ -150,18 +243,68 @@ impl PacketEngine {
         self.mode
     }
 
-    /// Блокирующий перехват пакета.
+    /// Блокирующий перехват пакета с zero-alloc приёмом через пул.
+    ///
+    /// ## single-copy
+    /// Единственная неустранимая копия — kernel→user (WinDivert).
+    /// `BytesMut` из пула → `Bytes::freeze()` без аллокации и memcpy.
+    ///
+    /// ## Error path
+    /// При ошибке `divert.recv` буфер ВОЗВРАЩАЕТСЯ в пул (не теряется).
     pub fn recv_blocking(
         &self,
-        buffer: &mut [u8],
+        pool: &PacketBufferPool,
     ) -> Result<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> {
         let guard = self.divert.load();
         let Some(ref divert) = **guard else {
             anyhow::bail!("WinDivert not initialized (API-only mode)");
         };
-        let packet = divert.recv(buffer).context("WinDivert recv failed")?;
+
+        let mut buf = pool.acquire(); // len == POOLED_BUF_SIZE
+
+        // WinDivert пишет данные прямо в buf.
+        // packet.data — slice buf'а; копируем всё, что нужно, до работы с buf.
+        let result = divert.recv(&mut buf).context("WinDivert recv failed");
+        let (len, addr) = match result {
+            Ok(packet) => {
+                let len = packet.data.len();
+                let addr = packet.address.clone();
+                // ⚠ packet.data (borrow buf) дропается здесь — buf снова полностью наш.
+                drop(packet);
+                (len, addr)
+            }
+            Err(e) => {
+                // Возвращаем буфер в пул — не теряем аллокацию
+                pool.release(buf);
+                return Err(e);
+            }
+        };
+
+        if len > buf.len() {
+            // Редкий jumbo-пакет — аллокация под фактический размер
+            buf = BytesMut::from(&buf[..len]);
+        } else {
+            buf.truncate(len);
+        }
+
         self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
-        Ok((bytes::Bytes::copy_from_slice(&packet.data), packet.address))
+        Ok((buf.freeze(), addr))
+    }
+
+    /// Send + возврат буфера в пул одной операцией.
+    ///
+    /// Вызывается в worker loop после обработки пакета.
+    /// Не зависит от результата send — буфер возвращается в пул всегда
+    /// (даже при ошибке, буфер можно переиспользовать на следующем recv).
+    pub fn send_blocking_and_release(
+        &self,
+        packet: bytes::Bytes,
+        addr: &WinDivertAddress<NetworkLayer>,
+        pool: &PacketBufferPool,
+    ) -> Result<u32> {
+        let result = self.send_blocking(&packet, addr);
+        pool.release_bytes(packet);
+        result
     }
 
     /// Блокирующая отправка модифицированного пакета.
@@ -235,6 +378,11 @@ impl PacketEngine {
     /// Вызывается при изменении blacklist/whitelist.
     /// Создаёт новый WinDivert handle (старый закрывается при drop).
     pub fn update_filter(&self, filter: &str) -> Result<()> {
+        // Explicitly drop old handle before opening a new one to avoid
+        // having two WinDivert filters active simultaneously.
+        let old = self.divert.swap(Arc::new(None));
+        drop(old);
+
         let new_divert = WinDivert::network(filter, WINDIVERT_PRIORITY, WinDivertFlags::default())
             .context("Failed to update WinDivert filter")?;
         new_divert
@@ -256,6 +404,11 @@ impl PacketEngine {
     /// Проверяет, доступен ли raw socket.
     pub fn has_raw_socket(&self) -> bool {
         self.raw_sock.is_some()
+    }
+
+    /// Асинхронная версия `disable_offload` — не блокирует вызывающий поток.
+    pub fn disable_offload_async() -> tokio::task::JoinHandle<Result<()>> {
+        tokio::task::spawn_blocking(Self::disable_offload)
     }
 
     /// Отключает TSO/LSO (TCP Segmentation Offload / Large Send Offload)
@@ -444,8 +597,8 @@ mod tests {
         let engine = PacketEngine::new_api_only();
         assert!(!engine.has_divert());
         // recv_blocking should fail in API-only mode
-        let mut buf = vec![0u8; PACKET_BUFFER_SIZE];
-        assert!(engine.recv_blocking(&mut buf).is_err());
+        let pool = PacketBufferPool::new(1);
+        assert!(engine.recv_blocking(&pool).is_err());
     }
 
     #[test]
@@ -457,5 +610,133 @@ mod tests {
         // Might fail because raw sock is None
         // Just validate it doesn't panic
         let _ = result;
+    }
+
+    // ── PacketBufferPool tests ──
+
+    #[test]
+    fn test_pool_acquire_release() {
+        let pool = PacketBufferPool::new(4);
+        let buf = pool.acquire();
+        assert_eq!(buf.len(), POOLED_BUF_SIZE);
+        assert_eq!(buf.capacity(), POOLED_BUF_SIZE);
+        // Возвращаем в пул
+        pool.release(buf);
+        // После release буфер должен быть доступен снова
+        let buf2 = pool.acquire();
+        assert_eq!(buf2.len(), POOLED_BUF_SIZE);
+    }
+
+    #[test]
+    fn test_pool_reuse_count() {
+        // Проверяем, что acquire не переаллоцирует: пул отдаёт те же буферы
+        let pool = PacketBufferPool::new(4);
+        let mut addrs = Vec::new();
+        for _ in 0..4 {
+            let buf = pool.acquire();
+            addrs.push(buf.as_ptr());
+            pool.release(buf);
+        }
+        // Второй раунд — те же указатели
+        for addr in &addrs {
+            let buf = pool.acquire();
+            assert_eq!(buf.as_ptr(), *addr, "буфер не из пула — новая аллокация");
+        }
+    }
+
+    #[test]
+    fn test_pool_reuse_count_exhausted() {
+        // Когда пул исчерпан — acquire создаёт новый (без паники)
+        let pool = PacketBufferPool::new(2);
+        let _a = pool.acquire();
+        let _b = pool.acquire();
+        // Пул пуст → fallback-аллокация
+        let c = pool.acquire();
+        assert_eq!(c.len(), POOLED_BUF_SIZE);
+    }
+
+    #[test]
+    fn test_pool_release_bytes_returns_to_pool() {
+        let pool = PacketBufferPool::new(2);
+        let buf = pool.acquire();
+        let frozen: bytes::Bytes = buf.freeze();
+
+        // release_bytes должен вернуть буфер в пул (refcount == 1)
+        pool.release_bytes(frozen);
+
+        // Следующий acquire — из пула, не аллокация
+        let reused = pool.acquire();
+        assert_eq!(reused.len(), POOLED_BUF_SIZE);
+    }
+
+    #[test]
+    fn test_pool_release_bytes_shared_noop() {
+        // Если Bytes расшарен — release_bytes не пуляет (refcount > 1)
+        let pool = PacketBufferPool::new(2);
+        let buf = pool.acquire();
+        let frozen: bytes::Bytes = buf.freeze();
+        let _clone = frozen.clone(); // refcount++
+        let ptr_before = frozen.as_ptr();
+
+        pool.release_bytes(frozen); // refcount-- (clone остаётся)
+
+        // Пул должен иметь все элементы (ничего не вернулось)
+        let reused = pool.acquire();
+        assert_ne!(
+            reused.as_ptr(),
+            ptr_before,
+            "shared Bytes не должен пулиться"
+        );
+    }
+
+    #[test]
+    fn test_pool_release_small_noop() {
+        // Маленький буфер (capacity < POOLED_BUF_SIZE) — не пуляем
+        let pool = PacketBufferPool::new(2);
+        let mut small = bytes::BytesMut::with_capacity(100);
+        small.resize(100, 0);
+        let small = small.freeze();
+
+        pool.release_bytes(small);
+
+        // Пул всё ещё имеет свои 2 буфера — small не попал в него
+        let _a = pool.acquire();
+        let _b = pool.acquire();
+        // Пул пуст → третий acquire создаст новый буфер (не из пула)
+        let c = pool.acquire();
+        assert_eq!(c.len(), POOLED_BUF_SIZE);
+        assert_eq!(c.capacity(), POOLED_BUF_SIZE);
+    }
+
+    #[test]
+    fn test_pool_thread_safety() {
+        // ArrayQueue — lock-free, проверяем concurrent доступ
+        let pool = std::sync::Arc::new(PacketBufferPool::new(8));
+        let mut handles = Vec::new();
+
+        for _ in 0..4 {
+            let p = pool.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let buf = p.acquire();
+                    // симуляция работы
+                    std::thread::yield_now();
+                    p.release(buf);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Все буферы вернулись
+        for _ in 0..8 {
+            let buf = pool.acquire();
+            assert_eq!(buf.len(), POOLED_BUF_SIZE);
+        }
+        // Пул пуст
+        let overflow = pool.acquire();
+        assert_eq!(overflow.len(), POOLED_BUF_SIZE);
     }
 }

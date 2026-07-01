@@ -225,7 +225,7 @@ impl Config {
         use crate::desync::{DesyncConfig, DesyncTechnique};
 
         let desync_config = DesyncConfig {
-            fake_sni: self.desync.fake_sni.clone(),
+            fake_sni: std::sync::Arc::from(self.desync.fake_sni.as_str()),
             split_size: self.desync.split_size,
             split_count: self.desync.split_count,
             max_seg_size: 10,
@@ -234,6 +234,7 @@ impl Config {
             inject_delay_us: self.desync.inject_delay_us,
             inter_delay_us: 0,
             reseed_interval: 8192,
+            ..Default::default()
         };
 
         let techniques: Vec<DesyncTechnique> = self
@@ -245,7 +246,7 @@ impl Config {
 
         crate::engine::ProcessingConfig {
             seq_spoof_enabled: true,
-            fake_sni: self.desync.fake_sni.clone(),
+            fake_sni: std::sync::Arc::from(self.desync.fake_sni.as_str()),
             hop_tab_enabled: true,
             geo_routing_enabled: true,
             desync_port: 443,

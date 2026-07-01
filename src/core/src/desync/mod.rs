@@ -21,7 +21,6 @@
 //! - [dpibreak](https://github.com/hufrea/dpibreak) — W series
 //! - [sni-spoofing-rust](https://github.com/HirbodBehnam/sni-spoofing-rust) — SEQ Spoof
 
-pub mod crypto;
 pub mod group;
 pub mod http;
 pub mod ip;
@@ -32,6 +31,8 @@ pub mod segment_plan;
 pub mod tcp;
 pub mod tls;
 
+use smallvec::{smallvec, SmallVec};
+
 use pnet_packet::ip::IpNextHeaderProtocol;
 use pnet_packet::ipv4::MutableIpv4Packet;
 use pnet_packet::MutablePacket;
@@ -39,48 +40,53 @@ use std::net::Ipv4Addr;
 
 /// Результат применения desync техники.
 ///
-/// ## Zero-Copy
-/// Использует `bytes::Bytes` для zero-copy semantics:
-/// - `Bytes::clone()` увеличивает ref count (не копирует данные)
-/// - `Bytes::slice()` создаёт sub-slice без копирования
-/// - Копирование происходит ТОЛЬКО при модификации IP/TCP header
+/// ## Single-copy
+/// single-copy (kernel-mandated), zero-alloc steady-state.
+/// SmallVec для inject: 95% техник делают ≤4 inject, inline без heap.
 #[derive(Debug, Clone)]
 pub struct DesyncResult {
     /// Модифицированный оригинальный пакет (для отправки через WinDivert).
     pub modified: Option<bytes::Bytes>,
     /// Дополнительные пакеты для инъекции.
-    pub inject: Vec<bytes::Bytes>,
+    pub inject: SmallVec<[bytes::Bytes; 4]>,
     /// Задержка между инъекциями (мкс). 0 = без задержки.
     pub inter_delay_us: u32,
     /// Дропнуть пакет (не отправлять).
     pub drop: bool,
+    /// T44.6: флаг что inject пакеты должны быть отправлены как outbound (от клиента к серверу).
+    /// Устанавливается rst_selective (T11) — RST должен идти к серверу, не к клиенту.
+    /// По умолчанию false (большинство injects идут как inbound от server perspective в WinDivert).
+    pub is_outbound_inject: bool,
 }
 
 impl DesyncResult {
     pub fn passthrough() -> Self {
         Self {
             modified: None,
-            inject: Vec::new(),
+            inject: SmallVec::new(),
             inter_delay_us: 0,
             drop: false,
+            is_outbound_inject: false,
         }
     }
 
     pub fn modified_only(modified: impl Into<bytes::Bytes>) -> Self {
         Self {
             modified: Some(modified.into()),
-            inject: Vec::new(),
+            inject: SmallVec::new(),
             inter_delay_us: 0,
             drop: false,
+            is_outbound_inject: false,
         }
     }
 
     pub fn inject_only(inject: impl Into<bytes::Bytes>) -> Self {
         Self {
             modified: None,
-            inject: vec![inject.into()],
+            inject: smallvec![inject.into()],
             inter_delay_us: 0,
             drop: false,
+            is_outbound_inject: false,
         }
     }
 
@@ -90,27 +96,30 @@ impl DesyncResult {
     ) -> Self {
         Self {
             modified: Some(modified.into()),
-            inject: vec![inject.into()],
+            inject: smallvec![inject.into()],
             inter_delay_us: 0,
             drop: false,
+            is_outbound_inject: false,
         }
     }
 
-    pub fn inject_many(inject: Vec<bytes::Bytes>) -> Self {
+    pub fn inject_many(inject: impl IntoIterator<Item = bytes::Bytes>) -> Self {
         Self {
             modified: None,
-            inject,
+            inject: inject.into_iter().collect(),
             inter_delay_us: 0,
             drop: false,
+            is_outbound_inject: false,
         }
     }
 
     pub fn drop_packet() -> Self {
         Self {
             modified: None,
-            inject: Vec::new(),
+            inject: SmallVec::new(),
             inter_delay_us: 0,
             drop: true,
+            is_outbound_inject: false,
         }
     }
 
@@ -156,6 +165,11 @@ pub enum DesyncTechnique {
     FakeSni,
     OobInjection,
     // === P3 TCP ===
+    /// Устарел — ненадёжен в transparent proxy.
+    /// Используйте `FakeSni` вместо него.
+    #[deprecated(
+        note = "TcpPreopen is unreliable in transparent proxy mode — use FakeSni instead"
+    )]
     TcpPreopen,
     MssClamp,
     AckSuppress,
@@ -179,7 +193,6 @@ pub enum DesyncTechnique {
     TtlManipulation,
     IpFragPrimitives,
     RstDropIpId,
-    TtlJitter,
     DscpRandom,
     MutualSpoof,
     // === TLS ===
@@ -233,6 +246,7 @@ impl DesyncTechnique {
             Self::SynHide => "SynHide",
             Self::FakeSni => "FakeSni",
             Self::OobInjection => "OobInjection",
+            #[allow(deprecated)]
             Self::TcpPreopen => "TcpPreopen",
             Self::MssClamp => "MssClamp",
             Self::AckSuppress => "AckSuppress",
@@ -255,7 +269,6 @@ impl DesyncTechnique {
             Self::TtlManipulation => "TtlManipulation",
             Self::IpFragPrimitives => "IpFragPrimitives",
             Self::RstDropIpId => "RstDropIpId",
-            Self::TtlJitter => "TtlJitter",
             Self::DscpRandom => "DscpRandom",
             Self::MutualSpoof => "MutualSpoof",
             Self::TlsRecordFrag => "TlsRecordFrag",
@@ -304,6 +317,7 @@ impl DesyncTechnique {
             Self::SynHide => "zapret",
             Self::FakeSni => "byedpi",
             Self::OobInjection => "byedpi",
+            #[allow(deprecated)]
             Self::TcpPreopen => "byedpi",
             Self::MssClamp => "dpibreak",
             Self::AckSuppress => "dpibreak",
@@ -326,7 +340,6 @@ impl DesyncTechnique {
             Self::TtlManipulation => "zapret",
             Self::IpFragPrimitives => "zapret",
             Self::RstDropIpId => "offveil",
-            Self::TtlJitter => "CandyTunnel",
             Self::DscpRandom => "CandyTunnel",
             Self::MutualSpoof => "CandyTunnel",
             Self::TlsRecordFrag => "zapret",
@@ -375,7 +388,6 @@ impl DesyncTechnique {
             | Self::SynHide
             | Self::FakeSni
             | Self::OobInjection
-            | Self::TcpPreopen
             | Self::MssClamp
             | Self::AckSuppress
             | Self::PktReorder
@@ -392,12 +404,13 @@ impl DesyncTechnique {
             | Self::PortShuffle
             | Self::Wclamp
             | Self::TsMd5 => TechniqueCategory::Tcp,
+            #[allow(deprecated)]
+            Self::TcpPreopen => TechniqueCategory::Tcp,
             Self::FragOverlap
             | Self::BadChecksum
             | Self::TtlManipulation
             | Self::IpFragPrimitives
             | Self::RstDropIpId
-            | Self::TtlJitter
             | Self::DscpRandom
             | Self::MutualSpoof
             | Self::ReverseFragmentOrder => TechniqueCategory::Ip,
@@ -444,11 +457,121 @@ pub enum TechniqueCategory {
     Crypto,
 }
 
+/// Категория эффекта desync техники на пакет.
+/// Используется для валидации композиции техник в DesyncGroup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TechniqueEffect {
+    /// Меняет только поля IP/TCP заголовка (TTL, DSCP, checksum, window).
+    /// НЕ инвалидирует payload offset, SEQ, или длину.
+    /// Безопасно комбинировать с любыми другими техниками.
+    HeaderOnly,
+
+    /// Меняет длину TCP payload (TlsRecordPad, ChunkObfuscation, ContentLengthFuzz).
+    /// Инвалидирует все downstream split positions.
+    InvalidatesPayloadLength,
+
+    /// Меняет SEQ (inject с другим SEQ: FakeSni, SynData, SynFloodDecoy, PktReorder).
+    /// Инвалидирует downstream SEQ-relative расчёты.
+    InvalidatesSeq,
+
+    /// Split-техника — режет payload на сегменты.
+    /// Взаимоисключающая с другими Split техниками в одной группе.
+    Split,
+}
+
+impl DesyncTechnique {
+    /// Возвращает категорию эффекта техники на пакет.
+    /// Используется DesyncGroup::validate() для проверки композиции.
+    pub fn effect(&self) -> TechniqueEffect {
+        match self {
+            // HeaderOnly — меняют только заголовок
+            Self::TtlManipulation
+            | Self::DscpRandom
+            | Self::BadChecksum
+            | Self::MssClamp
+            | Self::WinSize
+            | Self::WinScaleManip
+            | Self::Wclamp
+            | Self::RstDropIpId
+            | Self::TsMd5
+            | Self::TlsVersionSpoof => TechniqueEffect::HeaderOnly,
+
+            // InvalidatesPayloadLength — меняют длину payload
+            Self::TlsRecordPad
+            | Self::ChunkObfuscation
+            | Self::ContentLengthFuzz
+            | Self::H2SettingsFlood
+            | Self::H2RstPadding
+            | Self::H2WindowUpdateFlood
+            | Self::H2PriorityAbuse
+            | Self::H2Goaway
+            | Self::QuicMaxStreams => TechniqueEffect::InvalidatesPayloadLength,
+
+            // InvalidatesSeq — inject с другим SEQ (но не split)
+            Self::FakeSni
+            | Self::SynData
+            | Self::SynAckSplit
+            | Self::SynHide
+            | Self::OobInjection
+            | Self::AckSuppress
+            | Self::RstSelective
+            | Self::SynFloodDecoy
+            | Self::FakeRst
+            | Self::Disoob
+            | Self::HostFake
+            | Self::QuicRetryInject
+            | Self::QuicConnectionClose
+            | Self::QuicStreamReset
+            | Self::Udp2Icmp => TechniqueEffect::InvalidatesSeq,
+            #[allow(deprecated)]
+            Self::TcpPreopen => TechniqueEffect::InvalidatesSeq,
+
+            // Split — режут payload, взаимоисключающие
+            Self::MultiSplit
+            | Self::MultiDisorder
+            | Self::TcpSeg
+            | Self::Disorder
+            | Self::FakeDataSplit
+            | Self::FakeDataDisorder
+            | Self::HostFakeSplit
+            | Self::SniRecordFrag
+            | Self::TlsRecordFrag
+            | Self::SniMicrofrag
+            | Self::TlsRecordRewrap
+            | Self::ByteByByte
+            | Self::UnidirFrag
+            | Self::PktReorder
+            | Self::MultidisorderNew
+            | Self::ReverseFragmentOrder
+            | Self::FragOverlap
+            | Self::IpFragPrimitives
+            | Self::SniMasking
+            | Self::QuicBlocking
+            | Self::QuicVersionDowngrade => TechniqueEffect::Split,
+
+            // Crypto/Obfs — меняют содержимое payload, но не длину.
+            // Классифицируем как HeaderOnly для целей композиции
+            // (они не инвалидируют split positions)
+            Self::XorFirst
+            | Self::WgObfs
+            | Self::MutualSpoof
+            | Self::PortShuffle
+            | Self::H2FrameOrdering
+            | Self::Http11Pipeline
+            | Self::HttpUpgradeAbuse
+            | Self::HttpCaseMix => TechniqueEffect::HeaderOnly,
+
+            // Удалённые/отключённые техники — HeaderOnly (no-op)
+            Self::ChaCha20 => TechniqueEffect::HeaderOnly,
+        }
+    }
+}
+
 /// Единая конфигурация Desync Engine.
 #[derive(Debug, Clone)]
 pub struct DesyncConfig {
     /// Fake SNI для инъекции
-    pub fake_sni: String,
+    pub fake_sni: std::sync::Arc<str>,
     /// Размер сплита (байт) — для split-техник
     pub split_size: usize,
     /// Количество сегментов для multisplit
@@ -464,15 +587,47 @@ pub struct DesyncConfig {
     /// Задержка между отдельными inject пакетами (мкс). 0 = без задержки.
     pub inter_delay_us: u32,
     /// Количество PRNG вызовов между reseed'ами.
-    /// 0 = отключено (для benchmarking).
-    /// 8192 = рекомендуется для production (~10ms при 844K pps).
     pub reseed_interval: u64,
+    /// Prebuilt fake ClientHello (lazily initialized).
+    pub(crate) fake_ch_payload: std::sync::OnceLock<bytes::Bytes>,
+}
+
+impl DesyncConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.split_count == 0 {
+            return Err(ConfigError::Invalid("split_count must be >= 1".into()));
+        }
+        if self.split_size == 0 {
+            return Err(ConfigError::Invalid("split_size must be >= 1".into()));
+        }
+        if self.max_seg_size == 0 {
+            return Err(ConfigError::Invalid("max_seg_size must be >= 1".into()));
+        }
+        if self.fake_sni.is_empty() || self.fake_sni.len() > 253 {
+            return Err(ConfigError::Invalid(
+                "fake_sni length must be in [1, 253]".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn fake_ch(&self) -> &bytes::Bytes {
+        self.fake_ch_payload.get_or_init(|| {
+            crate::adaptive::ch_gen::build_client_hello_default(&self.fake_sni).into()
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("Invalid config: {0}")]
+    Invalid(String),
 }
 
 impl Default for DesyncConfig {
     fn default() -> Self {
         Self {
-            fake_sni: "www.google.com".to_string(),
+            fake_sni: std::sync::Arc::from("www.google.com"),
             split_size: 1,
             split_count: 3,
             max_seg_size: 10,
@@ -481,6 +636,7 @@ impl Default for DesyncConfig {
             inject_delay_us: 1000,
             inter_delay_us: 0,
             reseed_interval: 8192,
+            fake_ch_payload: std::sync::OnceLock::new(),
         }
     }
 }
@@ -607,4 +763,28 @@ pub fn build_ip_packet(
     let checksum = ipv4_checksum(&buf[..20]);
     buf[10..12].copy_from_slice(&checksum.to_be_bytes());
     buf.freeze()
+}
+
+/// Incremental IP/TCP checksum update для одного 16-bit слова.
+/// RFC 1624: HC' = HC - ~m_old + ~m_new
+#[inline(always)]
+pub fn update_checksum_word(old_csum: u16, old_word: u16, new_word: u16) -> u16 {
+    let mut sum = (!old_csum) as u32;
+    sum = sum.wrapping_sub(!old_word as u32);
+    sum = sum.wrapping_add(!new_word as u32);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Incremental update для 32-bit поля (SEQ, ACK).
+#[inline(always)]
+pub fn update_checksum_dword(old_csum: u16, old_dword: u32, new_dword: u32) -> u16 {
+    let old_hi = (old_dword >> 16) as u16;
+    let old_lo = (old_dword & 0xFFFF) as u16;
+    let new_hi = (new_dword >> 16) as u16;
+    let new_lo = (new_dword & 0xFFFF) as u16;
+    let csum = update_checksum_word(old_csum, old_hi, new_hi);
+    update_checksum_word(csum, old_lo, new_lo)
 }

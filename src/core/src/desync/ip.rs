@@ -1,10 +1,12 @@
 //! IP-level Desync техники.
 //!
 //! ## Техники
-//! - [W1] FragOverlap — IP fragmentation overlap
-//! - [Z14] BadChecksum — намеренно неправильная контрольная сумма
-//! - [19] TtlManipulation — манипуляция TTL
+//! - [W1] FragOverlap — IP fragmentation overlap с SNI overwrite
+//! - [Z14] BadChecksum — инъекция пакета с неверной контрольной суммой
+//! - [19] TtlManipulation — манипуляция TTL (fixed per-connection)
 //! - [Z15] IpFragPrimitives — примитивы IP фрагментации
+//! - [OF4] RstDropIpId — дроп RST с низким IP ID
+//! - [CT4] DscpRandom — случайная DSCP метка per-connection
 //!
 //! ## Источник
 //! Адаптировано из [dpibreak](https://github.com/hufrea/dpibreak) и
@@ -18,21 +20,16 @@ use pnet_packet::MutablePacket;
 use std::net::Ipv4Addr;
 use tracing::debug;
 
-/// [W1] FragOverlap: IP fragmentation с перекрытием.
+/// [W1] FragOverlap: IP fragmentation с перекрытием и SNI overwrite.
 ///
 /// ## Принцип
-/// Отправляем два IP фрагмента с перекрывающимися offset'ами.
-/// DPI собирает из фрагмента 1 (fake SNI). Сервер собирает
-/// из фрагмента 2 (real SNI — имеет больший offset и перезаписывает).
-///
-/// ## Подробности
-/// Фрагмент 1: offset=0, More Fragments=1 — содержит fake SNI
-/// Фрагмент 2: offset=20 (в 8-байтовых единицах = 20/8 = 2),
-///             More Fragments=0 — содержит реальные данные
-///             offset=20 перекрывает байты 0-19 фрагмента 1
+/// Два IP фрагмента с одним identification, перекрывающиеся по offset.
+/// Frag1 = fake ClientHello с fake SNI (TTL-1).
+/// Frag2 = оригинальный payload начиная с реального SNI (normal TTL).
+/// DPI собирает из Frag1 (видит fake SNI). Сервер собирает из Frag2
+/// (offset больше → перезаписывает → видит real SNI).
 ///
 /// ## Returns
-/// - modified: None (оригинал можно не менять)
 /// - inject: [frag1, frag2] — два фрагмента
 pub fn frag_overlap(packet: &[u8], fake_sni: &str, fake_ttl_offset: u8) -> DesyncResult {
     let ip = match parse_ip_header(packet) {
@@ -41,111 +38,123 @@ pub fn frag_overlap(packet: &[u8], fake_sni: &str, fake_ttl_offset: u8) -> Desyn
     };
 
     let payload = &packet[ip.header_len..];
-
     if payload.is_empty() {
         return DesyncResult::passthrough();
     }
 
+    // Fake CH с fake SNI — это Frag1 payload
     let fake_payload = ch_gen::build_client_hello_default(fake_sni);
-
-    // Фрагмент 1: fake CH, offset=0, MF=1, TTL-1
     let frag1_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let frag_id = ip.identification;
+
     let frag1 = build_ip_fragment(
         ip.src,
         ip.dst,
         ip.protocol,
-        ip.identification.wrapping_add(1),
+        frag_id,
         0,
         true,
         frag1_ttl,
         &fake_payload,
     );
 
-    // Динамический overlap_offset на основе TCP header length
-    let tcp_start = ip.header_len;
-    let tcp_header_len = if packet.len() > tcp_start + 12 {
-        ((packet[tcp_start + 12] >> 4) & 0xF) as usize * 4
+    // Найти позицию реального SNI в оригинальном payload
+    let sni_offset_in_payload = crate::desync::tls::find_sni_offset_in_ch(payload);
+
+    // Вычислить offset для Frag2: 8-byte aligned, ближайший к SNI
+    let overlap_offset = if let Some(sni_pos) = sni_offset_in_payload {
+        // SNI найден — align к 8-byte boundary, ближайший к позиции SNI
+        (sni_pos + 7) & !7 // round up to next 8-byte boundary
     } else {
-        20
+        // Fallback: offset = TCP header length (20 bytes = 160 bits / 8 = 20 units)
+        let tcp_start = ip.header_len;
+        let tcp_header_len = if packet.len() > tcp_start + 12 {
+            ((packet[tcp_start + 12] >> 4) & 0xF) as usize * 4
+        } else {
+            20
+        };
+        (tcp_header_len + 7) & !7
     };
-    let overlap_offset = tcp_header_len;
-    let overlap_offset_bytes = overlap_offset.next_multiple_of(8);
-    let frag2_offset_units = (overlap_offset_bytes / 8) as u16;
+    let frag2_offset_units = (overlap_offset / 8) as u16;
+
+    // Frag2: оригинальный payload, начиная с overlap_offset
+    let frag2_payload = if overlap_offset < payload.len() {
+        &payload[overlap_offset..]
+    } else {
+        // offset за пределами payload — берём весь payload
+        payload
+    };
 
     let frag2 = build_ip_fragment(
         ip.src,
         ip.dst,
         ip.protocol,
-        ip.identification.wrapping_add(1),
+        frag_id,
         frag2_offset_units,
         false,
         ip.ttl,
-        payload,
+        frag2_payload,
     );
 
     debug!(
-        "[W1] FragOverlap: fake {} overlapped at offset {}",
-        fake_sni, overlap_offset
+        "[W1] FragOverlap: fake SNI='{}' overlap_offset={} frag2_units={}",
+        fake_sni, overlap_offset, frag2_offset_units
     );
 
     DesyncResult::inject_many(vec![frag1, frag2])
 }
 
-/// [Z14] BadChecksum: намеренно неправильная контрольная сумма.
+/// [Z14] BadChecksum: инъекция пакета с неверной контрольной суммой.
 ///
 /// ## Принцип
-/// DPI часто проверяет целостность пакета по IP/TCP checksum.
-/// Если checksum неправильный — DPI может отбросить пакет
-/// и не инспектировать его содержимое. Сервер обычно всё
-/// равно принимает (некоторые ОС игнорируют checksum).
+/// DPI проверяет целостность пакета по IP/TCP checksum.
+/// Пакет с неверным checksum отбрасывается DPI и не инспектируется.
+/// Сервер обычно принимает (некоторые ОС игнорируют checksum).
 ///
-/// ## Варианты
-/// - TCP badsum: меняем TCP checksum на заведомо неверный
-/// - IP badsum: меняем IP header checksum на неверный
+/// ## Returns
+/// - inject: [badsum_packet] — копия с неверным IP и TCP checksum
+/// - modified: None (оригинал проходит без изменений)
 pub fn bad_checksum(packet: &[u8]) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
-    };
-
-    let mut modified = packet.to_vec();
-
-    let csum_offset = 10;
-    if csum_offset + 2 <= modified.len() {
-        let old_csum = u16::from_be_bytes([modified[csum_offset], modified[csum_offset + 1]]);
-        let delta = crate::desync::rand::random_range(1, 65535) as u16;
-        let new_csum = old_csum.wrapping_add(delta);
-        modified[csum_offset..csum_offset + 2].copy_from_slice(&new_csum.to_be_bytes());
+    if packet.len() < 20 {
+        return DesyncResult::passthrough();
     }
 
-    let tcp_checksum_offset = ip.header_len + 16;
-    if tcp_checksum_offset + 2 <= modified.len() {
-        let old_tcp_csum = u16::from_be_bytes([
-            modified[tcp_checksum_offset],
-            modified[tcp_checksum_offset + 1],
-        ]);
-        let delta = crate::desync::rand::random_range(1, 65535) as u16;
-        let new_tcp_csum = old_tcp_csum.wrapping_add(delta);
-        modified[tcp_checksum_offset..tcp_checksum_offset + 2]
-            .copy_from_slice(&new_tcp_csum.to_be_bytes());
+    let mut badsum = packet.to_vec();
+
+    // IP checksum
+    let old_ip_csum = u16::from_be_bytes([badsum[10], badsum[11]]);
+    let ip_delta = crate::desync::rand::random_range(1, 65535) as u16;
+    let new_ip_csum = old_ip_csum.wrapping_add(ip_delta);
+    badsum[10..12].copy_from_slice(&new_ip_csum.to_be_bytes());
+
+    // TCP checksum (если есть)
+    let ip = parse_ip_header(packet);
+    if let Some(h) = ip {
+        let tcp_csum_offset = h.header_len + 16;
+        if tcp_csum_offset + 2 <= badsum.len() {
+            let old_tcp_csum =
+                u16::from_be_bytes([badsum[tcp_csum_offset], badsum[tcp_csum_offset + 1]]);
+            let tcp_delta = crate::desync::rand::random_range(1, 65535) as u16;
+            let new_tcp_csum = old_tcp_csum.wrapping_add(tcp_delta);
+            badsum[tcp_csum_offset..tcp_csum_offset + 2]
+                .copy_from_slice(&new_tcp_csum.to_be_bytes());
+        }
     }
 
-    debug!("[Z14] BadChecksum: IP csum flipped, TCP csum flipped");
+    debug!("[Z14] BadChecksum: inject-only (original passes through)");
 
-    DesyncResult::modified_only(modified)
+    DesyncResult::inject_only(badsum)
 }
 
-/// [19] TtlManipulation: манипуляция TTL.
+/// [19] TtlManipulation: манипуляция TTL (fixed per-connection).
 ///
 /// ## Принцип
-/// Изменяем TTL в IP header пакета. Некоторые DPI используют
-/// TTL для идентификации операционной системы или обнаружения
-/// подозрительных пакетов.
+/// Устанавливаем фиксированный TTL в IP header. Per-packet variation —
+/// anomaly для DPI fingerprinting, поэтому TTL фиксирован на всё соединение.
 ///
 /// ## Стратегии
-/// - Установить TTL=64 (Linux default) — маскировка под Linux
-/// - Установить TTL=128 (Windows default) — маскировка под Windows
-/// - Случайный TTL в диапазоне [64, 128] — анти-DPI fingerprint
+/// - TTL=64 (Linux default)
+/// - TTL=128 (Windows default)
 pub fn ttl_manipulation(packet: &[u8], new_ttl: u8) -> DesyncResult {
     let ip = match parse_ip_header(packet) {
         Some(h) => h,
@@ -154,13 +163,17 @@ pub fn ttl_manipulation(packet: &[u8], new_ttl: u8) -> DesyncResult {
 
     let mut modified = packet.to_vec();
 
-    // TTL — байт 8 в IP header
-    if 9 <= modified.len() {
+    // TTL — байт 8 в IP header; протокол — байт 9.
+    // RFC 1624: инкрементальное обновление checksum при изменении TTL.
+    if 12 <= modified.len() {
         modified[8] = new_ttl;
 
-        // Пересчитываем IP checksum
-        let checksum = ipv4_checksum(&modified[..20]);
-        modified[10..12].copy_from_slice(&checksum.to_be_bytes());
+        // TTL и Protocol образуют одно 16-битное слово в checksum
+        let old_word = ((ip.ttl as u16) << 8) | (packet[9] as u16);
+        let new_word = ((new_ttl as u16) << 8) | (packet[9] as u16);
+        let old_csum = u16::from_be_bytes([packet[10], packet[11]]);
+        let new_csum = crate::desync::update_checksum_word(old_csum, old_word, new_word);
+        modified[10..12].copy_from_slice(&new_csum.to_be_bytes());
     }
 
     debug!("[19] TtlManipulation: TTL {} → {}", ip.ttl, new_ttl);
@@ -174,11 +187,6 @@ pub fn ttl_manipulation(packet: &[u8], new_ttl: u8) -> DesyncResult {
 /// Разделяем TCP сегмент на несколько IP фрагментов. DPI может
 /// не собрать фрагменты правильно, что приведёт к пропуску
 /// DPI-инспекции.
-///
-/// ## Стратегии
-/// - Каждый фрагмент = 1 байт TCP payload — максимальная фрагментация
-/// - Первый фрагмент = fake SNI, остальные = реальные данные
-/// - Чередование правильных и bad checksum фрагментов
 pub fn ip_frag_primitives(packet: &[u8], frag_size: usize, fake_ttl_offset: u8) -> DesyncResult {
     let ip = match parse_ip_header(packet) {
         Some(h) => h,
@@ -232,31 +240,19 @@ pub fn ip_frag_primitives(packet: &[u8], frag_size: usize, fake_ttl_offset: u8) 
 /// [OF4] RstDropIpId: дроп RST пакетов с IP ID ≤ 0x000F.
 ///
 /// ## Принцип
-/// DPI часто инжектирует RST-пакеты для принудительного разрыва соединения.
-/// У таких пакетов IP ID обычно очень мал (≤ 15, т.е. 0x000F), так как они
+/// DPI инжектирует RST-пакеты для разрыва соединения.
+/// У таких пакетов IP ID обычно очень мал (≤ 15), так как они
 /// генерируются автоматически без нормального счётчика.
-///
-/// Проверяем: если пакет — TCP RST и IP ID ≤ 0x000F → дропаем его.
-/// Это предотвращает разрыв соединения DPI.
-///
-/// ## Returns
-/// - `drop: true` если RST с низким IP ID
-/// - `passthrough` для всех остальных пакетов
-///
-/// ## Источник
-/// offveil [OF4] — RST Drop IP ID
 pub fn rst_drop_ip_id(packet: &[u8]) -> DesyncResult {
     let ip = match parse_ip_header(packet) {
         Some(h) => h,
         None => return DesyncResult::passthrough(),
     };
 
-    // Проверяем IP ID ≤ 0x000F
     if ip.identification > 0x000F {
         return DesyncResult::passthrough();
     }
 
-    // Проверяем TCP RST флаг
     let tcp_data = &packet[ip.header_len..];
     let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
         Some(t) => t,
@@ -264,7 +260,7 @@ pub fn rst_drop_ip_id(packet: &[u8]) -> DesyncResult {
     };
 
     let flags = tcp.get_flags();
-    let is_rst = (flags & 0x04) != 0; // TcpFlags::RST = 0x04
+    let is_rst = (flags & 0x04) != 0;
 
     if !is_rst {
         return DesyncResult::passthrough();
@@ -276,6 +272,56 @@ pub fn rst_drop_ip_id(packet: &[u8]) -> DesyncResult {
     );
 
     DesyncResult::drop_packet()
+}
+
+/// [CT4] DscpRandom: случайная DSCP метка per-connection.
+///
+/// ## Принцип
+/// DPI анализирует DSCP для классификации трафика.
+/// Случайная DSCP метка сбивает классификацию.
+/// DSCP постоянный per-connection (не per-packet) — иначе anomaly.
+///
+/// Использует инкрементальный checksum (RFC 1624: HC' = ~(~HC + ~m + m')).
+pub fn dscp_random(packet: &[u8], dscp_value: u8) -> DesyncResult {
+    let _ip = match parse_ip_header(packet) {
+        Some(h) => h,
+        None => return DesyncResult::passthrough(),
+    };
+
+    let current_dscp = (packet[1] >> 2) & 0x3F;
+    let new_dscp = dscp_value & 0x3F;
+
+    if new_dscp == current_dscp {
+        return DesyncResult::passthrough();
+    }
+
+    let mut modified = packet.to_vec();
+    let ecn = modified[1] & 0x03;
+    modified[1] = (new_dscp << 2) | ecn;
+
+    // Инкрементальный checksum: RFC 1624
+    // HC' = ~(~HC + ~m + m')
+    let old_byte = ((current_dscp << 2) | ecn) as u32;
+    let new_byte = ((new_dscp << 2) | ecn) as u32;
+    let old_csum = u32::from(u16::from_be_bytes([modified[10], modified[11]]));
+    let mut sum = (!old_csum & 0xFFFF)
+        .wrapping_add(!old_byte & 0xFFFF)
+        .wrapping_add(new_byte);
+    // Fold carries
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF).wrapping_add(sum >> 16);
+    }
+    let new_csum = !(sum as u16);
+    modified[10..12].copy_from_slice(&new_csum.to_be_bytes());
+
+    debug!("[CT4] DscpRandom: DSCP {} → {}", current_dscp, new_dscp);
+    DesyncResult::modified_only(modified)
+}
+
+/// [CT1] MutualSpoof: удалён — пакет уходил обратно к клиенту.
+pub fn mutual_spoof(_packet: &[u8]) -> DesyncResult {
+    tracing::warn!("MutualSpoof is removed — technique was broken by design (src=dst swap sends packet back to client)");
+    DesyncResult::passthrough()
 }
 
 // ==================== Вспомогательные функции ====================
@@ -314,78 +360,9 @@ fn build_ip_fragment(
         ip.set_destination(dst);
 
         ip.payload_mut().copy_from_slice(payload);
-        // ip drops here → mutable borrow ends
     }
 
     let checksum = ipv4_checksum(&buf[..20]);
     buf[10..12].copy_from_slice(&checksum.to_be_bytes());
     buf.freeze()
-}
-
-// ==================== P6: CandyTunnel IP техники ====================
-
-/// [CT3] TtlJitter: случайный TTL для каждого пакета.
-///
-/// ## Принцип
-/// DPI использует TTL для fingerprinting ОС и обнаружения desync.
-/// Случайный TTL (TTL ± random(3)) маскирует fingerprint.
-pub fn ttl_jitter(packet: &[u8], base_ttl: Option<u8>) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
-    };
-
-    let current_ttl = base_ttl.unwrap_or(ip.ttl);
-    let jitter = crate::desync::rand::random_range(0, 6) as i16 - 3;
-    let new_ttl = (current_ttl as i16 + jitter).clamp(1, 255) as u8;
-
-    if new_ttl == ip.ttl {
-        return DesyncResult::passthrough();
-    }
-
-    let mut modified = packet.to_vec();
-    modified[8] = new_ttl;
-    let checksum = ipv4_checksum(&modified[..20]);
-    modified[10..12].copy_from_slice(&checksum.to_be_bytes());
-
-    debug!("[CT3] TtlJitter: {} → {}", ip.ttl, new_ttl);
-    DesyncResult::modified_only(modified)
-}
-
-/// [CT4] DscpRandom: случайная DSCP метка per-connection.
-///
-/// ## Принцип
-/// DPI анализирует DSCP для классификации трафика.
-/// Случайная DSCP метка сбивает классификацию.
-/// DSCP постоянный per-connection (не per-packet) — иначе anomaly.
-pub fn dscp_random(packet: &[u8], dscp_value: u8) -> DesyncResult {
-    let _ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
-    };
-
-    let current_dscp = (packet[1] >> 2) & 0x3F;
-    let new_dscp = dscp_value & 0x3F;
-
-    if new_dscp == current_dscp {
-        return DesyncResult::passthrough();
-    }
-
-    let mut modified = packet.to_vec();
-    let ecn = modified[1] & 0x03;
-    modified[1] = (new_dscp << 2) | ecn;
-    let checksum = ipv4_checksum(&modified[..20]);
-    modified[10..12].copy_from_slice(&checksum.to_be_bytes());
-
-    debug!("[CT4] DscpRandom: DSCP {} → {}", current_dscp, new_dscp);
-    DesyncResult::modified_only(modified)
-}
-
-/// [CT1] MutualSpoof: двусторонняя подмена source/dest IP.
-///
-/// ## Принцип
-/// [CT1] MutualSpoof: удалён — пакет уходил обратно к клиенту, сервер не получал данных.
-pub fn mutual_spoof(_packet: &[u8]) -> DesyncResult {
-    tracing::warn!("MutualSpoof is removed — technique was broken by design (src=dst swap sends packet back to client)");
-    DesyncResult::passthrough()
 }

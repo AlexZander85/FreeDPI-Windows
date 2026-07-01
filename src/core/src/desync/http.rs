@@ -947,7 +947,7 @@ pub fn chunk_obfuscation(packet: &[u8], split_count: usize, fake_ttl_offset: u8)
     }
 
     let seg_size = tcp.payload.len() / split_count;
-    let mut inject: Vec<bytes::Bytes> = Vec::new();
+    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> = smallvec::SmallVec::new();
 
     for i in 0..split_count - 1 {
         let start = i * seg_size;
@@ -995,6 +995,7 @@ pub fn chunk_obfuscation(packet: &[u8], split_count: usize, fake_ttl_offset: u8)
         inject,
         inter_delay_us: 0,
         drop: false,
+        is_outbound_inject: false,
     }
 }
 

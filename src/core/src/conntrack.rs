@@ -2,7 +2,7 @@
 
 use dashmap::DashMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -13,15 +13,23 @@ pub struct ConnKey {
     pub dst_ip: Ipv4Addr,
     pub src_port: u16,
     pub dst_port: u16,
+    pub proto: u8,
 }
 
 impl ConnKey {
-    pub fn new(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_port: u16, dst_port: u16) -> Self {
+    pub fn new(
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        proto: u8,
+    ) -> Self {
         Self {
             src_ip,
             dst_ip,
             src_port,
             dst_port,
+            proto,
         }
     }
 }
@@ -35,7 +43,7 @@ pub enum ConnState {
     Closed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ConntrackEntry {
     pub client_isn: u32,
     pub server_isn: u32,
@@ -52,6 +60,14 @@ pub struct ConntrackEntry {
     pub last_activity: Instant,
     pub dup_ack_count: u32,
     pub rng: Option<crate::desync::rand::PerConnRng>,
+    /// Флаг TLS 1.3 session resumption.
+    /// true если ClientHello содержал non-empty session_ticket extension.
+    /// Используется для генерации fake CH с early_data extension (0-RTT defense).
+    pub is_resumption: bool,
+    /// QUIC: последний наблюдаемый packet number (для PN gap detection).
+    pub quic_pn: u64,
+    /// QUIC: destination connection ID (первые 8 байт, для идентификации потока).
+    pub quic_dcid: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +81,7 @@ struct ConntrackInner {
     gc_interval: Duration,
     total_created: AtomicU64,
     active_count: AtomicU64,
+    gc_cursor: AtomicUsize,
 }
 
 impl Conntrack {
@@ -75,6 +92,7 @@ impl Conntrack {
                 gc_interval,
                 total_created: AtomicU64::new(0),
                 active_count: AtomicU64::new(0),
+                gc_cursor: AtomicUsize::new(0),
             }),
         }
     }
@@ -121,16 +139,25 @@ impl Conntrack {
         self.inner.map.contains_key(key)
     }
 
-    /// Обновление SEQ — расширенный delta limit (2^30 вместо 65535).
+    /// Обновление SEQ — signed delta for proper SEQ wrap handling.
+    ///
+    /// Uses i32 delta to correctly handle wrap-around at 2^31 boundaries.
+    /// Accepts delta in range [-2^30, 2^30] to allow for both forward and backward movement.
     pub fn update_seq_monotonic(&self, key: &ConnKey, seq: u32, ack: u32) {
         if let Some(mut entry) = self.inner.map.get_mut(key) {
-            let delta = seq.wrapping_sub(entry.client_seq);
+            let delta = (seq as i32).wrapping_sub(entry.client_seq as i32);
             if delta == 0 {
                 entry.dup_ack_count = entry.dup_ack_count.saturating_add(1);
-            } else if delta < (1u32 << 30) {
+            } else if delta > 0 && delta <= (1i32 << 30) {
+                // Forward movement within acceptable range
+                entry.client_seq = seq;
+                entry.dup_ack_count = 0;
+            } else if (-(1i32 << 30)..0).contains(&delta) {
+                // Backward movement (retransmit) — still valid
                 entry.client_seq = seq;
                 entry.dup_ack_count = 0;
             }
+            // delta outside [-2^30, 2^30] is treated as outlier and ignored
             entry.client_ack = ack;
             entry.last_activity = Instant::now();
         }
@@ -157,17 +184,23 @@ impl Conntrack {
         }
     }
 
-    /// Incremental GC — обрабатывает записи с time budget ≤1ms.
-    /// Использует безопасный API DashMap (iter + remove).
+    /// Incremental GC — round-robin across shards using gc_cursor.
+    /// Processes entries from a subset of shards each tick to amortize work.
     pub fn gc_incremental(&self, max_idle: Duration) {
         let deadline = Instant::now() + Duration::from_millis(1);
         let mut evicted = 0u64;
 
-        // Собираем ключи для удаления, Respect time budget
+        // Round-robin: start from current cursor position
+        // Use a fixed shard count estimate (DashMap default is num_cpus, typically 8-64)
+        let estimated_shards = 16; // reasonable default
+        let start = self.inner.gc_cursor.fetch_add(1, Ordering::Relaxed) % estimated_shards;
+
+        // Collect keys to remove from this shard subset
         let to_remove: Vec<ConnKey> = self
             .inner
             .map
             .iter()
+            .skip(start)
             .take_while(|_| Instant::now() <= deadline)
             .filter(|r| r.value().last_activity.elapsed() > max_idle)
             .map(|r| *r.key())
@@ -186,11 +219,12 @@ impl Conntrack {
         }
     }
 
+    /// GC loop — uses configured gc_interval from inner, not hardcoded value.
     pub async fn gc_loop(&self) {
         let mut interval = tokio::time::interval(self.inner.gc_interval);
         loop {
             interval.tick().await;
-            self.gc_incremental(Duration::from_secs(120));
+            self.gc_incremental(self.inner.gc_interval);
         }
     }
 
@@ -200,14 +234,6 @@ impl Conntrack {
 
     pub fn total_created(&self) -> u64 {
         self.inner.total_created.load(Ordering::Relaxed)
-    }
-
-    pub fn snapshot(&self) -> Vec<(ConnKey, ConntrackEntry)> {
-        self.inner
-            .map
-            .iter()
-            .map(|r| (*r.key(), r.value().clone()))
-            .collect()
     }
 }
 
@@ -229,6 +255,7 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             54321,
             443,
+            6, // TCP
         )
     }
 
@@ -248,6 +275,9 @@ mod tests {
             last_activity: Instant::now(),
             dup_ack_count: 0,
             rng: None,
+            quic_pn: 0,
+            quic_dcid: vec![],
+            is_resumption: false,
         }
     }
 
@@ -287,5 +317,57 @@ mod tests {
         ct.insert(key, test_entry());
         ct.gc(Duration::from_secs(120));
         assert!(ct.contains(&key));
+    }
+
+    #[test]
+    fn test_update_seq_monotonic_forward() {
+        let ct = Conntrack::default();
+        let key = test_key();
+        ct.insert(key, test_entry());
+        ct.update_seq_monotonic(&key, 2000, 1001);
+        assert_eq!(ct.get(&key).unwrap().client_seq, 2000);
+    }
+
+    #[test]
+    fn test_update_seq_monotonic_wrap() {
+        let ct = Conntrack::default();
+        let key = test_key();
+        let mut entry = test_entry();
+        entry.client_seq = u32::MAX - 100;
+        ct.insert(key, entry);
+        // Wrap around: MAX-100 + 200 = wraps to ~100
+        ct.update_seq_monotonic(&key, 100, 1001);
+        assert_eq!(ct.get(&key).unwrap().client_seq, 100);
+    }
+
+    #[test]
+    fn test_update_seq_monotonic_outlier_ignored() {
+        let ct = Conntrack::default();
+        let key = test_key();
+        let mut entry = test_entry();
+        entry.client_seq = 1000;
+        ct.insert(key, entry);
+        // Huge jump (>2^30) should be ignored
+        ct.update_seq_monotonic(&key, 1000 + (1u32 << 30) + 1, 1001);
+        assert_eq!(ct.get(&key).unwrap().client_seq, 1000);
+    }
+
+    #[test]
+    fn test_key_includes_proto() {
+        let k1 = ConnKey::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            12345,
+            443,
+            6,
+        );
+        let k2 = ConnKey::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            12345,
+            443,
+            17,
+        );
+        assert_ne!(k1, k2); // Different proto → different key
     }
 }

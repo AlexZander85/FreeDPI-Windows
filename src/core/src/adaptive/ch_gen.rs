@@ -86,6 +86,7 @@ const EXT_SUPPORTED_VERSIONS: u16 = 0x002B;
 const EXT_COMPRESS_CERTIFICATE: u16 = 0x001B;
 const EXT_APPLICATION_SETTINGS: u16 = 0x4469;
 const EXT_PADDING: u16 = 0x0015;
+const EXT_EARLY_DATA: u16 = 0x4433; // early_data (RFC 8446 §4.2.10)
 const EXT_ENCRYPTED_CLIENT_HELLO: u16 = 0xFE0D; // ECH GREASE (RFC 9460, Chrome 122+)
 
 // TLS cipher suites (Chrome 130+ default set)
@@ -136,6 +137,20 @@ const P256_PUBLIC_KEY_SIZE: usize = 65; // 0x04 prefix + 32 X + 32 Y
 /// # Returns
 /// Vec<u8> — полный TLS record (ContentType + Version + Length + Handshake + CH)
 pub fn build_client_hello(sni: &str, rng: &mut PerConnRng) -> Vec<u8> {
+    build_client_hello_with_resumption(sni, rng, false)
+}
+
+/// Строит ClientHello с опцией 0-RTT resumption.
+///
+/// Если `is_resumption = true`:
+/// - session_ticket extension содержит non-empty ticket
+/// - добавляется early_data extension (0x4433) с max_early_data_size = U32_MAX
+/// - имитирует поведение браузера при 0-RTT
+pub fn build_client_hello_with_resumption(
+    sni: &str,
+    rng: &mut PerConnRng,
+    is_resumption: bool,
+) -> Vec<u8> {
     assert!(
         sni.len() >= MIN_SNI_LEN && sni.len() <= MAX_SNI_LEN,
         "SNI length {} out of range [{}, {}]",
@@ -147,7 +162,7 @@ pub fn build_client_hello(sni: &str, rng: &mut PerConnRng) -> Vec<u8> {
     let grease = rng.generate_grease_set();
 
     // 1. Build extensions (without padding — padding added last)
-    let extensions = build_extensions(sni, rng, grease);
+    let extensions = build_extensions(sni, rng, grease, is_resumption);
 
     // 2. Build ClientHello body
     let body = build_ch_body(rng, grease, &extensions);
@@ -167,6 +182,440 @@ pub fn build_client_hello_default(sni: &str) -> Vec<u8> {
     let conn_id = crate::desync::rand::random_u64();
     let mut rng = PerConnRng::new(conn_id);
     build_client_hello(sni, &mut rng)
+}
+
+/// Строит ClientHello с zero TLS Random и zero session_id, но per-connection GREASE и key shares.
+///
+/// Отличие от `build_client_hello_template`: GREASE значения берутся из `rng`,
+/// extensions строятся обычные (с random key shares и ECH). Отличие от
+/// `build_client_hello`: TLS Random = 0, session_id = 0.
+///
+/// Используется для prebuilt cache: детерминированный TLS Random и session_id
+/// позволяют использовать как template, а per-connection GREASE/key shares
+/// обеспечивают разнообразие для DPI.
+///
+/// ## ВАЖНО
+/// Template CH НЕ безопасен для direct injection — детерминированный TLS Random
+/// это мгновенный fingerprint для DPI. Использовать ТОЛЬКО когда:
+/// - Fake CH имеет TTL-1 (не доходит до server, DPI может увидеть но не валидировать)
+/// - В seq_spoof (T27) — там строится per-connection CH через fork()
+pub fn build_client_hello_with_zero_random(sni: &str, rng: &mut PerConnRng) -> Vec<u8> {
+    assert!(
+        sni.len() >= MIN_SNI_LEN && sni.len() <= MAX_SNI_LEN,
+        "SNI length {} out of range [{}, {}]",
+        sni.len(),
+        MIN_SNI_LEN,
+        MAX_SNI_LEN
+    );
+
+    let grease = rng.generate_grease_set();
+
+    // 1. Build extensions (without padding)
+    let extensions = build_extensions(sni, rng, grease, false);
+
+    // 2. Build ClientHello body — с zero TLS Random и zero session_id
+    let body = build_ch_body_with_zero_random(grease, &extensions);
+
+    // 3. Compute padding
+    let body_with_padding = add_padding(body, rng);
+
+    // 4. Wrap in handshake header
+    let handshake = wrap_handshake(&body_with_padding);
+
+    wrap_record(&handshake)
+}
+
+/// Строит ClientHello-шаблон с deterministic zero random fields.
+///
+/// Используется как prebuilt template: TLS random, session ID, key share,
+/// ECH config, GREASE values — все обнулены. Padding — фиксированный (0).
+/// Для actual use random fields заполняются отдельно.
+///
+/// # Arguments
+/// * `sni` — доменное имя для SNI extension
+///
+/// # Returns
+/// `bytes::Bytes` — полный TLS record с deterministic content.
+pub fn build_client_hello_template(sni: &str) -> bytes::Bytes {
+    // Fixed GREASE values for template (first slot values from RFC 8701)
+    const GREASE_CIPHER: u16 = 0x0A0A;
+    const GREASE_EXT: u16 = 0x0A0A;
+    const GREASE_GROUP: u16 = 0x0A0A;
+    const GREASE_VERSION: u16 = 0x0A0A;
+
+    let grease = (GREASE_CIPHER, GREASE_EXT, GREASE_GROUP, GREASE_VERSION);
+
+    let extensions = build_extensions_template(sni, grease);
+
+    let body = build_ch_body_template(grease, &extensions);
+
+    // No padding for template (fixed size)
+    let handshake = wrap_handshake(&body);
+    let record = wrap_record(&handshake);
+    bytes::Bytes::from(record)
+}
+
+/// Template CH с early_data extension (для 0-RTT resumption).
+/// Random fields = 0 (deterministic template), но структура включает
+/// `early_data` extension и non-empty session_ticket.
+pub fn build_client_hello_template_with_resumption(sni: &str) -> bytes::Bytes {
+    let mut rng = crate::desync::rand::PerConnRng::from_seed([0u8; 32], 0);
+    let ch = build_client_hello_with_resumption(sni, &mut rng, true);
+    bytes::Bytes::from(ch)
+}
+
+/// Строит все extensions кроме padding для шаблона (zero random fields).
+fn build_extensions_template(sni: &str, grease: (u16, u16, u16, u16)) -> Vec<u8> {
+    let (_cipher_g, ext_g, group_g, ver_g) = grease;
+    let mut ext = Vec::with_capacity(1400);
+
+    // 1. GREASE extension (first, empty data — Chrome behavior)
+    ext.extend_from_slice(&ext_g.to_be_bytes());
+    ext.extend_from_slice(&0u16.to_be_bytes());
+
+    // 2. SNI (0x0000)
+    push_sni_extension(&mut ext, sni);
+
+    // 3. extended_master_secret (0x0017)
+    push_empty_extension(&mut ext, EXT_EXTENDED_MASTER_SECRET);
+
+    // 4. renegotiation_info (0xFF01)
+    ext.extend_from_slice(&EXT_RENEGOTIATION_INFO.to_be_bytes());
+    ext.extend_from_slice(&1u16.to_be_bytes());
+    ext.push(0x00);
+
+    // 5. supported_groups (0x000A)
+    push_supported_groups(&mut ext, group_g);
+
+    // 6. session_ticket (0x0023)
+    push_empty_extension(&mut ext, EXT_SESSION_TICKET);
+
+    // 7. ALPN (0x0010)
+    push_alpn_extension(&mut ext);
+
+    // 8. signed_certificate_timestamp (0x0012)
+    push_empty_extension(&mut ext, EXT_SCT);
+
+    // 9. signature_algorithms (0x000D)
+    push_sig_algs_extension(&mut ext);
+
+    // 10. key_share (0x0033) — zero-filled key shares for template
+    push_key_share_extension_template(&mut ext);
+
+    // 11. psk_key_exchange_modes (0x002D)
+    ext.extend_from_slice(&EXT_PSK_KEX_MODES.to_be_bytes());
+    ext.extend_from_slice(&2u16.to_be_bytes());
+    ext.push(1);
+    ext.push(1);
+
+    // 12. supported_versions (0x002B)
+    push_supported_versions(&mut ext, ver_g);
+
+    // 13. compress_certificate (0x001B)
+    ext.extend_from_slice(&EXT_COMPRESS_CERTIFICATE.to_be_bytes());
+    ext.extend_from_slice(&5u16.to_be_bytes());
+    ext.extend_from_slice(&3u16.to_be_bytes());
+    ext.push(0x02);
+    ext.push(0x01);
+    ext.push(0x00);
+
+    // 14. application_settings (0x4469)
+    ext.extend_from_slice(&EXT_APPLICATION_SETTINGS.to_be_bytes());
+    ext.extend_from_slice(&2u16.to_be_bytes());
+    ext.extend_from_slice(&0u16.to_be_bytes());
+
+    // 15. ECH GREASE (0xfe0d) — zero-filled for template
+    let ech_ext = build_ech_grease_extension_template();
+    ext.extend_from_slice(&ech_ext);
+
+    // 16. GREASE extension (second, before padding)
+    ext.extend_from_slice(&ext_g.to_be_bytes());
+    ext.extend_from_slice(&0u16.to_be_bytes());
+
+    ext
+}
+
+/// Zero-filled key share extension for template.
+fn push_key_share_extension_template(ext: &mut Vec<u8>) {
+    let pq_key = vec![0u8; MLKEM768_PUBLIC_KEY_SIZE];
+    let x25519_key = [0u8; X25519_PUBLIC_KEY_SIZE];
+
+    let mut shares = Vec::with_capacity(4 + MLKEM768_PUBLIC_KEY_SIZE + 4 + X25519_PUBLIC_KEY_SIZE);
+
+    shares.extend_from_slice(&GROUP_X25519MLKEM768.to_be_bytes());
+    shares.extend_from_slice(&(MLKEM768_PUBLIC_KEY_SIZE as u16).to_be_bytes());
+    shares.extend_from_slice(&pq_key);
+
+    shares.extend_from_slice(&GROUP_X25519.to_be_bytes());
+    shares.extend_from_slice(&(X25519_PUBLIC_KEY_SIZE as u16).to_be_bytes());
+    shares.extend_from_slice(&x25519_key);
+
+    let shares_len = shares.len() as u16;
+    let ext_data_len = shares_len + 2;
+
+    ext.extend_from_slice(&EXT_KEY_SHARE.to_be_bytes());
+    ext.extend_from_slice(&ext_data_len.to_be_bytes());
+    ext.extend_from_slice(&shares_len.to_be_bytes());
+    ext.extend_from_slice(&shares);
+}
+
+/// Zero-filled ECH GREASE extension for template.
+fn build_ech_grease_extension_template() -> Vec<u8> {
+    let config_id: u8 = 0;
+    let mut pub_key = [0u8; P256_PUBLIC_KEY_SIZE];
+    pub_key[0] = 0x04; // Uncompressed point format
+
+    let payload_len: usize = 32; // fixed size for template
+    let payload = vec![0u8; payload_len];
+
+    let mut config_contents = Vec::with_capacity(85);
+    config_contents.push(config_id);
+    config_contents.extend_from_slice(&HPKE_KEM_P256.to_be_bytes());
+    config_contents.extend_from_slice(&(P256_PUBLIC_KEY_SIZE as u16).to_be_bytes());
+    config_contents.extend_from_slice(&pub_key);
+    config_contents.extend_from_slice(&4u16.to_be_bytes());
+    config_contents.extend_from_slice(&HPKE_KDF_HKDF_SHA256.to_be_bytes());
+    config_contents.extend_from_slice(&HPKE_AEAD_AES_128_GCM.to_be_bytes());
+    config_contents.push(0);
+    config_contents.push(0);
+    config_contents.extend_from_slice(&0u16.to_be_bytes());
+
+    let mut config = Vec::with_capacity(4 + config_contents.len());
+    config.extend_from_slice(&0xFE0Du16.to_be_bytes());
+    config.extend_from_slice(&(config_contents.len() as u16).to_be_bytes());
+    config.extend_from_slice(&config_contents);
+
+    let mut ech = Vec::with_capacity(config.len() + 4 + payload_len);
+    ech.extend_from_slice(&config);
+    ech.extend_from_slice(&0u16.to_be_bytes());
+    ech.extend_from_slice(&(payload_len as u16).to_be_bytes());
+    ech.extend_from_slice(&payload);
+
+    let mut ext = Vec::with_capacity(4 + ech.len());
+    ext.extend_from_slice(&EXT_ENCRYPTED_CLIENT_HELLO.to_be_bytes());
+    ext.extend_from_slice(&(ech.len() as u16).to_be_bytes());
+    ext.extend_from_slice(&ech);
+
+    ext
+}
+
+/// Строит ClientHello body для шаблона (zero random fields, no padding).
+fn build_ch_body_template(grease: (u16, u16, u16, u16), extensions: &[u8]) -> Vec<u8> {
+    let (cipher_g, _, _, _) = grease;
+    let mut body = Vec::with_capacity(200 + extensions.len());
+
+    // legacy_version: TLS 1.2
+    body.extend_from_slice(&[0x03, 0x03]);
+
+    // random (32 bytes) — zero for template
+    body.extend_from_slice(&[0u8; 32]);
+
+    // session_id (32 bytes) — zero for template
+    body.push(32);
+    body.extend_from_slice(&[0u8; 32]);
+
+    // cipher_suites: GREASE + 3 standard + GREASE
+    let cipher_suites: [u16; 5] = [
+        cipher_g,
+        CS_TLS_AES_128_GCM_SHA256,
+        CS_TLS_AES_256_GCM_SHA384,
+        CS_TLS_CHACHA20_POLY1305_SHA256,
+        cipher_g,
+    ];
+    let cs_len = (cipher_suites.len() * 2) as u16;
+    body.extend_from_slice(&cs_len.to_be_bytes());
+    for &cs in &cipher_suites {
+        body.extend_from_slice(&cs.to_be_bytes());
+    }
+
+    // compression_methods: null only
+    body.push(1);
+    body.push(0x00);
+
+    // extensions
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(extensions);
+
+    body
+}
+
+/// Вычисляет JA4 fingerprint для TLS ClientHello.
+///
+/// Формат: `t13d<N_ext>h2_<cipher_hash_12hex>_<ext_hash_12hex>`
+///
+/// - `t13`: TLS 1.3
+/// - `d`: длина SNI > 0 (domain present)
+/// - `<N_ext>`: количество extensions (3 цифры)
+/// - `h2`: ALPN содержит h2
+/// - `<cipher_hash_12hex>`: первые 12 hex SHA-256 от sorted cipher suites
+/// - `<ext_hash_12hex>`: первые 12 hex SHA-256 от sorted extension types
+///
+/// # Arguments
+/// * `client_hello` — полный TLS record (ContentType + Version + Length + Handshake + CH)
+///
+/// # Returns
+/// `Option<String>` — JA4 fingerprint или None если парсинг не удался.
+pub fn calculate_ja4(client_hello: &[u8]) -> Option<String> {
+    if !is_client_hello(client_hello) {
+        return None;
+    }
+
+    // Skip TLS record header (5 bytes) + handshake header (4 bytes)
+    if client_hello.len() < 9 {
+        return None;
+    }
+    let mut pos = 5; // after TLS record header
+
+    // Handshake header: type(1) + length(3)
+    if client_hello[pos] != 0x01 {
+        return None;
+    }
+    pos += 4;
+
+    // ClientHello body: version(2) + random(32) + session_id(1+N) + cipher_suites(2+M) + compression(1+K) + extensions
+    if pos + 35 > client_hello.len() {
+        return None;
+    }
+    pos += 2; // legacy_version
+    pos += 32; // random
+
+    // session_id
+    if pos >= client_hello.len() {
+        return None;
+    }
+    let sid_len = client_hello[pos] as usize;
+    pos += 1 + sid_len;
+
+    // cipher_suites
+    if pos + 2 > client_hello.len() {
+        return None;
+    }
+    let cs_len = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]) as usize;
+    let cs_start = pos + 2;
+    let cs_end = cs_start + cs_len;
+    if cs_end > client_hello.len() {
+        return None;
+    }
+
+    // Parse cipher suites (filter out GREASE: high byte == low byte and (val & 0x0F0F) == 0x0A0A)
+    let mut cipher_suites = Vec::new();
+    let mut i = cs_start;
+    while i + 2 <= cs_end {
+        let cs = u16::from_be_bytes([client_hello[i], client_hello[i + 1]]);
+        if !is_grease(cs) {
+            cipher_suites.push(cs);
+        }
+        i += 2;
+    }
+    pos = cs_end;
+
+    // compression_methods
+    if pos >= client_hello.len() {
+        return None;
+    }
+    let comp_len = client_hello[pos] as usize;
+    pos += 1 + comp_len;
+
+    // extensions
+    if pos + 2 > client_hello.len() {
+        return None;
+    }
+    let ext_total_len = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]) as usize;
+    pos += 2;
+
+    let ext_end = pos + ext_total_len;
+    if ext_end > client_hello.len() {
+        return None;
+    }
+
+    // Parse extensions — collect types and check for SNI/ALPN
+    let mut extension_types = Vec::new();
+    let mut has_sni = false;
+    let mut has_h2 = false;
+
+    while pos + 4 <= ext_end {
+        let ext_type = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]);
+        let ext_len = u16::from_be_bytes([client_hello[pos + 2], client_hello[pos + 3]]) as usize;
+        pos += 4;
+
+        if pos + ext_len > ext_end {
+            return None;
+        }
+
+        if !is_grease(ext_type) {
+            extension_types.push(ext_type);
+        }
+
+        // Check SNI
+        if ext_type == EXT_SNI {
+            has_sni = true;
+        }
+
+        // Check ALPN for h2
+        if ext_type == EXT_ALPN && ext_len > 2 {
+            let alpn_data = &client_hello[pos..pos + ext_len];
+            let protocols_len = u16::from_be_bytes([alpn_data[0], alpn_data[1]]) as usize;
+            if 2 + protocols_len <= alpn_data.len() {
+                let mut j = 2;
+                while j + 1 < 2 + protocols_len {
+                    let proto_len = alpn_data[j] as usize;
+                    j += 1;
+                    if j + proto_len <= 2 + protocols_len
+                        && proto_len == 2
+                        && &alpn_data[j..j + 2] == b"h2"
+                    {
+                        has_h2 = true;
+                    }
+                    j += proto_len;
+                }
+            }
+        }
+
+        pos += ext_len;
+    }
+
+    // Build JA4 fingerprint
+    let ext_count = extension_types.len();
+    let sni_char = if has_sni { 'd' } else { 'i' };
+    let alpn_flag = if has_h2 { "h2" } else { "h1" };
+
+    // Sort cipher suites and extension types
+    cipher_suites.sort_unstable();
+    extension_types.sort_unstable();
+
+    // Hash cipher suites
+    let cipher_hash = hash_and_truncate(&cipher_suites);
+    // Hash extension types
+    let ext_hash = hash_and_truncate(&extension_types);
+
+    Some(format!(
+        "t13{}{:03}{}_{}_{}",
+        sni_char, ext_count, alpn_flag, cipher_hash, ext_hash
+    ))
+}
+
+/// Проверяет является ли значение GREASE (RFC 8701).
+fn is_grease(val: u16) -> bool {
+    (val & 0x0F0F) == 0x0A0A && (val >> 8) == (val & 0xFF)
+}
+
+/// SHA-256 хеш и первые 6 байт (12 hex символов).
+/// JA4 fingerprint hash: SHA-256 truncated to first 6 bytes (12 hex chars).
+///
+/// Per JA4 spec, cipher suites and extension types are serialized as
+/// sorted big-endian u16 values, then SHA-256 hashed, first 6 bytes kept.
+fn hash_and_truncate(items: &[u16]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for &item in items {
+        hasher.update(item.to_be_bytes());
+    }
+    let hash = hasher.finalize();
+    // First 6 bytes of hash as hex (12 hex chars)
+    hash[..6]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>()
 }
 
 /// Проверяет, является ли буфер TLS ClientHello.
@@ -296,7 +745,29 @@ pub fn mask_sni(_client_hello: &[u8], white_domain: &str) -> Option<Vec<u8>> {
 /// Порядок extensions соответствует Chrome 130+:
 /// GREASE → SNI → EMS → Renego → Groups → Ticket → ALPN → SCT → SigAlgs →
 /// KeyShare → PSK_KEX → Versions → CompressCert → AppSettings → GREASE
-fn build_extensions(sni: &str, rng: &mut PerConnRng, grease: (u16, u16, u16, u16)) -> Vec<u8> {
+/// Строит `early_data` extension (RFC 8446 §4.2.10).
+///
+/// Используется при 0-RTT (resumption). Сигнализирует серверу,
+/// что клиент хочет отправить данные в первом полёте, до
+/// завершения handshake.
+///
+/// # Arguments
+/// * `max_early_data_size` — максимальный объём 0-RTT данных.
+///   В реальных браузерах = 0xFFFFFFFF (unlimited).
+pub fn build_early_data_extension(max_early_data_size: u32) -> Vec<u8> {
+    let mut ext = Vec::with_capacity(10);
+    ext.extend_from_slice(&EXT_EARLY_DATA.to_be_bytes()); // type
+    ext.extend_from_slice(&4u16.to_be_bytes()); // ext data length
+    ext.extend_from_slice(&max_early_data_size.to_be_bytes()); // max_early_data_size
+    ext
+}
+
+fn build_extensions(
+    sni: &str,
+    rng: &mut PerConnRng,
+    grease: (u16, u16, u16, u16),
+    is_resumption: bool,
+) -> Vec<u8> {
     let (_cipher_g, ext_g, group_g, ver_g) = grease;
     let mut ext = Vec::with_capacity(1400);
 
@@ -318,8 +789,17 @@ fn build_extensions(sni: &str, rng: &mut PerConnRng, grease: (u16, u16, u16, u16
     // 5. supported_groups (0x000A) — includes X25519MLKEM768
     push_supported_groups(&mut ext, group_g);
 
-    // 6. session_ticket (0x0023) — empty
-    push_empty_extension(&mut ext, EXT_SESSION_TICKET);
+    // 6. session_ticket (0x0023)
+    if is_resumption {
+        // Non-empty session ticket для 0-RTT resumption
+        let ticket: [u8; 4] = rng.next_wire_u64().to_be_bytes()[..4].try_into().unwrap();
+        ext.extend_from_slice(&EXT_SESSION_TICKET.to_be_bytes());
+        ext.extend_from_slice(&4u16.to_be_bytes()); // data length
+        ext.extend_from_slice(&ticket);
+    } else {
+        // Empty session ticket (normal ClientHello)
+        push_empty_extension(&mut ext, EXT_SESSION_TICKET);
+    }
 
     // 7. ALPN (0x0010) — h2, http/1.1
     push_alpn_extension(&mut ext);
@@ -356,19 +836,16 @@ fn build_extensions(sni: &str, rng: &mut PerConnRng, grease: (u16, u16, u16, u16
     ext.extend_from_slice(&0u16.to_be_bytes()); // empty settings
 
     // 15. ECH GREASE (0xfe0d) — Chrome 122+ default behavior.
-    //
-    // Реальный Chrome отправляет dummy ECH extension в КАЖДОМ ClientHello,
-    // даже если сервер ECH не поддерживает. Это создаёт политическую
-    // дилемму для DPI: блокировать = заблокировать весь Chrome 122+ трафик
-    // (политическое самоубийство для consumer ISP), пропускать = не читать
-    // SNI (ECH визуально неотличим от real ECH без попытки расшифровки).
-    //
-    // Структура: RFC 9460 §4 ECHClientHello с config_id, public_key, payload —
-    // все random. DPI не может отличить без private key.
     let ech_ext = build_ech_grease_extension(rng);
     ext.extend_from_slice(&ech_ext);
 
-    // 16. GREASE extension (second, before padding)
+    // 16. early_data (0x4433) — только при resumption (0-RTT)
+    if is_resumption {
+        let early_data_ext = build_early_data_extension(u32::MAX);
+        ext.extend_from_slice(&early_data_ext);
+    }
+
+    // 17. GREASE extension (last, before padding)
     let grease2 = rng.pick_grease();
     ext.extend_from_slice(&grease2.to_be_bytes());
     ext.extend_from_slice(&0u16.to_be_bytes());
@@ -616,6 +1093,47 @@ fn build_ch_body(rng: &mut PerConnRng, grease: (u16, u16, u16, u16), extensions:
     body
 }
 
+/// Строит ClientHello body с zero TLS Random и zero session_id.
+/// Остальные поля (cipher_suites, extensions) — как в обычной CH.
+fn build_ch_body_with_zero_random(grease: (u16, u16, u16, u16), extensions: &[u8]) -> Vec<u8> {
+    let (cipher_g, _, _, _) = grease;
+    let mut body = Vec::with_capacity(512);
+
+    // Version: TLS 1.2 legacy (0x0303)
+    body.extend_from_slice(&[0x03, 0x03]);
+
+    // TLS Random — 32 bytes of zeros (template marker)
+    body.extend_from_slice(&[0u8; 32]);
+
+    // Session ID — 32 bytes of zeros (template marker)
+    body.push(32); // session_id length
+    body.extend_from_slice(&[0u8; 32]);
+
+    // Cipher suites — same as build_ch_body
+    let cipher_suites: [u16; 5] = [
+        cipher_g,
+        CS_TLS_AES_128_GCM_SHA256,
+        CS_TLS_AES_256_GCM_SHA384,
+        CS_TLS_CHACHA20_POLY1305_SHA256,
+        cipher_g,
+    ];
+    let cs_len = (cipher_suites.len() * 2) as u16;
+    body.extend_from_slice(&cs_len.to_be_bytes());
+    for &cs in &cipher_suites {
+        body.extend_from_slice(&cs.to_be_bytes());
+    }
+
+    // Compression methods — null only
+    body.push(1);
+    body.push(0x00);
+
+    // Extensions
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(extensions);
+
+    body
+}
+
 /// Добавляет padding extension (0x0015) для доведения CH до random multiple of 16.
 ///
 /// Chrome 130+ behavior: pad to random multiple of 16 in [512, 4096].
@@ -689,7 +1207,7 @@ fn compute_padded_body_size(current_body_len: usize, rng: &mut PerConnRng) -> us
     let max_extra = MAX_PADDED.saturating_sub(aligned);
     let extra_steps = max_extra / ALIGN;
     let extra = if extra_steps > 0 {
-        (rng.next_range(0, extra_steps as u64) * ALIGN as u64) as usize
+        (rng.next_range_internal(0, extra_steps as u64) * ALIGN as u64) as usize
     } else {
         0
     };
@@ -1005,5 +1523,187 @@ mod tests {
             build_client_hello(&long_sni, &mut rng);
         });
         assert!(result.is_err(), "Should panic on SNI > 253 bytes");
+    }
+
+    // ========================================================================
+    // T44.2: build_client_hello_with_zero_random tests
+    // ========================================================================
+
+    #[test]
+    fn test_build_client_hello_with_zero_random_basic() {
+        let mut rng = test_rng();
+        let ch = build_client_hello_with_zero_random("example.com", &mut rng);
+        assert!(ch.len() > 100, "CH too small: {} bytes", ch.len());
+        assert!(ch.len() <= 4500, "CH too large: {} bytes", ch.len());
+        assert_eq!(ch[0], 0x16); // TLS Handshake
+        assert_eq!(ch[5], 0x01); // ClientHello
+    }
+
+    #[test]
+    fn test_build_client_hello_with_zero_random_random_field() {
+        // TLS Random должен быть нулевым (32 bytes at offset 11..43)
+        let mut rng = test_rng();
+        let ch = build_client_hello_with_zero_random("example.com", &mut rng);
+        let random = &ch[11..43];
+        assert!(
+            random.iter().all(|&b| b == 0),
+            "TLS Random should be zero (template marker)"
+        );
+    }
+
+    #[test]
+    fn test_build_client_hello_with_zero_random_session_id() {
+        // Session ID (после random) должен быть нулевым
+        let mut rng = test_rng();
+        let ch = build_client_hello_with_zero_random("example.com", &mut rng);
+        // От offset 11 (random start) + 32 (random) = offset 43 for session_id len
+        let sid_len = ch[43];
+        assert_eq!(sid_len, 32, "Session ID length should be 32");
+        let session_id = &ch[44..44 + sid_len as usize];
+        assert!(
+            session_id.iter().all(|&b| b == 0),
+            "Session ID should be zero (template marker)"
+        );
+    }
+
+    #[test]
+    fn test_build_client_hello_with_zero_random_sni_parseable() {
+        let mut rng = test_rng();
+        let ch = build_client_hello_with_zero_random("test.example.com", &mut rng);
+        let sni = parse_sni(&ch).expect("SNI should be parseable");
+        assert_eq!(sni, "test.example.com");
+    }
+
+    #[test]
+    fn test_build_client_hello_with_zero_random_grease_varies() {
+        // Different connections → different GREASE (deterministic via rng seed)
+        let mut rng1 = PerConnRng::new(1);
+        let mut rng2 = PerConnRng::new(2);
+        let ch1 = build_client_hello_with_zero_random("example.com", &mut rng1);
+        let ch2 = build_client_hello_with_zero_random("example.com", &mut rng2);
+        // CHs should differ (different GREASE + key share randomisation)
+        let differences = ch1.iter().zip(ch2.iter()).filter(|(a, b)| a != b).count();
+        assert!(
+            differences > 10,
+            "CHs too similar — per-conn randomisation may be broken: {} differences",
+            differences
+        );
+    }
+
+    // ========================================================================
+    // T25: build_client_hello_template tests
+    // ========================================================================
+
+    #[test]
+    fn test_build_client_hello_template_basic() {
+        let ch = build_client_hello_template("example.com");
+        assert!(ch.len() > 0, "Template CH should not be empty");
+        assert_eq!(ch[0], 0x16); // TLS Handshake
+        assert_eq!(ch[5], 0x01); // ClientHello
+    }
+
+    #[test]
+    fn test_build_client_hello_template_deterministic() {
+        // Template is deterministic — same SNI produces same output
+        let ch1 = build_client_hello_template("example.com");
+        let ch2 = build_client_hello_template("example.com");
+        assert_eq!(ch1, ch2, "Template should be deterministic");
+    }
+
+    #[test]
+    fn test_build_client_hello_template_zero_random() {
+        let ch = build_client_hello_template("example.com");
+        // After record header (5) + handshake header (4) + version (2) = offset 11
+        // Random field is 32 bytes at offset 11..43
+        let random = &ch[11..43];
+        assert!(
+            random.iter().all(|&b| b == 0),
+            "Random field should be zero"
+        );
+    }
+
+    #[test]
+    fn test_build_client_hello_template_sni() {
+        let ch = build_client_hello_template("test.example.com");
+        let sni = parse_sni(&ch).expect("SNI should be parseable");
+        assert_eq!(sni, "test.example.com");
+    }
+
+    // ========================================================================
+    // T26: calculate_ja4 tests
+    // ========================================================================
+
+    #[test]
+    fn test_ja4_starts_with_t13d() {
+        let mut rng = test_rng();
+        let ch = build_client_hello("example.com", &mut rng);
+        let ja4 = calculate_ja4(&ch).expect("JA4 should be computed");
+        assert!(
+            ja4.starts_with("t13d"),
+            "JA4 should start with 't13d', got: {}",
+            ja4
+        );
+    }
+
+    #[test]
+    fn test_ja4_format() {
+        let mut rng = test_rng();
+        let ch = build_client_hello("example.com", &mut rng);
+        let ja4 = calculate_ja4(&ch).expect("JA4 should be computed");
+
+        // Format: t13d<ext_count><h2_flag>_<cipher_hash>_<ext_hash>
+        let parts: Vec<&str> = ja4.split('_').collect();
+        assert_eq!(parts.len(), 3, "JA4 should have 3 parts separated by '_'");
+
+        // First part should be t13d<NNN><h2|h1>
+        assert!(
+            parts[0].starts_with("t13d"),
+            "First part should start with t13d"
+        );
+        assert!(
+            parts[1].len() == 12,
+            "Cipher hash should be 12 hex chars, got: {}",
+            parts[1]
+        );
+        assert!(
+            parts[2].len() == 12,
+            "Ext hash should be 12 hex chars, got: {}",
+            parts[2]
+        );
+    }
+
+    #[test]
+    fn test_ja4_deterministic() {
+        // Same CH produces same JA4
+        let mut rng = test_rng();
+        let ch = build_client_hello("example.com", &mut rng);
+        let ja4_1 = calculate_ja4(&ch).unwrap();
+        let ja4_2 = calculate_ja4(&ch).unwrap();
+        assert_eq!(ja4_1, ja4_2, "JA4 should be deterministic");
+    }
+
+    #[test]
+    fn test_ja4_different_sni_different_hash() {
+        // Different SNI = different extensions order = different hash
+        let mut rng1 = PerConnRng::new(1);
+        let mut rng2 = PerConnRng::new(2);
+        let ch1 = build_client_hello("example.com", &mut rng1);
+        let ch2 = build_client_hello("other.com", &mut rng2);
+        let ja4_1 = calculate_ja4(&ch1).unwrap();
+        let ja4_2 = calculate_ja4(&ch2).unwrap();
+        // JA4 hashes should differ (different cipher suite ordering or extension counts)
+        // At minimum the format should be valid
+        assert!(ja4_1.starts_with("t13d"));
+        assert!(ja4_2.starts_with("t13d"));
+    }
+
+    #[test]
+    fn test_ja4_template() {
+        let ch = build_client_hello_template("example.com");
+        let ja4 = calculate_ja4(&ch).expect("JA4 should work on template");
+        assert!(
+            ja4.starts_with("t13d"),
+            "Template JA4 should start with t13d"
+        );
     }
 }

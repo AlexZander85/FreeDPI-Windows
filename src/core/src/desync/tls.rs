@@ -1,8 +1,8 @@
 //! TLS-level Desync техники.
 //!
 //! ## Техники
-//! - [15] TlsRecordFrag — TLS Record Fragmentation
-//! - [07] TlsRecordPad — TLS Record Padding
+//! - [15] TlsRecordFrag — TLS Record Fragmentation (split at SNI offset)
+//! - [07] TlsRecordPad — TLS Record Padding (inside the record)
 //!
 //! ## Принципы
 //! TLS desync техники манипулируют TLS Record Layer до того,
@@ -14,32 +14,28 @@
 //! Адаптировано из [zapret](https://github.com/bol-van/zapret) и
 //! [byedpi](https://github.com/hufrea/byedpi).
 
-use crate::desync::{ipv4_checksum, parse_ip_header, DesyncResult};
-use pnet_packet::ip::IpNextHeaderProtocols;
-use pnet_packet::ipv4::MutableIpv4Packet;
-use pnet_packet::tcp::MutableTcpPacket;
+use crate::desync::{parse_ip_header, DesyncResult};
 use pnet_packet::tcp::TcpFlags;
-use pnet_packet::MutablePacket;
-use std::net::Ipv4Addr;
 use tracing::debug;
 
-/// [15] TlsRecordFrag: разделение TLS record на несколько фрагментов.
+/// [15] TlsRecordFrag: разделение TLS record внутри ClientHello у SNI.
 ///
 /// ## Принцип
 /// DPI ожидает TLS ClientHello целиком в одном TCP сегменте.
-/// Разделяем TLS record на 2+ части. DPI видит первый фрагмент
-/// (только начало CH) и может не распознать его как TLS. Сервер
-/// собирает fragments по ContentType.
+/// Разделяем TLS record внутри тела ClientHello — в области SNI
+/// со случайным jitter. DPI видит обрезанный CH и не может
+/// распознать SNI. Сервер собирает fragments по record boundaries.
 ///
-/// ## Подробности
-/// TLS record: [ContentType(1) + Version(2) + Length(2) + Payload]
-/// Разделяем так, чтобы второй фрагмент начинался после Length
-/// (т.е. режем по границе record payload, не внутри).
+/// ## Стратегия
+/// 1. Парсим TLS record → ClientHello
+/// 2. Ищем SNI extension, определяем offset имени хоста
+/// 3. Добавляем random jitter (±16 байт) к offset
+/// 4. Разделяем payload на 2 TCP сегмента по этому offset
 ///
 /// ## Returns
-/// - inject: [frag1, frag2, ...] — фрагменты record'а
-///   frag1 = ContentType + Version + Length (5 байт)
-///   frag2+ = остаток данных
+/// - inject: [frag1, frag2] — два TCP сегмента
+///   frag1 = данные до split_point (TTL-1, fake)
+///   frag2 = данные после split_point (нормальный TTL, реальный)
 pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> DesyncResult {
     let ip = match parse_ip_header(packet) {
         Some(h) => h,
@@ -55,7 +51,7 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
     let data_offset = tcp.get_data_offset() as usize * 4;
     let payload = &tcp_data[data_offset..];
 
-    if payload.len() < 5 || frag_at >= payload.len() {
+    if payload.len() < 10 || payload[0] != 0x16 {
         return DesyncResult::passthrough();
     }
 
@@ -67,11 +63,35 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
     let src_port = tcp.get_source();
     let dst_port = tcp.get_destination();
 
+    // Определяем точку разреза: ищем SNI внутри ClientHello
+    let record_len = u16::from_be_bytes([payload[3], payload[4]]) as usize;
+    let split_point = if let Some(sni_offset) = find_sni_offset_in_ch(payload) {
+        // SNI найден — разрезаем в области SNI с jitter
+        let jitter = crate::desync::rand::random_range(0, 32) as i16 - 16;
+        let base = sni_offset as i16 + jitter;
+        // Не разрезаем раньше record header (5) и не позже конца record
+        let min_split = 6.min(record_len.saturating_sub(1));
+        let max_split = record_len.saturating_add(5).saturating_sub(1);
+        (base.max(min_split as i16).min(max_split as i16)) as usize
+    } else {
+        // SNI не найден — используем frag_at как fallback
+        let candidate = frag_at.max(6);
+        if candidate >= payload.len() {
+            return DesyncResult::passthrough();
+        }
+        candidate
+    };
+
+    if split_point >= payload.len() {
+        return DesyncResult::passthrough();
+    }
+
     let mut inject: Vec<bytes::Bytes> = Vec::new();
 
-    // Фрагмент 1: начало TLS record (до frag_at)
-    let frag1_payload = &payload[..frag_at];
-    let frag1 = build_tcp_with_payload(
+    // Фрагмент 1: начало до split_point (fake TTL)
+    let frag1_payload = &payload[..split_point];
+    let frag1 = crate::desync::tcp::build_ip_tcp_packet_with_options(
+        packet,
         src,
         dst,
         src_port,
@@ -86,10 +106,11 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
     );
     inject.push(frag1);
 
-    // Фрагмент 2: остаток данных
-    let frag2_payload = &payload[frag_at..];
-    let new_seq = seq.wrapping_add(frag_at as u32);
-    let frag2 = build_tcp_with_payload(
+    // Фрагмент 2: остаток (нормальный TTL)
+    let frag2_payload = &payload[split_point..];
+    let new_seq = seq.wrapping_add(split_point as u32);
+    let frag2 = crate::desync::tcp::build_ip_tcp_packet_with_options(
+        packet,
         src,
         dst,
         src_port,
@@ -106,7 +127,7 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
 
     debug!(
         "[15] TlsRecordFrag: split at byte {} ({} + {} bytes)",
-        frag_at,
+        split_point,
         frag1_payload.len(),
         frag2_payload.len()
     );
@@ -114,18 +135,22 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
     DesyncResult::inject_many(inject)
 }
 
-/// [07] TlsRecordPad: padding TLS record.
+/// [07] TlsRecordPad: padding внутри TLS record.
 ///
 /// ## Принцип
-/// Добавляем фиктивные байты после реального TLS record.
-/// DPI может читать padding как часть CH и сбиться.
-/// Сервер игнорирует данные после завершения record.
+/// Добавляем случайные padding-байты ВНУТРЬ TLS record, сразу
+/// после тела ClientHello, и обновляем record length. DPI видит
+/// изменённую структуру record и может сбиться. Сервер парсит
+/// ClientHello по handshake length и игнорирует лишние байты
+/// в record.
 ///
 /// ## Подробности
-/// Добавляем N байт случайного мусора после payload.
-/// TCP header остаётся тем же (SEQ не меняется).
-/// Сервер читает первые M байт как CH, остальное игнорирует.
-pub fn tls_record_pad(packet: &[u8], pad_size: usize, fake_ttl_offset: u8) -> DesyncResult {
+/// TLS record: [ContentType(1) + Version(2) + Length(2) + Fragment]
+/// Fragment содержит ClientHello: [HandshakeType(1) + Length(3) + Body]
+///
+/// Вставляем padding после Body CH, увеличиваем Length на pad_size,
+/// пересчитываем IP checksum. Возвращаем modified_only — один пакет.
+pub fn tls_record_pad(packet: &[u8], pad_size: usize, _fake_ttl_offset: u8) -> DesyncResult {
     let ip = match parse_ip_header(packet) {
         Some(h) => h,
         None => return DesyncResult::passthrough(),
@@ -140,60 +165,66 @@ pub fn tls_record_pad(packet: &[u8], pad_size: usize, fake_ttl_offset: u8) -> De
     let data_offset = tcp.get_data_offset() as usize * 4;
     let payload = &tcp_data[data_offset..];
 
-    if payload.is_empty() {
+    // Минимум: TLS record header(5) + HandshakeType(1) + Length(3) = 9 байт
+    if payload.len() < 9 || payload[0] != 0x16 {
         return DesyncResult::passthrough();
     }
 
-    // Padding: N байт случайного мусора
-    let padding: Vec<u8> = (0..pad_size).map(|i| (i * 0x13) as u8).collect();
+    // HandshakeType должен быть ClientHello (0x01)
+    if payload[5] != 0x01 {
+        return DesyncResult::passthrough();
+    }
 
-    // Первые пакет: реальные данные
-    let seq = tcp.get_sequence();
-    let ack = tcp.get_acknowledgement();
-    let window = tcp.get_window();
-    let src = ip.src;
-    let dst = ip.dst;
-    let src_port = tcp.get_source();
-    let dst_port = tcp.get_destination();
+    // Длина тела ClientHello (3 bytes, big-endian)
+    let ch_body_len =
+        ((payload[6] as usize) << 16) | ((payload[7] as usize) << 8) | (payload[8] as usize);
+    let ch_end = 5 + 4 + ch_body_len; // record_header(5) + handshake_header(4) + body
 
-    let real = build_tcp_with_payload(
-        src,
-        dst,
-        src_port,
-        dst_port,
-        seq,
-        ack,
-        TcpFlags::PSH | TcpFlags::ACK,
-        window,
-        payload,
-        ip.ttl,
-        ip.identification,
-    );
+    let record_len = u16::from_be_bytes([payload[3], payload[4]]) as usize;
+    let record_len_u16 = u16::from_be_bytes([payload[3], payload[4]]);
 
-    // Padding пакет: TTL-1 (не должен дойти до сервера)
-    let pad_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
-    let pad_seq = seq.wrapping_add(payload.len() as u32);
-    let pad_pkt = build_tcp_with_payload(
-        src,
-        dst,
-        src_port,
-        dst_port,
-        pad_seq,
-        ack,
-        TcpFlags::PSH | TcpFlags::ACK,
-        window,
-        &padding,
-        pad_ttl,
-        ip.identification.wrapping_add(1),
-    );
+    // Проверяем целостность: конец CH не должен превышать record
+    if ch_end > 5 + record_len || ch_end > payload.len() {
+        return DesyncResult::passthrough();
+    }
+
+    // Случайный padding
+    let padding = crate::desync::rand::random_bytes(pad_size);
+
+    // Модифицируем пакет in-place
+    let mut modified = packet.to_vec();
+    let tcp_payload_offset = ip.header_len + data_offset;
+
+    // Вставляем padding после тела ClientHello
+    let insert_pos = tcp_payload_offset + ch_end;
+    modified.splice(insert_pos..insert_pos, padding.iter().copied());
+
+    // Обновляем TLS record length (bytes 3-4 в payload)
+    let new_record_len = record_len_u16.wrapping_add(pad_size as u16);
+    let rl_offset = tcp_payload_offset + 3;
+    modified[rl_offset..rl_offset + 2].copy_from_slice(&new_record_len.to_be_bytes());
+
+    // Обновляем IP total length
+    let new_total = modified.len() as u16;
+    modified[2..4].copy_from_slice(&new_total.to_be_bytes());
+
+    // Пересчитываем IP checksum
+    let ip_csum = crate::desync::ipv4_checksum(&modified[..20]);
+    modified[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+    // Пересчитываем TCP checksum
+    let tcp_start = ip.header_len;
+    modified[tcp_start + 16] = 0;
+    modified[tcp_start + 17] = 0;
+    let tcp_csum = crate::desync::tcp_checksum_v4(ip.src, ip.dst, &modified[tcp_start..]);
+    modified[tcp_start + 16..tcp_start + 18].copy_from_slice(&tcp_csum.to_be_bytes());
 
     debug!(
-        "[07] TlsRecordPad: {} bytes real + {} bytes padding",
-        payload.len(),
-        pad_size
+        "[07] TlsRecordPad: {} bytes padding inside record (record {} → {} bytes)",
+        pad_size, record_len_u16, new_record_len
     );
 
-    DesyncResult::inject_many(vec![real, pad_pkt])
+    DesyncResult::modified_only(modified)
 }
 
 /// [OM2] SniMicrofrag: микро-фрагментация TLS ClientHello.
@@ -254,14 +285,15 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
     let src_port = tcp.get_source();
     let dst_port = tcp.get_destination();
 
-    let mut inject: Vec<bytes::Bytes> = Vec::with_capacity(micro_count);
+    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> =
+        smallvec::SmallVec::with_capacity(micro_count);
 
-    // Микро-фрагменты: по 1 байту
     for i in 0..micro_count {
         let frag_payload = &payload[i..i + 1];
         let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
         let frag_seq = seq.wrapping_add(i as u32);
-        let frag = build_tcp_with_payload(
+        let frag = crate::desync::tcp::build_ip_tcp_packet_with_options(
+            packet,
             src,
             dst,
             src_port,
@@ -277,10 +309,10 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
         inject.push(frag);
     }
 
-    // Последний сегмент: остаток данных, нормальный TTL
     let remaining = &payload[micro_count..];
     let last_seq = seq.wrapping_add(micro_count as u32);
-    let modified = build_tcp_with_payload(
+    let modified = crate::desync::tcp::build_ip_tcp_packet_with_options(
+        packet,
         src,
         dst,
         src_port,
@@ -305,73 +337,107 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
         inject,
         inter_delay_us: 0,
         drop: false,
+        is_outbound_inject: false,
     }
 }
 
-// ==================== Вспомогательные функции ====================
+// ==================== SNI Parser ====================
 
-/// Строит TCP пакет с payload, IP обёрткой и корректным checksum.
-#[allow(clippy::too_many_arguments)]
-fn build_tcp_with_payload(
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    window: u16,
-    payload: &[u8],
-    ttl: u8,
-    identification: u16,
-) -> bytes::Bytes {
-    let tcp_header_len = 20;
-
-    // --- TCP segment ---
-    let mut tcp_buf = bytes::BytesMut::with_capacity(tcp_header_len);
-    tcp_buf.resize(tcp_header_len, 0);
-    {
-        let mut tcp = MutableTcpPacket::new(&mut tcp_buf).unwrap();
-        tcp.set_source(src_port);
-        tcp.set_destination(dst_port);
-        tcp.set_sequence(seq);
-        tcp.set_acknowledgement(ack);
-        tcp.set_data_offset(5);
-        tcp.set_flags(flags);
-        tcp.set_window(window);
-        tcp.set_checksum(0);
-        tcp.set_urgent_ptr(0);
-        // tcp drops here → mutable borrow ends
+/// Ищет offset начала имени хоста в SNI extension внутри TLS ClientHello.
+///
+/// Парсит TLS record → ClientHello → Extensions → SNI extension.
+/// Возвращает offset относительно начала TLS record payload
+/// (т.е. payload[sni_offset] — первый байт hostname).
+///
+/// Возвращает `None` если ClientHello не найден или SNI extension отсутствует.
+pub(crate) fn find_sni_offset_in_ch(payload: &[u8]) -> Option<usize> {
+    if payload.len() < 10 {
+        return None;
     }
-    let csum = crate::desync::tcp_checksum_v4(src_ip, dst_ip, &tcp_buf);
-    tcp_buf[16..18].copy_from_slice(&csum.to_be_bytes());
 
-    let mut full = tcp_buf.to_vec();
-    full.extend_from_slice(payload);
-
-    // --- IP packet ---
-    let total_len = 20 + full.len();
-    let mut ip_buf = bytes::BytesMut::with_capacity(total_len);
-    ip_buf.resize(total_len, 0);
-    {
-        let mut ip = MutableIpv4Packet::new(&mut ip_buf).unwrap();
-        ip.set_version(4);
-        ip.set_header_length(5);
-        ip.set_total_length(total_len as u16);
-        ip.set_identification(identification);
-        ip.set_flags(0);
-        ip.set_fragment_offset(0);
-        ip.set_ttl(ttl);
-        ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
-        ip.set_source(src_ip);
-        ip.set_destination(dst_ip);
-        ip.payload_mut().copy_from_slice(&full);
-        // ip drops here → mutable borrow ends
+    // TLS record header: ContentType(1) + Version(2) + Length(2)
+    if payload[0] != 0x16 {
+        return None;
     }
-    let ip_csum = ipv4_checksum(&ip_buf[..20]);
-    ip_buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
 
-    ip_buf.freeze()
+    let record_len = u16::from_be_bytes([payload[3], payload[4]]) as usize;
+    if record_len + 5 > payload.len() {
+        return None;
+    }
+
+    // HandshakeType: ClientHello = 0x01
+    if payload[5] != 0x01 {
+        return None;
+    }
+
+    // HandshakeLength (3 bytes)
+    let ch_body_len =
+        ((payload[6] as usize) << 16) | ((payload[7] as usize) << 8) | (payload[8] as usize);
+    let ch_end = 5 + 4 + ch_body_len;
+    if ch_end > payload.len() {
+        return None;
+    }
+
+    // Парсим ClientHello body начиная с offset 9
+    let mut pos = 9;
+
+    // Version (2 bytes)
+    pos += 2;
+    if pos + 32 > ch_end {
+        return None;
+    }
+    // Random (32 bytes)
+    pos += 32;
+
+    // SessionID
+    if pos >= ch_end {
+        return None;
+    }
+    let session_id_len = payload[pos] as usize;
+    pos += 1 + session_id_len;
+
+    // CipherSuites (2 bytes length + data)
+    if pos + 2 > ch_end {
+        return None;
+    }
+    let cs_len = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+    pos += 2 + cs_len;
+
+    // Compression methods (1 byte length + data)
+    if pos >= ch_end {
+        return None;
+    }
+    let cm_len = payload[pos] as usize;
+    pos += 1 + cm_len;
+
+    // Extensions length (2 bytes)
+    if pos + 2 > ch_end {
+        return None;
+    }
+    let ext_len = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+    pos += 2;
+    let ext_end = (pos + ext_len).min(ch_end);
+
+    // Walk extensions looking for SNI (type = 0x0000)
+    while pos + 4 <= ext_end {
+        let ext_type = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+        let ext_data_len = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
+
+        if ext_type == 0x0000 && pos + 4 + ext_data_len <= ext_end {
+            // SNI extension: ServerNameListLen(2) + NameType(1) + NameLen(2) + hostname
+            let sni_start = pos + 4;
+            if sni_start + 5 <= ext_end {
+                let name_len =
+                    u16::from_be_bytes([payload[sni_start + 3], payload[sni_start + 4]]) as usize;
+                if name_len > 0 && sni_start + 5 + name_len <= ext_end {
+                    return Some(sni_start + 5); // offset первого байта hostname
+                }
+            }
+        }
+        pos += 4 + ext_data_len;
+    }
+
+    None
 }
 
 /// [OF1] SniMasking: маскировка SNI в существующем TLS ClientHello.
@@ -405,54 +471,45 @@ pub fn sni_masking(packet: &[u8], mask_byte: u8) -> DesyncResult {
         return DesyncResult::passthrough();
     }
 
-    // Проверяем TLS ContentType = Handshake (0x16)
     if tcp.payload[0] != 0x16 {
         return DesyncResult::passthrough();
     }
 
-    // Ищем SNI extension
-    // TLS Record: ContentType(1) + Version(2) + Length(2) = 5 bytes header
-    // HandshakeType(1) + Length(3) + Version(2) + Random(32) + SessionID + CipherSuites + Compression + Extensions
     let payload = tcp.payload;
-    let mut pos = 5; // пропускаем TLS record header
+    let mut pos = 5;
 
     if pos + 4 > payload.len() {
         return DesyncResult::passthrough();
     }
 
-    // HandshakeType: ClientHello = 0x01
     if payload[pos] != 0x01 {
         return DesyncResult::passthrough();
     }
-    pos += 4; // HandshakeType + Length
+    pos += 4;
 
     if pos + 34 > payload.len() {
         return DesyncResult::passthrough();
     }
-    pos += 34; // Version(2) + Random(32)
+    pos += 34;
 
-    // SessionID
     if pos >= payload.len() {
         return DesyncResult::passthrough();
     }
     let session_id_len = payload[pos] as usize;
     pos += 1 + session_id_len;
 
-    // CipherSuites
     if pos + 2 > payload.len() {
         return DesyncResult::passthrough();
     }
     let cipher_suites_len = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
     pos += 2 + cipher_suites_len;
 
-    // Compression methods
     if pos >= payload.len() {
         return DesyncResult::passthrough();
     }
     let compression_len = payload[pos] as usize;
     pos += 1 + compression_len;
 
-    // Extensions
     if pos + 2 > payload.len() {
         return DesyncResult::passthrough();
     }
@@ -464,14 +521,11 @@ pub fn sni_masking(packet: &[u8], mask_byte: u8) -> DesyncResult {
         return DesyncResult::passthrough();
     }
 
-    // Ищем SNI extension (type = 0x0000)
     while pos + 4 <= extensions_end {
         let ext_type = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
         let ext_len = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
 
         if ext_type == 0x0000 && pos + 4 + ext_len <= payload.len() {
-            // SNI extension найден
-            // SNI structure: ServerNameListLen(2) + NameType(1) + NameLen(2) + hostname
             let sni_start = pos + 4;
             if sni_start + 5 > payload.len() {
                 return DesyncResult::passthrough();
@@ -486,7 +540,6 @@ pub fn sni_masking(packet: &[u8], mask_byte: u8) -> DesyncResult {
                 return DesyncResult::passthrough();
             }
 
-            // Маскируем hostname
             let mut modified = packet.to_vec();
             let tcp_offset = ip.header_len;
             let payload_offset = tcp_offset + tcp.data_offset;
@@ -495,7 +548,6 @@ pub fn sni_masking(packet: &[u8], mask_byte: u8) -> DesyncResult {
                 modified[payload_offset + i] = mask_byte;
             }
 
-            // Пересчитываем TCP checksum
             let _tcp_len = modified.len() - tcp_offset;
             let src_ip = ip.src;
             let dst_ip = ip.dst;
@@ -524,25 +576,108 @@ mod tests {
     fn test_tls_record_frag_passthrough() {
         let pkt = build_test_tls_packet();
         let result = tls_record_frag(&pkt, 5, 1);
-        // Should either fragment or passthrough (depends on packet size)
         assert!(!result.drop);
     }
 
+    #[test]
+    fn test_tls_record_pad() {
+        let pkt = build_test_tls_ch_packet();
+        let result = tls_record_pad(&pkt, 10, 1);
+        match &result {
+            DesyncResult {
+                modified: Some(m), ..
+            } => {
+                assert!(m.len() > pkt.len());
+                // Record length should have increased by 10
+                let new_rl = u16::from_be_bytes([m[43], m[44]]);
+                let old_rl = u16::from_be_bytes([pkt[43], pkt[44]]);
+                assert_eq!(new_rl, old_rl + 10);
+            }
+            _ => panic!("expected modified packet"),
+        }
+    }
+
+    #[test]
+    fn test_find_sni_offset() {
+        let pkt = build_test_tls_ch_packet();
+        let ip = parse_ip_header(&pkt).unwrap();
+        let tcp_data = &pkt[ip.header_len..];
+        let tcp = pnet_packet::tcp::TcpPacket::new(tcp_data).unwrap();
+        let data_offset = tcp.get_data_offset() as usize * 4;
+        let payload = &tcp_data[data_offset..];
+        // The test packet has a simple CH; SNI may or may not be present
+        // Just verify the function doesn't panic
+        let _ = find_sni_offset_in_ch(payload);
+    }
+
     fn build_test_tls_packet() -> Vec<u8> {
-        // Minimal IP+TCP+TLS packet
-        let mut pkt = vec![0u8; 60]; // IP(20) + TCP(20) + TLS(20)
-        pkt[0] = 0x45; // IPv4
-        pkt[9] = 6; // TCP protocol
-        pkt[12..14].copy_from_slice(&100u16.to_be_bytes()); // total length
-                                                            // TCP
-        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes()); // src port
-        pkt[22..24].copy_from_slice(&443u16.to_be_bytes()); // dst port
-        pkt[32] = 0x50; // data offset = 5 (20 bytes)
-        pkt[33] = 0x18; // PSH+ACK
-                        // TLS record
-        pkt[40] = 0x16; // ContentType: Handshake
+        let mut pkt = vec![0u8; 60];
+        pkt[0] = 0x45;
+        pkt[9] = 6;
+        pkt[12..14].copy_from_slice(&100u16.to_be_bytes());
+        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
+        pkt[32] = 0x50;
+        pkt[33] = 0x18;
+        pkt[40] = 0x16;
         pkt[41] = 0x03;
-        pkt[42] = 0x01; // Version: TLS 1.0
+        pkt[42] = 0x01;
+        pkt
+    }
+
+    fn build_test_tls_ch_packet() -> Vec<u8> {
+        // Minimal TLS ClientHello: IP(20) + TCP(20) + TLS record header(5) + CH
+        let mut pkt = vec![0u8; 120];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&120u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&[192, 168, 1, 1]);
+        pkt[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
+        pkt[32] = 0x50;
+        pkt[33] = 0x18;
+        // TLS record header at offset 40
+        pkt[40] = 0x16;
+        pkt[41] = 0x03;
+        pkt[42] = 0x01;
+        // Record Length = handshake_header(4) + ch_body_len
+        // CH body = Version(2) + Random(32) + SessionID(1) + CipherSuites(4) + Compress(2) + ExtLen(2) + ExtBody(16) = 57
+        // So Record Length = 4 + 57 = 61
+        let ch_body_len: u16 = 57;
+        let record_len: u16 = 4 + ch_body_len;
+        pkt[43..45].copy_from_slice(&record_len.to_be_bytes());
+        // HandshakeType = ClientHello
+        pkt[45] = 0x01;
+        // HandshakeLength (3 bytes) = ch_body_len = 57
+        pkt[46] = 0;
+        pkt[47] = 0;
+        pkt[48] = ch_body_len as u8;
+        // Version
+        pkt[49] = 0x03;
+        pkt[50] = 0x03;
+        // Random (32 bytes at 51..82) — leave zeros
+        // SessionID length = 0
+        pkt[83] = 0;
+        // CipherSuites length = 2
+        pkt[84..86].copy_from_slice(&2u16.to_be_bytes());
+        pkt[86] = 0x13;
+        pkt[87] = 0x01;
+        // Compression methods length = 1
+        pkt[88] = 1;
+        pkt[89] = 0x00;
+        // Extensions length = 16
+        pkt[90..92].copy_from_slice(&16u16.to_be_bytes());
+        // SNI extension
+        pkt[92..94].copy_from_slice(&0x0000u16.to_be_bytes()); // type
+        pkt[94..96].copy_from_slice(&12u16.to_be_bytes()); // length
+        pkt[96..98].copy_from_slice(&10u16.to_be_bytes()); // ServerNameList len
+        pkt[98] = 0x00; // NameType: host_name
+        pkt[99..101].copy_from_slice(&7u16.to_be_bytes()); // NameLen
+        pkt[101..108].copy_from_slice(b"example"); // hostname
+        let csum = crate::desync::ipv4_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&csum.to_be_bytes());
         pkt
     }
 }
@@ -572,10 +707,9 @@ pub fn tls_version_overwrite(packet: &[u8]) -> DesyncResult {
     let mut modified = packet.to_vec();
     let payload_start = ip.header_len + data_offset;
     modified[payload_start + 1] = 0x03;
-    modified[payload_start + 2] = 0x04; // TLS 1.3
+    modified[payload_start + 2] = 0x04;
 
-    // Пересчитываем IP checksum
-    let ip_csum = ipv4_checksum(&modified[..20]);
+    let ip_csum = crate::desync::ipv4_checksum(&modified[..20]);
     modified[10..12].copy_from_slice(&ip_csum.to_be_bytes());
 
     debug!("[TLS] VersionOverwrite: TLS 1.3 spoof");
@@ -613,7 +747,7 @@ pub fn tls_record_rewrap(packet: &[u8], chunk_size: usize, fake_ttl_offset: u8) 
 
     let mut rewrapped =
         Vec::with_capacity(record_payload.len() + record_payload.len() / chunk_size * 5);
-    let tls_13_version = [0x03, 0x04]; // TLS 1.3 — комбинируется с Version Spoof
+    let tls_13_version = [0x03, 0x04];
     for chunk in record_payload.chunks(chunk_size) {
         rewrapped.push(content_type);
         rewrapped.extend_from_slice(&tls_13_version);
@@ -625,7 +759,8 @@ pub fn tls_record_rewrap(packet: &[u8], chunk_size: usize, fake_ttl_offset: u8) 
     let ack = tcp.get_acknowledgement();
     let window = tcp.get_window();
 
-    let inject_pkt = build_tcp_with_payload(
+    let inject_pkt = crate::desync::tcp::build_ip_tcp_packet_with_options(
+        packet,
         ip.src,
         ip.dst,
         tcp.get_source(),
@@ -670,58 +805,49 @@ pub fn sni_record_frag(packet: &[u8], chunk_size: usize, fake_ttl_offset: u8) ->
         return DesyncResult::passthrough();
     }
 
-    // TLS record: [ContentType(1) + Version(2) + Length(2) + HandshakeType(1) + ...]
     let record_payload = &payload[5..];
     if record_payload.len() < 6 || record_payload[0] != 0x01 {
-        return DesyncResult::passthrough(); // Не ClientHello
+        return DesyncResult::passthrough();
     }
 
-    // Ищем SNI extension: type = 0x0000
-    let mut pos = 38; // пропускаем: handshake_type(1) + len(3) + version(2) + random(32)
+    let mut pos = 38;
     if pos >= record_payload.len() {
         return DesyncResult::passthrough();
     }
 
-    // Session ID
     let session_id_len = record_payload[pos] as usize;
     pos += 1 + session_id_len;
     if pos + 2 > record_payload.len() {
         return DesyncResult::passthrough();
     }
 
-    // Cipher Suites
     let cs_len = u16::from_be_bytes([record_payload[pos], record_payload[pos + 1]]) as usize;
     pos += 2 + cs_len;
     if pos + 1 > record_payload.len() {
         return DesyncResult::passthrough();
     }
 
-    // Compression Methods
     let cm_len = record_payload[pos] as usize;
     pos += 1 + cm_len;
     if pos + 2 > record_payload.len() {
         return DesyncResult::passthrough();
     }
 
-    // Extensions Length
     let ext_len = u16::from_be_bytes([record_payload[pos], record_payload[pos + 1]]) as usize;
     pos += 2;
     let ext_end = pos + ext_len;
 
-    // Walk extensions
     while pos + 4 <= ext_end && pos + 4 <= record_payload.len() {
         let ext_type = u16::from_be_bytes([record_payload[pos], record_payload[pos + 1]]);
         let ext_len =
             u16::from_be_bytes([record_payload[pos + 2], record_payload[pos + 3]]) as usize;
 
         if ext_type == 0x0000 && pos + 4 + ext_len <= record_payload.len() {
-            // SNI extension found
             let sni_ext = &record_payload[pos + 4..pos + 4 + ext_len];
             if sni_ext.len() > 5 {
-                // ServerNameList(2) + ServerNameType(1) + NameLen(2) + Name
                 let name_len = u16::from_be_bytes([sni_ext[3], sni_ext[4]]) as usize;
                 if name_len > 0 && 5 + name_len <= sni_ext.len() {
-                    let sni_start_in_payload = 5 + pos + 4 + 5; // record_offset + ext_start + sni_header
+                    let sni_start_in_payload = 5 + pos + 4 + 5;
                     let sni_end_in_payload = sni_start_in_payload + name_len;
 
                     return build_sni_frag_result(
@@ -746,7 +872,7 @@ pub fn sni_record_frag(packet: &[u8], chunk_size: usize, fake_ttl_offset: u8) ->
 
 #[allow(clippy::too_many_arguments)]
 fn build_sni_frag_result(
-    _packet: &[u8],
+    packet: &[u8],
     tcp: &pnet_packet::tcp::TcpPacket,
     ip: &crate::desync::ParsedIpHeader,
     _data_offset: usize,
@@ -761,23 +887,20 @@ fn build_sni_frag_result(
     let post_sni = &payload[sni_end..];
 
     let mut rewrapped = Vec::with_capacity(payload.len() + sni.len());
-    let header_13 = [0x16u8, 0x03, 0x04]; // TLS 1.3 record header
+    let header_13 = [0x16u8, 0x03, 0x04];
 
-    // Pre-SNI chunks
     for chunk in pre_sni.chunks(chunk_size) {
         rewrapped.extend_from_slice(&header_13);
         rewrapped.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
         rewrapped.extend_from_slice(chunk);
     }
 
-    // SNI chunks (именно SNI разбиваем на 2B)
     for chunk in sni.chunks(chunk_size) {
         rewrapped.extend_from_slice(&header_13);
         rewrapped.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
         rewrapped.extend_from_slice(chunk);
     }
 
-    // Post-SNI chunks
     for chunk in post_sni.chunks(chunk_size) {
         rewrapped.extend_from_slice(&header_13);
         rewrapped.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
@@ -788,7 +911,8 @@ fn build_sni_frag_result(
     let ack = tcp.get_acknowledgement();
     let window = tcp.get_window();
 
-    let inject_pkt = build_tcp_with_payload(
+    let inject_pkt = crate::desync::tcp::build_ip_tcp_packet_with_options(
+        packet,
         ip.src,
         ip.dst,
         tcp.get_source(),

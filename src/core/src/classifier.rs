@@ -87,7 +87,7 @@ impl Classifier {
                     dst_port,
                     protocol,
                     direction: PacketDirection::Outbound, // будет уточнено
-                    conn_key: ConnKey::new(src_ip, dst_ip, src_port, dst_port),
+                    conn_key: ConnKey::new(src_ip, dst_ip, src_port, dst_port, protocol),
                     payload_offset,
                     payload_len: packet.len().saturating_sub(payload_offset),
                 };
@@ -141,7 +141,7 @@ impl Classifier {
                     dst_port,
                     protocol,
                     direction: PacketDirection::Outbound,
-                    conn_key: ConnKey::new(src_ip, dst_ip, src_port, dst_port),
+                    conn_key: ConnKey::new(src_ip, dst_ip, src_port, dst_port, protocol),
                     payload_offset,
                     payload_len: packet.len().saturating_sub(payload_offset),
                 };
@@ -166,7 +166,7 @@ impl Classifier {
                     dst_port: 0,
                     protocol,
                     direction: PacketDirection::Outbound,
-                    conn_key: ConnKey::new(src_ip, dst_ip, 0, 0),
+                    conn_key: ConnKey::new(src_ip, dst_ip, 0, 0, protocol),
                     payload_offset: header_len,
                     payload_len: packet.len().saturating_sub(header_len),
                 };
@@ -193,6 +193,21 @@ impl Classifier {
             && payload[0] == 0x16 // ContentType: Handshake
             && (payload[1] == 0x03) // TLS version major
             && payload[5] == 0x01 // HandshakeType: ClientHello
+    }
+
+    /// Проверяет, является ли payload десинхронизируемой целью.
+    /// Только ClientHello (первый раз) — не application data, не alert, не ретрансмиссия.
+    pub fn is_desync_target(payload: &[u8], desync_applied: bool) -> bool {
+        if !Self::is_client_hello(payload) {
+            return false;
+        }
+        if desync_applied {
+            return false;
+        }
+        if payload.len() < 50 {
+            return false;
+        }
+        true
     }
 
     /// Проверяет, является ли пакет TLS ServerHello.
@@ -345,7 +360,7 @@ mod tests {
             dst_port: 443,
             protocol: 6,
             direction: PacketDirection::Outbound,
-            conn_key: ConnKey::new(Ipv4Addr::new(192, 168, 1, 1), remote, 12345, 443),
+            conn_key: ConnKey::new(Ipv4Addr::new(192, 168, 1, 1), remote, 12345, 443, 6),
             payload_offset: 40,
             payload_len: 0,
         };

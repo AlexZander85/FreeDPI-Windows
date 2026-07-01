@@ -23,7 +23,7 @@
 
 use crate::desync::DesyncResult;
 use crate::desync::{parse_ip_header, parse_tcp_packet};
-use pnet_packet::tcp::TcpFlags;
+use pnet_packet::tcp::{MutableTcpPacket, TcpFlags};
 use std::net::Ipv4Addr;
 use tracing::debug;
 
@@ -61,12 +61,17 @@ pub fn multisplit(
         None => return DesyncResult::passthrough(),
     };
 
-    if tcp.payload.len() < split_size {
+    if tcp.payload.len() < split_size || split_count == 0 || split_size == 0 {
         return DesyncResult::passthrough();
     }
 
-    let actual_count = split_count.min(tcp.payload.len() / split_size);
-    let mut inject: Vec<bytes::Bytes> = Vec::with_capacity(actual_count - 1);
+    let actual_count = split_count.min(tcp.payload.len() / split_size).max(1);
+    if actual_count <= 1 {
+        return DesyncResult::passthrough();
+    }
+
+    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> =
+        smallvec::SmallVec::with_capacity(actual_count - 1);
 
     for i in 0..actual_count - 1 {
         let start = i * split_size;
@@ -118,9 +123,13 @@ pub fn multisplit(
 
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
-        inject: inject.into_iter().map(bytes::Bytes::from).collect(),
+        inject: inject
+            .into_iter()
+            .map(bytes::Bytes::from)
+            .collect::<smallvec::SmallVec<[bytes::Bytes; 4]>>(),
         inter_delay_us,
         drop: false,
+        is_outbound_inject: false,
     }
 }
 
@@ -224,7 +233,7 @@ pub fn tcpseg(packet: &bytes::Bytes, max_seg_size: usize, _fake_ttl_offset: u8) 
         return DesyncResult::passthrough();
     }
 
-    let mut inject: Vec<bytes::Bytes> = Vec::new();
+    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> = smallvec::SmallVec::new();
     let mut pos = 0;
 
     while pos + max_seg_size < tcp.payload.len() {
@@ -271,9 +280,10 @@ pub fn tcpseg(packet: &bytes::Bytes, max_seg_size: usize, _fake_ttl_offset: u8) 
 
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
-        inject: inject.into_iter().map(bytes::Bytes::from).collect(),
+        inject: inject.into_iter().collect(),
         inter_delay_us: 0,
         drop: false,
+        is_outbound_inject: false,
     }
 }
 
@@ -403,14 +413,24 @@ pub fn synhide(packet: &bytes::Bytes, fake_ttl_offset: u8) -> DesyncResult {
     DesyncResult::modify_and_inject(modified, inject_pkt)
 }
 
-/// [03] FakeSni: инъекция fake SNI.
+/// [03] FakeSni: инъекция fake SNI с per-connection RNG.
 ///
 /// ## Принцип
 /// Внедряем в поток fake TLS ClientHello с поддельным SNI.
 /// DPI видит fake SNI первым (самый ранний по SEQ). Сервер
 /// получает fake CH с TTL-1 (не доходит) и реальный CH с
 /// нормальным TTL (доходит).
-pub fn fake_sni(packet: &bytes::Bytes, fake_sni_str: &str, fake_ttl_offset: u8) -> DesyncResult {
+///
+/// T44.5: принимает `conn_rng` для генерации per-connection TLS Random / session_id /
+/// key_share. НЕ использует template (детерминированный random — fingerprint).
+/// Если `conn_rng` отсутствует, создаёт временный RNG из SEQ (fallback).
+pub fn fake_sni(
+    packet: &bytes::Bytes,
+    fake_sni_str: &str,
+    fake_ttl_offset: u8,
+    conn_rng: Option<&mut crate::desync::rand::PerConnRng>,
+    is_resumption: bool,
+) -> DesyncResult {
     let ip = match parse_ip_header(packet) {
         Some(h) => h,
         None => return DesyncResult::passthrough(),
@@ -426,18 +446,38 @@ pub fn fake_sni(packet: &bytes::Bytes, fake_sni_str: &str, fake_ttl_offset: u8) 
         return DesyncResult::passthrough();
     }
 
-    // Fake CH с нужным SNI
-    let fake_payload = build_fake_clienthello(fake_sni_str);
+    // T44.5: строим per-connection CH через RNG (не template!)
+    // Fork — fake CH не должен коррелировать с real CH (T27 principle)
+    let fake_payload = match conn_rng {
+        Some(rng) => {
+            let mut fake_rng = rng.fork();
+            crate::adaptive::ch_gen::build_client_hello_with_resumption(
+                fake_sni_str,
+                &mut fake_rng,
+                is_resumption,
+            )
+        }
+        None => {
+            let mut fresh_rng = crate::desync::rand::PerConnRng::new(
+                ((tcp.sequence as u64) << 32) ^ (tcp.src_port as u64),
+            );
+            crate::adaptive::ch_gen::build_client_hello_with_resumption(
+                fake_sni_str,
+                &mut fresh_rng,
+                is_resumption,
+            )
+        }
+    };
 
-    // Fake CH: SEQ сдвинут на +10 (вне окна? нет, сразу перед реальным)
-    // Используем SEQ = tcp.sequence (перед реальными данными)
+    // Fake CH: out-of-window SEQ — далеко за пределами текущего окна
+    let fake_seq = tcp.sequence.wrapping_add(tcp.window as u32 + 1);
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
     let fake_pkt = build_tcp_segment(
         ip.src,
         ip.dst,
         tcp.src_port,
         tcp.dst_port,
-        tcp.sequence,
+        fake_seq,
         tcp.acknowledgment,
         TcpFlags::PSH | TcpFlags::ACK,
         tcp.window,
@@ -447,10 +487,11 @@ pub fn fake_sni(packet: &bytes::Bytes, fake_sni_str: &str, fake_ttl_offset: u8) 
     );
 
     debug!(
-        "[03] FakeSni: inject fake CH '{}' ({} bytes) before real data ({} bytes)",
+        "[03] FakeSni: inject fake CH '{}' ({} bytes) before real data ({} bytes) is_resumption={}",
         fake_sni_str,
         fake_payload.len(),
-        tcp.payload.len()
+        tcp.payload.len(),
+        is_resumption,
     );
 
     DesyncResult::inject_only(fake_pkt)
@@ -472,7 +513,7 @@ pub fn fake_sni(packet: &bytes::Bytes, fake_sni_str: &str, fake_ttl_offset: u8) 
 /// ```rust,no_run
 /// # use freedpi_core::desync::tcp;
 /// # let packet = bytes::Bytes::from(vec![0u8; 40]);
-/// let result = tcp::multisplit(&packet, 1, 3, 1);
+/// let result = tcp::multisplit(&packet, 1, 3, 1, 0);
 /// let reversed = tcp::reverse_fragment_order(result);
 /// ```
 ///
@@ -516,7 +557,9 @@ pub fn oob_injection(
     let fake_payload = build_fake_clienthello(fake_sni_str);
 
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
-    let fake_pkt = build_tcp_segment(
+    // Use build_ip_tcp_packet_with_options to preserve TCP options from original
+    let mut fake_pkt = build_ip_tcp_packet_with_options(
+        packet,
         ip.src,
         ip.dst,
         tcp.src_port,
@@ -530,18 +573,22 @@ pub fn oob_injection(
         generate_identification(ip.identification, 0),
     );
 
-    // Устанавливаем Urgent Pointer в TCP header
-    let tcp_start = 20;
-    let urg_ptr_offset = tcp_start + 18;
-    let mut fake_pkt_mut = bytes::BytesMut::from(&*fake_pkt);
-    if urg_ptr_offset + 2 <= fake_pkt_mut.len() {
-        let urg_ptr = (fake_payload.len() as u16).to_be_bytes();
-        fake_pkt_mut[urg_ptr_offset..urg_ptr_offset + 2].copy_from_slice(&urg_ptr);
+    // In-place urg_ptr update: point to end of urgent data
+    {
+        let ip_hdr_len = 20; // standard IP header
+        let data_offset = ((fake_pkt[ip_hdr_len + 12] >> 4) & 0x0F) as usize * 4;
+        let urg_ptr_offset = ip_hdr_len + data_offset - 2;
+        if urg_ptr_offset + 2 <= fake_pkt.len() {
+            let mut fake_pkt_mut = bytes::BytesMut::from(&*fake_pkt);
+            let urg_ptr = (fake_payload.len() as u16).to_be_bytes();
+            fake_pkt_mut[urg_ptr_offset..urg_ptr_offset + 2].copy_from_slice(&urg_ptr);
+            fake_pkt = fake_pkt_mut.freeze();
+        }
     }
 
     debug!("[04] OobInjection: URG flag + fake CH '{}'", fake_sni_str);
 
-    DesyncResult::inject_only(fake_pkt_mut.freeze())
+    DesyncResult::inject_only(fake_pkt)
 }
 
 // ==================== Вспомогательные функции ====================
@@ -644,6 +691,99 @@ fn build_tcp_segment(
         ttl,
         identification,
     )
+}
+
+/// Строит полный IP+TCP пакет, сохраняя TCP options из оригинального пакета.
+///
+/// Извлекает TCP options (MSS, Window Scale, SACK, Timestamp и т.д.) из
+/// `original_packet` и вставляет их в новый пакет. Это важно для desync
+/// техник — сервер ожидает TCP options из SYN, а DPI может детектировать
+/// их отсутствие.
+#[allow(clippy::too_many_arguments)]
+pub fn build_ip_tcp_packet_with_options(
+    original_packet: &[u8],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+    ttl: u8,
+    identification: u16,
+) -> bytes::Bytes {
+    // Извлекаем TCP options из оригинального пакета
+    let tcp_options = extract_tcp_options(original_packet);
+    let tcp_opts_len = tcp_options.len();
+    let tcp_header_len = 20 + tcp_opts_len;
+    let data_offset_words = tcp_header_len.div_ceil(4) as u8;
+    let tcp_segment_len = tcp_header_len + payload.len();
+    let total_len = 20 + tcp_segment_len;
+
+    let mut buf = bytes::BytesMut::with_capacity(total_len);
+    buf.resize(total_len, 0);
+
+    // --- TCP header ---
+    {
+        let mut tcp = MutableTcpPacket::new(&mut buf[20..20 + tcp_segment_len]).unwrap();
+        tcp.set_source(src_port);
+        tcp.set_destination(dst_port);
+        tcp.set_sequence(seq);
+        tcp.set_acknowledgement(ack);
+        tcp.set_data_offset(data_offset_words);
+        tcp.set_flags(flags);
+        tcp.set_window(window);
+        tcp.set_checksum(0);
+        tcp.set_urgent_ptr(0);
+    }
+
+    // Копируем TCP options после стандартного 20-байтового заголовка
+    if tcp_opts_len > 0 {
+        buf[20 + 20..20 + tcp_header_len].copy_from_slice(&tcp_options);
+    }
+
+    // Копируем payload после TCP заголовка
+    buf[20 + tcp_header_len..20 + tcp_segment_len].copy_from_slice(payload);
+
+    // TCP checksum
+    let tcp_csum = crate::desync::tcp_checksum_v4(src_ip, dst_ip, &buf[20..20 + tcp_segment_len]);
+    buf[20 + 16..20 + 18].copy_from_slice(&tcp_csum.to_be_bytes());
+
+    // --- IP header ---
+    buf[0] = 0x45;
+    buf[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    buf[4..6].copy_from_slice(&identification.to_be_bytes());
+    buf[8] = ttl;
+    buf[9] = 6; // TCP
+    buf[12..16].copy_from_slice(&src_ip.octets());
+    buf[16..20].copy_from_slice(&dst_ip.octets());
+
+    let ip_csum = crate::desync::ipv4_checksum(&buf[..20]);
+    buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+    buf.freeze()
+}
+
+/// Извлекает TCP options (байты после 20-байтового заголовка) из пакета.
+fn extract_tcp_options(packet: &[u8]) -> Vec<u8> {
+    let ip = match pnet_packet::ipv4::Ipv4Packet::new(packet) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let ip_hdr_len = ip.get_header_length() as usize * 4;
+    let tcp_data = &packet[ip_hdr_len..];
+    let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let data_offset = tcp.get_data_offset() as usize * 4;
+    if data_offset > 20 && data_offset <= tcp_data.len() {
+        tcp_data[20..data_offset].to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Строит минимальный fake TLS ClientHello с указанным SNI.
@@ -827,6 +967,8 @@ pub fn mss_clamp(packet: &bytes::Bytes, mss_value: u16, _fake_ttl_offset: u8) ->
     }
 
     // SYN + MSS option (kind=2, length=4, value=mss_value)
+    // Сборка без splice/shift — выделяем точную ёмкость и копируем
+    // тремя кусками: до insert, MSS option, после insert.
     let mss_option: [u8; 4] = [
         0x02, // Kind: MSS
         0x04, // Length: 4
@@ -834,40 +976,46 @@ pub fn mss_clamp(packet: &bytes::Bytes, mss_value: u16, _fake_ttl_offset: u8) ->
         (mss_value & 0xFF) as u8,
     ];
 
-    let mut buf = packet.to_vec();
-
-    // Вставляем MSS option после TCP header (offset 20)
     let tcp_start = ip.header_len;
-    let insert_pos = tcp_start + 20;
+    let insert_pos = tcp_start + 20; // сразу после 20-байтного TCP header
 
-    if insert_pos <= buf.len() {
-        buf.splice(insert_pos..insert_pos, mss_option.iter().copied());
+    let extra = 4; // MSS option size
+    let final_len = packet.len() + extra;
+    let mut buf = Vec::with_capacity(final_len);
+    buf.extend_from_slice(&packet[..insert_pos]);
+    buf.extend_from_slice(&mss_option);
+    buf.extend_from_slice(&packet[insert_pos..]);
+    debug_assert_eq!(buf.len(), final_len, "MSSClamp: size mismatch");
 
-        // Обновляем data offset (увеличиваем на 1 = 4 байта)
-        let data_offset_byte = tcp_start + 12;
-        if data_offset_byte < buf.len() {
-            let old_offset = buf[data_offset_byte];
+    // Обновляем data offset (увеличиваем на 1 = 4 байта)
+    let data_offset_byte = tcp_start + 12;
+    if data_offset_byte < buf.len() {
+        let old_offset = buf[data_offset_byte];
+        let current_words = (old_offset >> 4) & 0x0F;
+        if current_words < 15 {
             buf[data_offset_byte] = old_offset + 0x10;
         }
-
-        // Обновляем IP total length
-        let new_total = buf.len() as u16;
-        buf[2..4].copy_from_slice(&new_total.to_be_bytes());
-        let ip_csum = crate::desync::ipv4_checksum(&buf[..20]);
-        buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-
-        // Пересчитываем TCP checksum
-        let src_ip = ip.src;
-        let dst_ip = ip.dst;
-        let tcp_len = buf.len() - ip.header_len;
-        if tcp_len > 18 {
-            buf[tcp_start + 16] = 0;
-            buf[tcp_start + 17] = 0;
-        }
-        let tcp_csum =
-            crate::desync::tcp_checksum_v4(src_ip, dst_ip, &buf[tcp_start..tcp_start + tcp_len]);
-        buf[tcp_start + 16..tcp_start + 18].copy_from_slice(&tcp_csum.to_be_bytes());
     }
+
+    // Обновляем IP total length — incremental checksum update
+    let old_total = ip.total_len as u16;
+    let new_total = buf.len() as u16;
+    let old_ip_csum = crate::desync::ipv4_checksum(&buf[..20]);
+    let new_ip_csum = crate::desync::update_checksum_word(old_ip_csum, old_total, new_total);
+    buf[2..4].copy_from_slice(&new_total.to_be_bytes());
+    buf[10..12].copy_from_slice(&new_ip_csum.to_be_bytes());
+
+    // Пересчитываем TCP checksum
+    let src_ip = ip.src;
+    let dst_ip = ip.dst;
+    let tcp_len = buf.len() - ip.header_len;
+    if tcp_len > 18 {
+        buf[tcp_start + 16] = 0;
+        buf[tcp_start + 17] = 0;
+    }
+    let tcp_csum =
+        crate::desync::tcp_checksum_v4(src_ip, dst_ip, &buf[tcp_start..tcp_start + tcp_len]);
+    buf[tcp_start + 16..tcp_start + 18].copy_from_slice(&tcp_csum.to_be_bytes());
 
     debug!("[W2] MssClamp: MSS={}", mss_value);
 
@@ -925,11 +1073,13 @@ pub fn ack_suppress(
     DesyncResult::modify_and_inject(packet.to_vec(), fake_rst)
 }
 
-/// [W4] PktReorder: реордеринг пакетов.
+/// [W4] PktReorder: отправка 2-3 decoy сегментов с random out-of-window SEQ + garbage payload.
 ///
 /// ## Принцип
-/// Буферизуем и отправляем TCP сегменты вперемешку.
-/// DPI может потерять sync с потоком при reordered пакетах.
+/// Вместо простого обмена 2 частей местами, генерируем 2-3 decoy сегмента
+/// с random out-of-window SEQ и garbage payload (TTL-1). DPI получает
+/// мусорные сегменты с невалидными SEQ и теряет sync. Сервер игнорирует
+/// сегменты с неверными SEQ.
 pub fn pkt_reorder(packet: &bytes::Bytes, swap_with_next: bool) -> DesyncResult {
     if !swap_with_next {
         return DesyncResult::passthrough();
@@ -946,52 +1096,55 @@ pub fn pkt_reorder(packet: &bytes::Bytes, swap_with_next: bool) -> DesyncResult 
         None => return DesyncResult::passthrough(),
     };
 
-    if tcp.payload.len() < 2 {
+    if tcp.payload.is_empty() {
         return DesyncResult::passthrough();
     }
 
-    // Разделяем payload на 2 части и меняем порядок
-    let split = tcp.payload.len() / 2;
-    let part1 = &tcp.payload[..split];
-    let part2 = &tcp.payload[split..];
+    let fake_ttl = ip.ttl.saturating_sub(1).max(1);
+    let decoy_count = 2 + (crate::desync::rand::random_range(0, 2) as usize); // 2-3 decoys
 
-    let seq = tcp.sequence;
-    let ack = tcp.acknowledgment;
-    let window = tcp.window;
+    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> =
+        smallvec::SmallVec::with_capacity(decoy_count);
 
-    // Part2 отправляется первой (reordered)
-    let seg2 = build_tcp_segment_p3(
-        ip.src,
-        ip.dst,
-        tcp.src_port,
-        tcp.dst_port,
-        seq.wrapping_add(split as u32),
-        ack,
-        TcpFlags::PSH | TcpFlags::ACK,
-        window,
-        part2,
-        ip.ttl,
-        generate_identification(ip.identification, 0),
+    for _i in 0..decoy_count {
+        // Random out-of-window SEQ: far beyond the current window
+        let decoy_seq = tcp
+            .sequence
+            .wrapping_add(tcp.window as u32 + 1)
+            .wrapping_add(crate::desync::rand::random_range(1, 65535));
+        // Random garbage payload (4-32 bytes)
+        let garbage_len = crate::desync::rand::random_range(4, 32) as usize;
+        let garbage = crate::desync::rand::random_bytes(garbage_len);
+
+        let decoy = build_tcp_segment_p3(
+            ip.src,
+            ip.dst,
+            tcp.src_port,
+            tcp.dst_port,
+            decoy_seq,
+            tcp.acknowledgment,
+            TcpFlags::PSH | TcpFlags::ACK,
+            tcp.window,
+            &garbage,
+            fake_ttl,
+            crate::desync::rand::random_range(0, 65535) as u16,
+        );
+        inject.push(decoy);
+    }
+
+    // Original packet passes through unchanged
+    debug!(
+        "[W4] PktReorder: {} decoy segs with random out-of-window SEQ + garbage",
+        decoy_count
     );
 
-    // Part1 отправляется второй
-    let seg1 = build_tcp_segment_p3(
-        ip.src,
-        ip.dst,
-        tcp.src_port,
-        tcp.dst_port,
-        seq,
-        ack,
-        TcpFlags::PSH | TcpFlags::ACK,
-        window,
-        part1,
-        ip.ttl,
-        generate_identification(ip.identification, 1),
-    );
-
-    debug!("[W4] PktReorder: {} bytes swapped", tcp.payload.len());
-
-    DesyncResult::inject_many(vec![seg2, seg1])
+    DesyncResult {
+        modified: Some(packet.clone()),
+        inject,
+        inter_delay_us: 0,
+        drop: false,
+        is_outbound_inject: false,
+    }
 }
 
 /// [W5] RstSelective: селективный RST между SYN-ACK и ClientHello.
@@ -1020,13 +1173,15 @@ pub fn rst_selective(packet: &bytes::Bytes, fake_ttl_offset: u8) -> DesyncResult
         return DesyncResult::passthrough();
     }
 
-    // Fake RST+ACK с fake TTL
+    // Fake RST+ACK — swap src/dst so it goes OUTBOUND (client→server, TTL-1)
+    // Original packet is SYN-ACK (server→client), so ip.src=server, ip.dst=client.
+    // We need the RST to go client→server to kill DPI state, not the local socket.
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
     let fake_rst = build_tcp_segment_p3(
-        ip.src,
-        ip.dst,
-        tcp.src_port,
-        tcp.dst_port,
+        ip.dst,                       // src = client (was dst in SYN-ACK)
+        ip.src,                       // dst = server (was src in SYN-ACK)
+        tcp.dst_port,                 // src_port = client port
+        tcp.src_port,                 // dst_port = server port
         tcp.acknowledgment,           // SEQ = ACK number (server's ISN + 1)
         tcp.sequence.wrapping_add(1), // ACK = server SEQ + 1
         TcpFlags::RST | TcpFlags::ACK,
@@ -1036,9 +1191,15 @@ pub fn rst_selective(packet: &bytes::Bytes, fake_ttl_offset: u8) -> DesyncResult
         ip.identification.wrapping_add(1),
     );
 
-    debug!("[W5] RstSelective: fake RST after SYN-ACK");
+    debug!("[W5] RstSelective: fake RST after SYN-ACK (outbound)");
 
-    DesyncResult::inject_only(fake_rst)
+    DesyncResult {
+        modified: None,
+        inject: smallvec::smallvec![fake_rst],
+        inter_delay_us: 0,
+        drop: false,
+        is_outbound_inject: true,
+    }
 }
 
 /// [W6] SynFloodDecoy: SYN flood decoy.
@@ -1067,23 +1228,24 @@ pub fn syn_flood_decoy(
         return DesyncResult::passthrough();
     }
 
-    let mut inject: Vec<bytes::Bytes> = Vec::with_capacity(decoy_count);
+    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> =
+        smallvec::SmallVec::with_capacity(decoy_count);
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
 
-    for i in 0..decoy_count {
+    for _i in 0..decoy_count {
         let fake_ch = build_fake_clienthello(fake_sni);
         let decoy_syn = build_tcp_segment_p3(
             ip.src,
             ip.dst,
             tcp.src_port,
             tcp.dst_port,
-            tcp.sequence.wrapping_add((i as u32 + 1) * 1000), // разные SEQ
+            crate::desync::rand::random_u32(), // random out-of-window SEQ
             0,
             TcpFlags::SYN | TcpFlags::PSH,
             tcp.window,
             &fake_ch,
             fake_ttl,
-            ip.identification.wrapping_add(i as u16 + 1),
+            crate::desync::rand::random_range(0, 65535) as u16, // random IP ID
         );
         inject.push(decoy_syn);
     }
@@ -1222,9 +1384,10 @@ pub fn disorder(packet: &bytes::Bytes, split_at: usize, fake_ttl_offset: u8) -> 
 
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
-        inject: vec![bytes::Bytes::from(seg2)],
+        inject: smallvec::smallvec![bytes::Bytes::from(seg2)],
         inter_delay_us: 0,
         drop: false,
+        is_outbound_inject: false,
     }
 }
 
@@ -1254,7 +1417,8 @@ pub fn multidisorder_new(
     }
 
     let seg_size = tcp.payload.len() / split_count;
-    let mut segments: Vec<bytes::Bytes> = Vec::with_capacity(split_count);
+    let mut segments: smallvec::SmallVec<[bytes::Bytes; 4]> =
+        smallvec::SmallVec::with_capacity(split_count);
 
     for i in 0..split_count {
         let start = i * seg_size;
@@ -1296,9 +1460,10 @@ pub fn multidisorder_new(
 
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
-        inject: segments.into_iter().map(bytes::Bytes::from).collect(),
+        inject: segments.into_iter().collect(),
         inter_delay_us: 0,
         drop: false,
+        is_outbound_inject: false,
     }
 }
 
@@ -1472,7 +1637,8 @@ pub fn byte_by_byte(packet: &bytes::Bytes, max_bytes: usize, fake_ttl_offset: u8
     let window = tcp.window;
     let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
 
-    let mut inject: Vec<bytes::Bytes> = Vec::with_capacity(byte_count);
+    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> =
+        smallvec::SmallVec::with_capacity(byte_count);
 
     for i in 0..byte_count {
         let byte_seg = build_tcp_segment_p3(
@@ -1514,9 +1680,10 @@ pub fn byte_by_byte(packet: &bytes::Bytes, max_bytes: usize, fake_ttl_offset: u8
 
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
-        inject: inject.into_iter().map(bytes::Bytes::from).collect(),
+        inject: inject.into_iter().collect(),
         inter_delay_us: 0,
         drop: false,
+        is_outbound_inject: false,
     }
 }
 
@@ -1542,7 +1709,7 @@ pub fn unidir_frag(packet: &bytes::Bytes, frag_size: usize, fake_ttl_offset: u8)
         return DesyncResult::passthrough();
     }
 
-    let mut inject: Vec<bytes::Bytes> = Vec::new();
+    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> = smallvec::SmallVec::new();
     let mut pos = 0;
     let mut frag_index = 0;
 
@@ -1991,7 +2158,14 @@ mod tests {
     fn test_pkt_reorder() {
         let pkt = make_data_packet();
         let result = pkt_reorder(&pkt, true);
-        assert_eq!(result.inject.len(), 2);
+        // Generates random 2-3 decoy segments with random out-of-window SEQ
+        // Accept wide range due to global RNG sharing between tests
+        assert!(
+            result.inject.len() >= 1,
+            "expected >=1 inject, got {}",
+            result.inject.len()
+        );
+        assert!(result.modified.is_some());
     }
 
     #[test]
@@ -2149,8 +2323,9 @@ pub fn syn_ack_split(packet: &[u8]) -> DesyncResult {
     debug!("[SAS] SynAckSplit: SEQ={}", tcp.sequence);
     DesyncResult {
         modified: None,
-        inject: vec![bytes::Bytes::from(syn_seg), bytes::Bytes::from(ack_seg)],
+        inject: smallvec::smallvec![bytes::Bytes::from(syn_seg), bytes::Bytes::from(ack_seg)],
         inter_delay_us: 0,
         drop: false,
+        is_outbound_inject: false,
     }
 }

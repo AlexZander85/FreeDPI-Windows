@@ -5,10 +5,18 @@
 //!
 //! # Использование
 //! ```powershell
-//! .\FreeDPI-service.exe           # запуск (требует admin)
-//! .\FreeDPI-service.exe --api     # только API (без WinDivert)
-//! .\FreeDPI-service.exe --config  # показать конфиг
+//! .\FreeDPI-service.exe                    # запуск (service mode или foreground)
+//! .\FreeDPI-service.exe --install          # регистрация в SCM
+//! .\FreeDPI-service.exe --uninstall        # удаление из SCM
+//! .\FreeDPI-service.exe --api              # только API (без WinDivert)
+//! .\FreeDPI-service.exe --config <path>    # указать конфиг
 //! ```
+//!
+//! # Windows Service Control Manager
+//! При запуске через SCM (net start / sc start) процесс регистрирует
+//! ServiceMain через StartServiceCtrlDispatcherW и отвечает на
+//! управляющие сигналы (stop, shutdown, pause).
+//! Если SCM не обнаруживает процесс, используется foreground-режим.
 
 use clap::Parser;
 use freedpi_api::{
@@ -26,14 +34,50 @@ use std::sync::{
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+// ---------------------------------------------------------------------------
+// Windows API imports for SCM integration
+// ---------------------------------------------------------------------------
+use windows::{
+    core::{PCWSTR, PWSTR},
+    Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR},
+    Win32::System::Services::*,
+};
+
+/// Название сервиса в SCM.
+const SERVICE_NAME: &str = "FreeDPI";
+
+/// Указатель на статус- handle, заполняется в ServiceMain.
+static mut SERVICE_STATUS_HANDLE: Option<SERVICE_STATUS_HANDLE> = None;
+
+/// Канал для сигнала остановки от SCM.
+static STOP_CHANNEL: std::sync::OnceLock<tokio::sync::broadcast::Sender<()>> =
+    std::sync::OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
 #[derive(Parser)]
 #[command(name = "FreeDPI-service", version, about = "FreeDPI Windows Service")]
 struct Cli {
     #[arg(long, default_value = "config.toml")]
     config: PathBuf,
+
     #[arg(long)]
     api_only: bool,
+
+    /// Зарегистрировать сервис в SCM.
+    #[arg(long)]
+    install: bool,
+
+    /// Удалить сервис из SCM.
+    #[arg(long)]
+    uninstall: bool,
 }
+
+// ---------------------------------------------------------------------------
+// Engine handle (shared state)
+// ---------------------------------------------------------------------------
 
 struct ServiceEngine {
     start_time: std::time::Instant,
@@ -104,21 +148,13 @@ impl EngineHandle for ServiceEngine {
     fn set_routing_override(&self, params: &RoutingOverride) {
         info!("Routing override: {} → {}", params.domain, params.region);
     }
-    fn probe_domain(&self, domain: &str, full: bool) -> Result<serde_json::Value, String> {
+    fn probe_domain(&self, domain: &str, _full: bool) -> Result<serde_json::Value, String> {
         use freedpi_core::probe::strategy_map::recommend;
         use freedpi_core::probe::ProbeModule;
 
         let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
         let module = ProbeModule::new();
-
-        // If not full probe, skip HTTP and TCP16 phases by using quick DNS+TCP+TLS only
-        let result = if full {
-            rt.block_on(module.probe(domain))
-        } else {
-            // Quick probe: DNS + TCP + TLS only (no HTTP/TCP16)
-            rt.block_on(module.probe(domain))
-        };
-
+        let result = rt.block_on(module.probe(domain));
         let recommendations = recommend(&result);
         let recs_json: Vec<serde_json::Value> = recommendations
             .iter()
@@ -170,7 +206,6 @@ impl EngineHandle for ServiceEngine {
             "timestamp": result.timestamp,
         });
 
-        // Store in history (keep last 100)
         if let Ok(mut history) = self.probe_history.lock() {
             history.insert(0, response.clone());
             history.truncate(100);
@@ -257,7 +292,6 @@ impl EngineHandle for ServiceEngine {
             })
             .collect();
 
-        // Store batch in history
         if let Ok(mut history) = self.probe_history.lock() {
             for resp in &responses {
                 history.insert(0, resp.clone());
@@ -286,26 +320,20 @@ impl EngineHandle for ServiceEngine {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+// ---------------------------------------------------------------------------
+// Service logic (shared between foreground and service modes)
+// ---------------------------------------------------------------------------
 
-    let cli = Cli::parse();
-    info!("FreeDPI Service v{}", env!("CARGO_PKG_VERSION"));
-
-    let config = Config::load(&cli.config)?;
-    let engine = Arc::new(ServiceEngine::new());
-
-    // Clone before Arc wrapping for spawned tasks
+async fn run_service(
+    config: Config,
+    engine: Arc<ServiceEngine>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) {
     let conntrack = engine.conntrack.clone();
     let sentinel = engine.sentinel.clone();
 
-    // Build processing pipeline (not stored in engine)
-    let pipeline = if !cli.api_only {
+    // Build pipeline (inside scope so pipeline Arc is dropped properly)
+    let pipeline = {
         let proc_config = config.to_processing_config();
         match ProcessingPipeline::new(
             &config.windivert.filter,
@@ -323,8 +351,6 @@ async fn main() -> anyhow::Result<()> {
                 None
             }
         }
-    } else {
-        None
     };
 
     // Start API server
@@ -351,32 +377,260 @@ async fn main() -> anyhow::Result<()> {
     // Start sentinel monitor
     sentinel.start_monitor();
 
-    // Shutdown channel
-    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-
     // Start pipeline
     if let Some(pipeline) = pipeline {
+        let pipeline = std::sync::Arc::new(pipeline);
         let stats = pipeline.stats_arc();
         let shutdown_rx_pipeline = shutdown_rx.resubscribe();
         tokio::spawn(async move {
             pipeline.run(shutdown_rx_pipeline).await;
         });
+        let mut shutdown_rx_stats = shutdown_rx.resubscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
-                interval.tick().await;
-                let s = stats.snapshot();
-                info!(
-                    "Stats: recv={} fwd={} inject={}",
-                    s.total_received, s.forwarded, s.fake_ch_injected
-                );
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let s = stats.snapshot();
+                        info!(
+                            "Stats: recv={} fwd={} inject={}",
+                            s.total_received, s.forwarded, s.fake_ch_injected
+                        );
+                    }
+                    _ = shutdown_rx_stats.recv() => break,
+                }
             }
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Foreground mode (console app — Ctrl+C)
+// ---------------------------------------------------------------------------
+
+async fn run_foreground(config: Config, engine: Arc<ServiceEngine>) -> anyhow::Result<()> {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+    run_service(config, engine, shutdown_rx).await;
 
     info!("Running. Ctrl+C to stop.");
     tokio::signal::ctrl_c().await?;
     let _ = shutdown_tx.send(());
-    engine.shutdown();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Windows Service SCM integration
+// ---------------------------------------------------------------------------
+
+/// SCM control handler — вызывается SCM при stop/pause/shutdown.
+unsafe extern "system" fn service_control_handler(
+    control: u32,
+    _event_type: u32,
+    _event_data: *mut std::ffi::c_void,
+    _context: *mut std::ffi::c_void,
+) -> u32 {
+    match control {
+        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+            // Signal running tasks to stop
+            if let Some(tx) = STOP_CHANNEL.get() {
+                let _ = tx.send(());
+            }
+            // Report stopped status to SCM
+            if let Some(handle) = SERVICE_STATUS_HANDLE {
+                let mut status = SERVICE_STATUS::default();
+                status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+                status.dwCurrentState = SERVICE_STOPPED;
+                status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+                status.dwWin32ExitCode = 0;
+                let _ = SetServiceStatus(handle, &status);
+            }
+            NO_ERROR.0
+        }
+        SERVICE_CONTROL_INTERROGATE => {
+            // Just report current state
+            NO_ERROR.0
+        }
+        _ => ERROR_CALL_NOT_IMPLEMENTED.0,
+    }
+}
+
+/// ServiceMain — entry point called by SCM dispatcher.
+unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
+    // Register control handler
+    let name: Vec<u16> = (SERVICE_NAME.to_owned() + "\0").encode_utf16().collect();
+    let handle = match RegisterServiceCtrlHandlerExW(
+        PCWSTR::from_raw(name.as_ptr()),
+        Some(service_control_handler),
+        None,
+    ) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    SERVICE_STATUS_HANDLE = Some(handle);
+
+    // Report SERVICE_RUNNING to SCM
+    let mut status = SERVICE_STATUS::default();
+    status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    status.dwCurrentState = SERVICE_RUNNING;
+    status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+    status.dwWin32ExitCode = 0;
+    let _ = SetServiceStatus(handle, &status);
+
+    // Create shutdown channel
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    let _ = STOP_CHANNEL.set(shutdown_tx);
+
+    // Build minimal config (load from default path)
+    let config = match Config::load(std::path::Path::new("config.toml")) {
+        Ok(c) => c,
+        Err(e) => {
+            let status = SERVICE_STATUS {
+                dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+                dwCurrentState: SERVICE_STOPPED,
+                dwControlsAccepted: SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
+                dwWin32ExitCode: 1,
+                dwServiceSpecificExitCode: 0,
+                dwCheckPoint: 0,
+                dwWaitHint: 0,
+            };
+            let _ = SetServiceStatus(handle, &status);
+            return;
+        }
+    };
+
+    freedpi_core::engine::refresh_local_ips();
+    let engine = Arc::new(ServiceEngine::new());
+
+    // Run in tokio runtime
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    rt.block_on(async {
+        run_service(config, engine, shutdown_rx).await;
+        // Block until stop signal
+        let mut rx = STOP_CHANNEL.get().unwrap().subscribe();
+        let _ = rx.recv().await;
+    });
+
+    // Report SERVICE_STOPPED
+    status.dwCurrentState = SERVICE_STOPPED;
+    let _ = SetServiceStatus(handle, &status);
+}
+
+/// Зарегистрировать сервис в SCM.
+fn install_service(binary_path: &str) -> anyhow::Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    let scm = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CREATE_SERVICE) }?;
+
+    let name: Vec<u16> = (SERVICE_NAME.to_owned() + "\0").encode_utf16().collect();
+    let display: Vec<u16> = ("FreeDPI DPI Bypass Service\0").encode_utf16().collect();
+    let path: Vec<u16> = OsStr::new(binary_path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let service = unsafe {
+        CreateServiceW(
+            scm,
+            PCWSTR::from_raw(name.as_ptr()),
+            PCWSTR::from_raw(display.as_ptr()),
+            SERVICE_ALL_ACCESS,
+            SERVICE_WIN32_OWN_PROCESS,
+            SERVICE_AUTO_START,
+            SERVICE_ERROR_NORMAL,
+            PCWSTR::from_raw(path.as_ptr()),
+            PCWSTR::null(),
+            None,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+        )
+    }?;
+
+    unsafe {
+        let _ = CloseServiceHandle(service);
+        let _ = CloseServiceHandle(scm);
+    }
+
+    println!("Service '{}' installed successfully.", SERVICE_NAME);
+    Ok(())
+}
+
+/// Удалить сервис из SCM.
+fn uninstall_service() -> anyhow::Result<()> {
+    let scm = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }?;
+
+    let name: Vec<u16> = (SERVICE_NAME.to_owned() + "\0").encode_utf16().collect();
+    let service =
+        unsafe { OpenServiceW(scm, PCWSTR::from_raw(name.as_ptr()), SERVICE_ALL_ACCESS) }?;
+
+    unsafe {
+        let _ = ControlService(service, SERVICE_CONTROL_STOP, std::ptr::null_mut());
+        let _ = DeleteService(service);
+        let _ = CloseServiceHandle(service);
+        let _ = CloseServiceHandle(scm);
+    }
+
+    println!("Service '{}' removed successfully.", SERVICE_NAME);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // SCM install/uninstall commands
+    if cli.install {
+        let binary = std::env::current_exe()?;
+        return install_service(&binary.to_string_lossy());
+    }
+    if cli.uninstall {
+        return uninstall_service();
+    }
+
+    // Try SCM dispatcher first (if launched by SCM)
+    let mut service_name: Vec<u16> = (SERVICE_NAME.to_owned() + "\0").encode_utf16().collect();
+    let dispatch_table = [
+        SERVICE_TABLE_ENTRYW {
+            lpServiceName: PWSTR::from_raw(service_name.as_mut_ptr()),
+            lpServiceProc: Some(service_main),
+        },
+        SERVICE_TABLE_ENTRYW::default(),
+    ];
+
+    // StartServiceCtrlDispatcherW succeeds only if launched by SCM
+    let launched_by_scm = unsafe {
+        StartServiceCtrlDispatcherW(dispatch_table.as_ptr() as *const SERVICE_TABLE_ENTRYW).is_ok()
+    };
+    if launched_by_scm {
+        // Runs until service stops; SCM dispatcher handled everything.
+        return Ok(());
+    }
+
+    // Foreground mode (console / direct launch)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    info!(
+        "FreeDPI Service v{} (foreground)",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let config = Config::load(&cli.config)?;
+    freedpi_core::engine::refresh_local_ips();
+    let engine = Arc::new(ServiceEngine::new());
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_foreground(config, engine))
 }

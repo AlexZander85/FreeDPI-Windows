@@ -87,12 +87,20 @@ pub fn build_seq_spoof_packet(
     hop_tab: &HopTab,
 ) -> Result<SeqSpoofResult> {
     let fake_ch =
-        if let Some(entry) = _conntrack.get(&ConnKey::new(src_ip, dst_ip, src_port, dst_port)) {
-            let mut rng = entry
-                .rng
-                .clone()
-                .unwrap_or_else(|| crate::desync::rand::PerConnRng::new(0));
-            ch_gen::build_client_hello(fake_sni, &mut rng)
+        if let Some(entry) = _conntrack.get(&ConnKey::new(src_ip, dst_ip, src_port, dst_port, 6)) {
+            // Create independent RNG for fake CH (not cloning — PerConnRng is !Clone)
+            let mut rng = crate::desync::rand::PerConnRng::new(
+                (src_ip.to_bits() as u64)
+                    ^ (dst_ip.to_bits() as u64)
+                    ^ ((src_port as u64) << 48)
+                    ^ (dst_port as u64),
+            );
+            // T43: учитываем is_resumption для 0-RTT defense
+            if entry.is_resumption {
+                ch_gen::build_client_hello_with_resumption(fake_sni, &mut rng, true)
+            } else {
+                ch_gen::build_client_hello(fake_sni, &mut rng)
+            }
         } else {
             ch_gen::build_client_hello_default(fake_sni)
         };
@@ -378,6 +386,7 @@ mod tests {
             Ipv4Addr::new(142, 250, 185, 46),
             54321,
             443,
+            6, // TCP
         );
         let entry = ConntrackEntry {
             client_isn: 1000,
@@ -394,6 +403,9 @@ mod tests {
             last_activity: Instant::now(),
             dup_ack_count: 0,
             rng: None,
+            quic_pn: 0,
+            quic_dcid: vec![],
+            is_resumption: false,
         };
         ct.insert(key, entry);
         ct
@@ -418,10 +430,10 @@ mod tests {
         )
         .unwrap();
 
-        // IP(20) + TCP(20) + TLS CH(512..4096) = 552..4136
+        // IP(20) + TCP(20) + TLS record(5) + handshake(4) + body(512..4096) = 561..4145
         let packet_len = result.fake_packet.len();
         assert!(packet_len >= 552, "Packet too small: {} bytes", packet_len);
-        assert!(packet_len <= 4136, "Packet too large: {} bytes", packet_len);
+        assert!(packet_len <= 4160, "Packet too large: {} bytes", packet_len);
     }
 
     #[test]
@@ -546,7 +558,7 @@ mod tests {
 
         let packet_len = result.fake_packet.len();
         assert!(packet_len >= 552, "Packet too small: {} bytes", packet_len);
-        assert!(packet_len <= 4136, "Packet too large: {} bytes", packet_len);
+        assert!(packet_len <= 4160, "Packet too large: {} bytes", packet_len);
     }
 
     #[test]
@@ -591,5 +603,83 @@ mod tests {
         ];
         let cksum = tcp_checksum_v4(&src, &dst, &tcp);
         assert!(cksum != 0);
+    }
+
+    #[test]
+    fn test_seq_spoof_with_resumption() {
+        let ct = Conntrack::default();
+        let key = crate::conntrack::ConnKey::new(
+            Ipv4Addr::new(192, 168, 1, 2),
+            Ipv4Addr::new(142, 250, 185, 46),
+            54321,
+            443,
+            6,
+        );
+        let entry = ConntrackEntry {
+            client_isn: 1000,
+            server_isn: 5000,
+            client_seq: 1001,
+            server_seq: 5001,
+            client_ack: 5001,
+            server_ack: 1001,
+            rtt_us: 50000,
+            state: ConnState::SynReceived,
+            desync_applied: false,
+            dscp_spoof: 0,
+            strategy_id: 0,
+            last_activity: std::time::Instant::now(),
+            dup_ack_count: 0,
+            rng: None,
+            quic_pn: 0,
+            quic_dcid: vec![],
+            is_resumption: true, // Включаем resumption
+        };
+        ct.insert(key, entry);
+
+        let ht = HopTab::new();
+        let ip = Ipv4Addr::new(142, 250, 185, 46);
+        ht.insert(HopTab::ip_to_u32(&ip), 10);
+
+        let result = build_seq_spoof_packet(
+            "example.com",
+            Ipv4Addr::new(192, 168, 1, 2),
+            ip,
+            54321,
+            443,
+            1000,
+            &ct,
+            &ht,
+        )
+        .unwrap();
+
+        // Проверяем что пакет содержит early_data extension (0x4433)
+        // — признак resumption
+        let packet = &result.fake_packet;
+        let early_data_type = 0x4433u16.to_be_bytes();
+        let has_early_data = packet.windows(2).any(|w| w == early_data_type);
+        assert!(
+            has_early_data,
+            "Resumption fake CH should contain early_data extension (0x4433)"
+        );
+
+        // Проверяем non-empty session_ticket
+        let ticket_ext_type = 0x0023u16.to_be_bytes();
+        // Находим session_ticket extension
+        let mut found_ticket = false;
+        let mut found_ticket_non_empty = false;
+        for i in 0..packet.len().saturating_sub(4) {
+            if packet[i..i + 2] == ticket_ext_type {
+                found_ticket = true;
+                let ext_len = u16::from_be_bytes([packet[i + 2], packet[i + 3]]) as usize;
+                if ext_len > 0 {
+                    found_ticket_non_empty = true;
+                }
+            }
+        }
+        assert!(found_ticket, "CH should contain session_ticket extension");
+        assert!(
+            found_ticket_non_empty,
+            "Resumption CH should have non-empty session_ticket"
+        );
     }
 }

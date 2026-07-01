@@ -144,11 +144,9 @@ pub fn shannon_entropy_fast(data: &[u8]) -> u16 {
     entropy as u16
 }
 
-/// Генерирует padding — использует ChaCha20 как CSPRNG для неотличимости от шума.
+/// Генерирует padding — использует CSPRNG для неотличимости от шума.
 fn generate_entropy_padding(size: usize, _target_entropy: f64) -> Vec<u8> {
-    let key = [0x42u8; 32];
-    let iv = [0u8; 12];
-    crate::desync::crypto::chacha20_block_xor(&vec![0u8; size], &key, &iv)
+    crate::desync::rand::random_bytes(size)
 }
 
 /// [CT5] PadSize: дополнение пакета до заданного размера.

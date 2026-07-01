@@ -1,15 +1,16 @@
-//! DesyncGroup — pipeline и concurrent применение техник.
+//! DesyncGroup — pipeline применение техник.
 //!
-//! ## Режимы
-//! 1. **Pipeline** (по умолчанию): каждая техника видит modified packet предыдущей.
-//! 2. **Concurrent**: каждая техника видит оригинальный пакет.
+//! ## Режим
+//! **Pipeline**: каждая техника видит modified packet предыдущей.
+//! Concurrent mode удалён (был гонкой с потерей данных).
 
 use crate::adaptive::auto_tune::TuneParams;
 use crate::desync::{http, ip, obfs, quic, tcp, tls};
-use crate::desync::{DesyncConfig, DesyncResult, DesyncTechnique};
+use crate::desync::{DesyncConfig, DesyncResult, DesyncTechnique, TechniqueEffect};
+use smallvec::SmallVec;
 
 /// Override параметры для одного вызова apply() — из AutoTune.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ConfigOverride {
     pub split_size: Option<usize>,
     pub split_count: Option<usize>,
@@ -26,14 +27,23 @@ impl From<TuneParams> for ConfigOverride {
     }
 }
 
-/// Стейт pipeline — передаётся между техниками.
-#[derive(Debug, Clone)]
+/// Стейт pipeline — передаётся между техниками. Не Clone — содержит PerConnRng.
+#[derive(Debug)]
 pub struct PipelineState {
     pub packet: bytes::Bytes,
     cached_payload_offset: Option<usize>,
     cached_tcp_seq: Option<u32>,
-    pub injects: Vec<bytes::Bytes>,
+    pub injects: SmallVec<[bytes::Bytes; 4]>,
     pub drop: bool,
+    /// T43: флаг TLS 1.3 session resumption.
+    /// Передаётся из engine в desync техники, чтобы fake CH
+    /// мог включать/исключать early_data extension.
+    pub is_resumption: Option<bool>,
+    /// T44.5: per-connection RNG для техник, которым нужен non-deterministic random.
+    /// Передаётся из engine; техники могут fork() для независимости.
+    pub conn_rng: Option<crate::desync::rand::PerConnRng>,
+    /// T44.6: флаг что inject пакеты должны быть отправлены как outbound (от клиента к серверу).
+    pub is_outbound_inject: bool,
 }
 
 impl PipelineState {
@@ -42,8 +52,11 @@ impl PipelineState {
             packet,
             cached_payload_offset: None,
             cached_tcp_seq: None,
-            injects: Vec::new(),
+            injects: SmallVec::new(),
             drop: false,
+            is_resumption: None,
+            conn_rng: None,
+            is_outbound_inject: false,
         }
     }
 
@@ -98,22 +111,35 @@ impl PipelineState {
             inject: self.injects,
             inter_delay_us: 0,
             drop: self.drop,
+            is_outbound_inject: self.is_outbound_inject,
         }
     }
 }
 
-pub trait DesyncOp {
-    fn apply(&self, state: &mut PipelineState, config: &DesyncConfig);
-    fn weight(&self) -> u8 {
-        1
+impl DesyncGroup {
+    fn merge_into_state(&self, state: &mut PipelineState, result: DesyncResult) {
+        if let Some(modified) = result.modified {
+            state.packet = modified;
+            state.invalidate_header_cache();
+        }
+        for inject in result.inject {
+            state.injects.push(inject);
+        }
+        if result.drop {
+            state.drop = true;
+        }
+        if result.is_outbound_inject {
+            state.is_outbound_inject = true;
+        }
     }
 }
 
-#[derive(Clone)]
+// SPLIT_TECHNIQUES removed in T38 — validate() now uses `TechniqueEffect::Split` via `effect()`.
+
+#[derive(Debug, Clone)]
 pub struct DesyncGroup {
     config: DesyncConfig,
     techniques: Vec<DesyncTechnique>,
-    pipeline_mode: bool,
 }
 
 impl DesyncGroup {
@@ -121,14 +147,14 @@ impl DesyncGroup {
         Self {
             config,
             techniques: Vec::new(),
-            pipeline_mode: true,
         }
     }
 
     pub fn default_set() -> Self {
         let mut group = Self::new(DesyncConfig::default());
+        // FakeSni (InvalidatesSeq) + MultiSplit (Split) — невалидная композиция после T38.
+        // Убираем MultiSplit — FakeSni + BadChecksum безопасны.
         group.add(DesyncTechnique::FakeSni);
-        group.add(DesyncTechnique::MultiSplit);
         group.add(DesyncTechnique::BadChecksum);
         group
     }
@@ -142,33 +168,98 @@ impl DesyncGroup {
     pub fn techniques(&self) -> &[DesyncTechnique] {
         &self.techniques
     }
-    pub fn set_pipeline_mode(&mut self, enabled: bool) {
-        self.pipeline_mode = enabled;
+
+    /// Валидация группы техник.
+    ///
+    /// Проверяет:
+    /// 1. Не более одной Split техники в группе (взаимоисключающие).
+    /// 2. InvalidatesPayloadLength НЕ может идти перед Split
+    ///    (split positions съедут после изменения длины payload).
+    /// 3. InvalidatesSeq НЕ может идти перед Split
+    ///    (SEQ-relative расчёты в split станут некорректными).
+    ///
+    /// Возвращает Err с конкретными именами техник при нарушении.
+    pub fn validate(&self) -> Result<(), GroupError> {
+        // 1. Не более одной Split техники
+        let split_techniques: Vec<_> = self
+            .techniques
+            .iter()
+            .filter(|t| matches!(t.effect(), TechniqueEffect::Split))
+            .collect();
+        if split_techniques.len() > 1 {
+            return Err(GroupError::MultipleSplitTechniques);
+        }
+
+        // 2. InvalidatesPayloadLength НЕ может идти перед Split
+        let mut seen_length_changing: Option<DesyncTechnique> = None;
+        for technique in &self.techniques {
+            match technique.effect() {
+                TechniqueEffect::InvalidatesPayloadLength => {
+                    seen_length_changing = Some(*technique);
+                }
+                TechniqueEffect::Split => {
+                    if let Some(length_tech) = seen_length_changing {
+                        return Err(GroupError::LengthChangeBeforeSplit(length_tech, *technique));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 3. InvalidatesSeq НЕ может идти перед Split
+        let mut seen_seq_invalidating: Option<DesyncTechnique> = None;
+        for technique in &self.techniques {
+            match technique.effect() {
+                TechniqueEffect::InvalidatesSeq => {
+                    seen_seq_invalidating = Some(*technique);
+                }
+                TechniqueEffect::Split => {
+                    if let Some(seq_tech) = seen_seq_invalidating {
+                        return Err(GroupError::SeqInvalidationBeforeSplit(seq_tech, *technique));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
     }
 
-    /// Применяет все техники.
-    /// - `dscp_value` — per-connection DSCP для DscpRandom
-    /// - `override_params` — переопределения параметров из AutoTune
     pub fn apply(
         &self,
         packet: &bytes::Bytes,
         dscp_value: Option<u8>,
         override_params: Option<ConfigOverride>,
+        is_resumption: Option<bool>,
     ) -> DesyncResult {
-        if self.pipeline_mode {
-            self.apply_pipeline(packet.clone(), dscp_value, override_params)
-        } else {
-            self.apply_concurrent(packet, dscp_value)
-        }
+        self.apply_pipeline(
+            packet.clone(),
+            dscp_value,
+            override_params,
+            is_resumption,
+            None,
+        )
     }
 
-    fn apply_concurrent(&self, packet: &bytes::Bytes, _dscp_value: Option<u8>) -> DesyncResult {
-        let mut result = DesyncResult::passthrough();
-        for technique in &self.techniques {
-            let r = self.apply_single_safe(technique, packet);
-            result.merge(r);
-        }
-        result
+    /// Same as `apply`, but accepts a per-connection RNG for non-deterministic
+    /// per-packet fields (TLS random, GREASE, etc.).  The engine should pass
+    /// a fork of the conntrack entry's RNG so each desync decision gets an
+    /// independent stream.
+    pub fn apply_with_rng(
+        &self,
+        packet: &bytes::Bytes,
+        dscp_value: Option<u8>,
+        override_params: Option<ConfigOverride>,
+        is_resumption: Option<bool>,
+        conn_rng: Option<crate::desync::rand::PerConnRng>,
+    ) -> DesyncResult {
+        self.apply_pipeline(
+            packet.clone(),
+            dscp_value,
+            override_params,
+            is_resumption,
+            conn_rng,
+        )
     }
 
     fn apply_pipeline(
@@ -176,10 +267,14 @@ impl DesyncGroup {
         packet: bytes::Bytes,
         dscp_value: Option<u8>,
         override_params: Option<ConfigOverride>,
+        is_resumption: Option<bool>,
+        conn_rng: Option<crate::desync::rand::PerConnRng>,
     ) -> DesyncResult {
         let mut state = PipelineState::from_packet(packet);
+        state.is_resumption = is_resumption;
+        state.conn_rng = conn_rng;
         for technique in &self.techniques {
-            self.apply_to_state(technique, &mut state, dscp_value, override_params.as_ref());
+            self.apply_to_state(technique, &mut state, dscp_value, override_params);
             if state.drop {
                 break;
             }
@@ -192,72 +287,81 @@ impl DesyncGroup {
         technique: &DesyncTechnique,
         state: &mut PipelineState,
         dscp_value: Option<u8>,
-        override_params: Option<&ConfigOverride>,
+        override_params: Option<ConfigOverride>,
     ) {
-        // Применяем override параметры если есть, иначе используем config как есть
-        let config = override_params.map_or_else(
-            || self.config.clone(),
-            |p| {
-                let mut c = self.config.clone();
-                if let Some(v) = p.split_size {
-                    c.split_size = v;
-                }
-                if let Some(v) = p.split_count {
-                    c.split_count = v;
-                }
-                if let Some(v) = p.fake_ttl_offset {
-                    c.fake_ttl_offset = v;
-                }
-                c
-            },
-        );
-        let c = &config;
+        let c = &self.config;
+        let split_size = override_params
+            .and_then(|p| p.split_size)
+            .unwrap_or(c.split_size);
+        let split_count = override_params
+            .and_then(|p| p.split_count)
+            .unwrap_or(c.split_count);
+        let fake_ttl_offset = override_params
+            .and_then(|p| p.fake_ttl_offset)
+            .unwrap_or(c.fake_ttl_offset);
+        let fake_sni_str: &str = &c.fake_sni;
+
         match technique {
             DesyncTechnique::FakeSni => {
-                let result = tcp::fake_sni(&state.packet, &c.fake_sni, c.fake_ttl_offset);
+                let resumption = state.is_resumption.unwrap_or(false);
+                let result = if let Some(ref mut rng) = state.conn_rng {
+                    tcp::fake_sni(
+                        &state.packet,
+                        fake_sni_str,
+                        fake_ttl_offset,
+                        Some(rng),
+                        resumption,
+                    )
+                } else {
+                    tcp::fake_sni(
+                        &state.packet,
+                        fake_sni_str,
+                        fake_ttl_offset,
+                        None,
+                        resumption,
+                    )
+                };
                 self.merge_into_state(state, result);
             }
             DesyncTechnique::MultiSplit => {
                 let result = tcp::multisplit(
                     &state.packet,
-                    c.split_size,
-                    c.split_count,
-                    c.fake_ttl_offset,
+                    split_size,
+                    split_count,
+                    fake_ttl_offset,
                     c.inter_delay_us,
                 );
                 state.invalidate_header_cache();
                 self.merge_into_state(state, result);
             }
             DesyncTechnique::MultiDisorder => {
-                let result = tcp::multidisorder(
-                    &state.packet,
-                    c.split_size,
-                    c.split_count,
-                    c.fake_ttl_offset,
-                );
+                let result =
+                    tcp::multidisorder(&state.packet, split_size, split_count, fake_ttl_offset);
                 state.invalidate_header_cache();
                 self.merge_into_state(state, result);
             }
             DesyncTechnique::Disorder => {
-                let result = tcp::disorder(&state.packet, c.split_size, c.fake_ttl_offset);
+                let result = tcp::disorder(&state.packet, split_size, fake_ttl_offset);
                 state.invalidate_header_cache();
                 self.merge_into_state(state, result);
             }
             DesyncTechnique::FakeDataSplit => {
-                let result = tcp::fakedsplit(&state.packet, &c.fake_sni, c.fake_ttl_offset);
+                let result = tcp::fakedsplit(&state.packet, fake_sni_str, fake_ttl_offset);
                 state.invalidate_header_cache();
                 self.merge_into_state(state, result);
             }
             DesyncTechnique::BadChecksum => {
-                // BadChecksum applies ONLY to inject packets, NOT to state.packet.
-                // Original packet must keep valid checksum to reach the server.
                 state.injects = state
                     .injects
                     .iter()
-                    .map(|pkt| {
-                        ip::bad_checksum(pkt)
-                            .modified
-                            .unwrap_or_else(|| pkt.clone())
+                    .flat_map(|pkt| {
+                        let result = ip::bad_checksum(pkt);
+                        if result.inject.is_empty() {
+                            // passthrough — keep original
+                            smallvec::smallvec![pkt.clone()]
+                        } else {
+                            result.inject
+                        }
                     })
                     .collect();
             }
@@ -267,16 +371,16 @@ impl DesyncGroup {
             DesyncTechnique::TlsRecordFrag => {
                 self.merge_into_state(
                     state,
-                    tls::tls_record_frag(&state.packet, 5, c.fake_ttl_offset),
+                    tls::tls_record_frag(&state.packet, 5, fake_ttl_offset),
                 );
             }
             DesyncTechnique::SniMasking => {
-                tracing::warn!("SniMasking is deprecated — server cannot restore masked SNI. Use FakeSni instead.");
+                tracing::warn!("SniMasking is deprecated — use FakeSni instead.");
             }
             DesyncTechnique::TlsRecordRewrap => {
                 self.merge_into_state(
                     state,
-                    tls::tls_record_rewrap(&state.packet, 100, c.fake_ttl_offset),
+                    tls::tls_record_rewrap(&state.packet, 100, fake_ttl_offset),
                 );
             }
             DesyncTechnique::TlsVersionSpoof => {
@@ -285,117 +389,271 @@ impl DesyncGroup {
             DesyncTechnique::SniRecordFrag => {
                 self.merge_into_state(
                     state,
-                    tls::sni_record_frag(&state.packet, 2, c.fake_ttl_offset),
+                    tls::sni_record_frag(&state.packet, 2, fake_ttl_offset),
                 );
             }
             DesyncTechnique::RstDropIpId => {
                 self.merge_into_state(state, ip::rst_drop_ip_id(&state.packet));
             }
             DesyncTechnique::DscpRandom => {
-                let dscp =
-                    dscp_value.unwrap_or_else(|| crate::desync::rand::random_range(0, 48) as u8);
-                self.merge_into_state(state, ip::dscp_random(&state.packet, dscp));
+                match dscp_value {
+                    Some(dscp) => {
+                        self.merge_into_state(state, ip::dscp_random(&state.packet, dscp));
+                    }
+                    None => {
+                        // No per-connection DSCP — skip (не применяем per-packet random, это аномалия)
+                        tracing::trace!("DscpRandom skipped — no per-connection dscp_value");
+                    }
+                }
             }
-            DesyncTechnique::TtlJitter => {
-                self.merge_into_state(state, ip::ttl_jitter(&state.packet, None));
+            #[allow(deprecated)]
+            DesyncTechnique::TcpPreopen => {
+                tracing::warn!(
+                    "TcpPreopen is deprecated and non-functional in pipeline mode — ignoring"
+                );
             }
-            _ => {
-                self.merge_into_state(state, self.apply_single_safe(technique, &state.packet));
+            // === Remaining TCP techniques ===
+            DesyncTechnique::TcpSeg => {
+                let result = tcp::tcpseg(&state.packet, c.max_seg_size, fake_ttl_offset);
+                state.invalidate_header_cache();
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::SynData => {
+                let result = tcp::syndata(
+                    &state.packet,
+                    &fake_sni_str.as_bytes()[..4.min(fake_sni_str.len())],
+                    fake_ttl_offset,
+                );
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::HostFakeSplit => {
+                let result = tcp::host_fake_split(&state.packet, fake_sni_str, fake_ttl_offset);
+                state.invalidate_header_cache();
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::FakeDataDisorder => {
+                let result = tcp::fake_data_disorder(
+                    &state.packet,
+                    fake_sni_str.as_bytes(),
+                    fake_ttl_offset,
+                );
+                state.invalidate_header_cache();
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::SynAckSplit => {
+                let result = tcp::syn_ack_split(&state.packet);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::WinSize => {
+                let result = tcp::winsize(&state.packet, 1024);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::SynHide => {
+                let result = tcp::synhide(&state.packet, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::OobInjection => {
+                let result = tcp::oob_injection(&state.packet, fake_sni_str, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::MssClamp => {
+                let result = tcp::mss_clamp(&state.packet, 536, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::AckSuppress => {
+                let result = tcp::ack_suppress(&state.packet, 2, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::PktReorder => {
+                let result = tcp::pkt_reorder(&state.packet, true);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::RstSelective => {
+                let result = tcp::rst_selective(&state.packet, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::SynFloodDecoy => {
+                let result = tcp::syn_flood_decoy(&state.packet, 5, fake_sni_str, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::WinScaleManip => {
+                let result = tcp::win_scale_manip(&state.packet, 1024, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::MultidisorderNew => {
+                let result = tcp::multidisorder_new(&state.packet, split_count, fake_ttl_offset);
+                state.invalidate_header_cache();
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::Disoob => {
+                let result = tcp::disoob(&state.packet, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::HostFake => {
+                let result = tcp::hostfake(&state.packet, fake_sni_str, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::FakeRst => {
+                let result = tcp::fakerst(&state.packet, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::ByteByByte => {
+                let result = tcp::byte_by_byte(&state.packet, 10, fake_ttl_offset);
+                state.invalidate_header_cache();
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::UnidirFrag => {
+                let result = tcp::unidir_frag(&state.packet, split_size, fake_ttl_offset);
+                state.invalidate_header_cache();
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::PortShuffle => {
+                let result = tcp::port_shuffle(&state.packet);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::Wclamp => {
+                let result = tcp::wclamp(&state.packet, 1024);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::TsMd5 => {
+                let result = tcp::ts_md5(&state.packet, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            // === IP techniques ===
+            DesyncTechnique::FragOverlap => {
+                let result = ip::frag_overlap(&state.packet, fake_sni_str, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::IpFragPrimitives => {
+                let result = ip::ip_frag_primitives(&state.packet, split_size, fake_ttl_offset);
+                state.invalidate_header_cache();
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::MutualSpoof => {
+                let result = ip::mutual_spoof(&state.packet);
+                self.merge_into_state(state, result);
+            }
+            // === TLS techniques ===
+            DesyncTechnique::TlsRecordPad => {
+                let result = tls::tls_record_pad(&state.packet, 32, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::SniMicrofrag => {
+                let result = tls::sni_microfrag(&state.packet, 5, fake_ttl_offset);
+                state.invalidate_header_cache();
+                self.merge_into_state(state, result);
+            }
+            // === HTTP techniques ===
+            DesyncTechnique::H2SettingsFlood => {
+                let result = http::h2_settings_flood(&state.packet, 3, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::H2RstPadding => {
+                let result = http::h2_rst_padding(&state.packet, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::H2WindowUpdateFlood => {
+                let result = http::h2_window_update_flood(&state.packet, 2, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::H2PriorityAbuse => {
+                let result = http::h2_priority_abuse(&state.packet, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::H2Goaway => {
+                let result = http::h2_goaway_inject(&state.packet, 1, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::ChunkObfuscation => {
+                let result = http::chunk_obfuscation(&state.packet, 3, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::H2FrameOrdering => {
+                let result = http::h2_frame_ordering(&state.packet, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::HttpCaseMix => {
+                let result = http::http_case_mix(&state.packet);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::Http11Pipeline => {
+                let result = http::http11_pipeline(&state.packet, fake_sni_str, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::ContentLengthFuzz => {
+                let result = http::content_length_fuzz(&state.packet, 100000);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::HttpUpgradeAbuse => {
+                let result = http::http_upgrade_abuse(&state.packet);
+                self.merge_into_state(state, result);
+            }
+            // === QUIC techniques ===
+            DesyncTechnique::QuicBlocking => {
+                let result = quic::quic_blocking(&state.packet);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::QuicVersionDowngrade => {
+                let result =
+                    quic::quic_version_downgrade(&state.packet, 0xFF00001D, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::QuicRetryInject => {
+                let result = quic::quic_retry_inject(&state.packet, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::QuicConnectionClose => {
+                let result = quic::quic_connection_close(&state.packet, 0x01, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::QuicStreamReset => {
+                let result = quic::quic_stream_reset(&state.packet, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::QuicMaxStreams => {
+                let result = quic::quic_max_streams(&state.packet, 100, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            // === Obfs/Crypto techniques ===
+            DesyncTechnique::Udp2Icmp => {
+                let result = obfs::udp2icmp(&state.packet, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::XorFirst => {
+                let result = obfs::xor_first(&state.packet, 4, 0xFF);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::WgObfs => {
+                let result = obfs::wg_obfs(&state.packet, fake_ttl_offset);
+                self.merge_into_state(state, result);
+            }
+            DesyncTechnique::ChaCha20 => {
+                tracing::warn!("ChaCha20 disabled — broken by design for transparent proxy");
+            }
+            // === Composite ===
+            DesyncTechnique::ReverseFragmentOrder => {
+                let r = tcp::multisplit(
+                    &state.packet,
+                    split_size,
+                    split_count,
+                    fake_ttl_offset,
+                    c.inter_delay_us,
+                );
+                let result = tcp::reverse_fragment_order(r);
+                state.invalidate_header_cache();
+                self.merge_into_state(state, result);
             }
         }
     }
 
-    fn merge_into_state(&self, state: &mut PipelineState, result: DesyncResult) {
-        if let Some(modified) = result.modified {
-            state.packet = modified;
-            state.invalidate_header_cache();
-        }
-        state.injects.extend(result.inject);
-        if result.drop {
-            state.drop = true;
-        }
-    }
-
-    /// Безопасная обёртка над apply_single — ловит паники.
+    #[allow(dead_code)]
     fn apply_single_safe(
         &self,
         technique: &DesyncTechnique,
         packet: &bytes::Bytes,
     ) -> DesyncResult {
-        use std::panic::AssertUnwindSafe;
-        match std::panic::catch_unwind(AssertUnwindSafe(|| self.apply_single(technique, packet))) {
-            Ok(result) => result,
-            Err(panic) => {
-                let msg = panic.downcast_ref::<&str>().unwrap_or(&"unknown panic");
-                tracing::error!("Desync technique {:?} panicked: {}", technique.name(), msg);
-                DesyncResult::passthrough()
-            }
-        }
-    }
-
-    fn apply_single(&self, technique: &DesyncTechnique, packet: &bytes::Bytes) -> DesyncResult {
         let c = &self.config;
         match technique {
-            DesyncTechnique::MultiSplit => tcp::multisplit(
-                packet,
-                c.split_size,
-                c.split_count,
-                c.fake_ttl_offset,
-                c.inter_delay_us,
-            ),
-            DesyncTechnique::MultiDisorder => {
-                tcp::multidisorder(packet, c.split_size, c.split_count, c.fake_ttl_offset)
-            }
-            DesyncTechnique::FakeDataSplit => {
-                tcp::fakedsplit(packet, &c.fake_sni, c.fake_ttl_offset)
-            }
-            DesyncTechnique::TcpSeg => tcp::tcpseg(packet, c.max_seg_size, c.fake_ttl_offset),
-            DesyncTechnique::SynData => {
-                tcp::syndata(packet, &c.fake_sni.as_bytes()[..4], c.fake_ttl_offset)
-            }
-            DesyncTechnique::WinSize => tcp::winsize(packet, 1024),
-            DesyncTechnique::SynHide => tcp::synhide(packet, c.fake_ttl_offset),
-            DesyncTechnique::FakeSni => tcp::fake_sni(packet, &c.fake_sni, c.fake_ttl_offset),
-            DesyncTechnique::OobInjection => {
-                tcp::oob_injection(packet, &c.fake_sni, c.fake_ttl_offset)
-            }
-            DesyncTechnique::TcpPreopen => tcp::tcp_preopen(packet, c.fake_ttl_offset),
-            DesyncTechnique::MssClamp => tcp::mss_clamp(packet, 536, c.fake_ttl_offset),
-            DesyncTechnique::AckSuppress => tcp::ack_suppress(packet, 2, c.fake_ttl_offset),
-            DesyncTechnique::PktReorder => tcp::pkt_reorder(packet, true),
-            DesyncTechnique::RstSelective => tcp::rst_selective(packet, c.fake_ttl_offset),
-            DesyncTechnique::SynFloodDecoy => {
-                tcp::syn_flood_decoy(packet, 5, &c.fake_sni, c.fake_ttl_offset)
-            }
-            DesyncTechnique::WinScaleManip => tcp::win_scale_manip(packet, 1024, c.fake_ttl_offset),
-            DesyncTechnique::Disorder => tcp::disorder(packet, c.split_size, c.fake_ttl_offset),
-            DesyncTechnique::MultidisorderNew => {
-                tcp::multidisorder_new(packet, c.split_count, c.fake_ttl_offset)
-            }
-            DesyncTechnique::Disoob => tcp::disoob(packet, c.fake_ttl_offset),
-            DesyncTechnique::HostFake => tcp::hostfake(packet, &c.fake_sni, c.fake_ttl_offset),
-            DesyncTechnique::FakeRst => tcp::fakerst(packet, c.fake_ttl_offset),
-            DesyncTechnique::ByteByByte => tcp::byte_by_byte(packet, 10, c.fake_ttl_offset),
-            DesyncTechnique::UnidirFrag => {
-                tcp::unidir_frag(packet, c.split_size, c.fake_ttl_offset)
-            }
-            DesyncTechnique::PortShuffle => tcp::port_shuffle(packet),
-            DesyncTechnique::Wclamp => tcp::wclamp(packet, 1024),
-            DesyncTechnique::TsMd5 => tcp::ts_md5(packet, c.fake_ttl_offset),
-            DesyncTechnique::FragOverlap => {
-                ip::frag_overlap(packet, &c.fake_sni, c.fake_ttl_offset)
-            }
-            DesyncTechnique::BadChecksum => ip::bad_checksum(packet),
-            DesyncTechnique::TtlManipulation => ip::ttl_manipulation(packet, 64),
-            DesyncTechnique::IpFragPrimitives => {
-                ip::ip_frag_primitives(packet, c.split_size, c.fake_ttl_offset)
-            }
-            DesyncTechnique::RstDropIpId => ip::rst_drop_ip_id(packet),
-            DesyncTechnique::TtlJitter => ip::ttl_jitter(packet, None),
-            DesyncTechnique::DscpRandom => {
-                let dscp = crate::desync::rand::random_range(0, 48) as u8; // stateless path — random per-packet
-                ip::dscp_random(packet, dscp)
-            }
             DesyncTechnique::MutualSpoof => ip::mutual_spoof(packet),
             DesyncTechnique::TlsRecordFrag => tls::tls_record_frag(packet, 5, c.fake_ttl_offset),
             DesyncTechnique::TlsRecordPad => tls::tls_record_pad(packet, 32, c.fake_ttl_offset),
@@ -444,7 +702,7 @@ impl DesyncGroup {
             DesyncTechnique::XorFirst => obfs::xor_first(packet, 4, 0xFF),
             DesyncTechnique::WgObfs => obfs::wg_obfs(packet, c.fake_ttl_offset),
             DesyncTechnique::ChaCha20 => {
-                tracing::warn!("ChaCha20 with hardcoded key is disabled — broken by design for transparent proxy");
+                tracing::warn!("ChaCha20 disabled — broken by design for transparent proxy");
                 DesyncResult::passthrough()
             }
             DesyncTechnique::ReverseFragmentOrder => {
@@ -464,6 +722,14 @@ impl DesyncGroup {
                 tcp::fake_data_disorder(packet, c.fake_sni.as_bytes(), c.fake_ttl_offset)
             }
             DesyncTechnique::SynAckSplit => tcp::syn_ack_split(packet),
+            #[allow(deprecated)]
+            DesyncTechnique::TcpPreopen => {
+                tracing::warn!(
+                    "TcpPreopen is deprecated — use FakeSni instead; returning passthrough"
+                );
+                DesyncResult::passthrough()
+            }
+            _ => DesyncResult::passthrough(),
         }
     }
 }
@@ -471,5 +737,101 @@ impl DesyncGroup {
 impl Default for DesyncGroup {
     fn default() -> Self {
         Self::default_set()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GroupError {
+    #[error("Multiple Split techniques in one group — they are mutually exclusive")]
+    MultipleSplitTechniques,
+
+    #[error(
+        "Length-changing technique ({0:?}) cannot precede Split technique ({1:?}) — \
+         split positions are invalidated by payload length change"
+    )]
+    LengthChangeBeforeSplit(DesyncTechnique, DesyncTechnique),
+
+    #[error(
+        "SEQ-invalidating technique ({0:?}) cannot precede Split technique ({1:?}) — \
+         split SEQ calculations are invalidated"
+    )]
+    SeqInvalidationBeforeSplit(DesyncTechnique, DesyncTechnique),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_multiple_split_rejected() {
+        let mut group = DesyncGroup::new(DesyncConfig::default());
+        group.add(DesyncTechnique::MultiSplit);
+        group.add(DesyncTechnique::FakeDataSplit);
+        assert!(matches!(
+            group.validate(),
+            Err(GroupError::MultipleSplitTechniques)
+        ));
+    }
+
+    #[test]
+    fn test_validate_length_change_before_split_rejected() {
+        let mut group = DesyncGroup::new(DesyncConfig::default());
+        group.add(DesyncTechnique::TlsRecordPad); // InvalidatesPayloadLength
+        group.add(DesyncTechnique::MultiSplit); // Split
+        assert!(matches!(
+            group.validate(),
+            Err(GroupError::LengthChangeBeforeSplit(
+                DesyncTechnique::TlsRecordPad,
+                DesyncTechnique::MultiSplit
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_validate_split_before_length_change_ok() {
+        let mut group = DesyncGroup::new(DesyncConfig::default());
+        group.add(DesyncTechnique::MultiSplit); // Split
+        group.add(DesyncTechnique::TlsRecordPad); // InvalidatesPayloadLength
+        assert!(group.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_seq_invalidation_before_split_rejected() {
+        let mut group = DesyncGroup::new(DesyncConfig::default());
+        group.add(DesyncTechnique::FakeSni); // InvalidatesSeq
+        group.add(DesyncTechnique::MultiSplit); // Split
+        assert!(matches!(
+            group.validate(),
+            Err(GroupError::SeqInvalidationBeforeSplit(
+                DesyncTechnique::FakeSni,
+                DesyncTechnique::MultiSplit
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_validate_header_only_before_split_ok() {
+        let mut group = DesyncGroup::new(DesyncConfig::default());
+        group.add(DesyncTechnique::TtlManipulation); // HeaderOnly
+        group.add(DesyncTechnique::DscpRandom); // HeaderOnly
+        group.add(DesyncTechnique::MultiSplit); // Split
+        assert!(group.validate().is_ok());
+    }
+
+    #[test]
+    fn test_technique_effect_classification() {
+        assert_eq!(
+            DesyncTechnique::TtlManipulation.effect(),
+            TechniqueEffect::HeaderOnly
+        );
+        assert_eq!(
+            DesyncTechnique::TlsRecordPad.effect(),
+            TechniqueEffect::InvalidatesPayloadLength
+        );
+        assert_eq!(
+            DesyncTechnique::FakeSni.effect(),
+            TechniqueEffect::InvalidatesSeq
+        );
+        assert_eq!(DesyncTechnique::MultiSplit.effect(), TechniqueEffect::Split);
     }
 }

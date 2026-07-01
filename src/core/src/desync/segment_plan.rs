@@ -13,7 +13,52 @@
 //! Планы сортируются по позиции независимо от порядка объявления.
 //! Noise делает каждый пакет уникальным — DPI не может натренировать паттерн.
 
+use std::f64::consts::PI;
+
 use serde::{Deserialize, Serialize};
+
+/// Log-normal distributed jitter using Box-Muller transform.
+/// Small values occur often, large values rarely — matching natural TCP scheduling jitter.
+///
+/// # Arguments
+/// * `max` — maximum output value (inclusive)
+/// * `conn_rng` — per-connection PRNG (internal, non-observable)
+///
+/// # Returns
+/// Jitter in [0, max] with log-normal distribution.
+pub fn natural_jitter(max: u32, conn_rng: &mut crate::desync::rand::PerConnRng) -> u32 {
+    if max == 0 {
+        return 0;
+    }
+
+    // Box-Muller: two uniform -> one standard normal
+    let u1_raw = (conn_rng.next_internal_u64() as f64) / (u64::MAX as f64);
+    let u2_raw = (conn_rng.next_internal_u64() as f64) / (u64::MAX as f64);
+    // Clamp u1 away from 0 to avoid ln(0)
+    let u1 = if u1_raw <= 0.0 {
+        f64::MIN_POSITIVE
+    } else if u1_raw >= 1.0 {
+        0.9999
+    } else {
+        u1_raw
+    };
+    let u2 = if u2_raw <= 0.0 {
+        f64::MIN_POSITIVE
+    } else if u2_raw >= 1.0 {
+        0.9999
+    } else {
+        u2_raw
+    };
+
+    let z = (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
+
+    // Log-normal: exp(N(mu, sigma^2)). Median at max/3, sigma=0.8 for moderate spread.
+    let mu = (max as f64 / 3.0).ln();
+    let sigma = 0.8;
+    let log_normal = (mu + sigma * z).exp();
+
+    (log_normal.max(0.0).min(max as f64) as u32).min(max)
+}
 
 /// Референсная точка для split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,10 +110,15 @@ impl SegmentPlanSet {
     ///
     /// # Arguments
     /// * `sni_offset` — абсолютный байт начала SNI в ClientHello (0 если нет SNI).
+    /// * `conn_rng` — per-connection PRNG для jitter.
     ///
     /// # Returns
     /// Вектор SplitPosition, отсортированный по position.
-    pub fn resolve(&self, sni_offset: usize) -> Vec<SplitPosition> {
+    pub fn resolve(
+        &self,
+        sni_offset: usize,
+        conn_rng: &mut crate::desync::rand::PerConnRng,
+    ) -> Vec<SplitPosition> {
         let mut positions: Vec<SplitPosition> = self
             .plans
             .iter()
@@ -78,7 +128,7 @@ impl SegmentPlanSet {
                     SplitRef::Sni => sni_offset,
                 };
                 let noise = if plan.noise > 0 {
-                    crate::desync::rand::random_range(0, plan.noise) as i32
+                    natural_jitter(plan.noise, conn_rng) as i32
                 } else {
                     0
                 };
@@ -105,9 +155,11 @@ pub fn parse_plan_set(toml_str: &str) -> anyhow::Result<SegmentPlanSet> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desync::rand::PerConnRng;
 
     #[test]
     fn test_basic_plan() {
+        let mut rng = PerConnRng::new(1);
         let plan = SegmentPlanSet {
             name: "test".into(),
             plans: vec![
@@ -125,7 +177,7 @@ mod tests {
                 },
             ],
         };
-        let positions = plan.resolve(100);
+        let positions = plan.resolve(100, &mut rng);
         assert_eq!(positions.len(), 2);
         assert_eq!(positions[0].position, 100);
         assert_eq!(positions[1].position, 105);
@@ -133,6 +185,7 @@ mod tests {
 
     #[test]
     fn test_plan_with_noise() {
+        let mut rng = PerConnRng::new(42);
         let plan = SegmentPlanSet {
             name: "noisy".into(),
             plans: vec![SegmentPlan {
@@ -142,8 +195,8 @@ mod tests {
                 noise: 5,
             }],
         };
-        // Position should be in range [10, 15] (10 + random(0..=5))
-        let positions = plan.resolve(0);
+        // Position should be in range [10, 15] with log-normal distribution
+        let positions = plan.resolve(0, &mut rng);
         assert_eq!(positions.len(), 1);
         assert!(positions[0].position >= 10);
         assert!(positions[0].position <= 15);
@@ -151,6 +204,7 @@ mod tests {
 
     #[test]
     fn test_lazy_flag() {
+        let mut rng = PerConnRng::new(7);
         let plan = SegmentPlanSet {
             name: "lazy-test".into(),
             plans: vec![SegmentPlan {
@@ -160,13 +214,14 @@ mod tests {
                 noise: 0,
             }],
         };
-        let positions = plan.resolve(50);
+        let positions = plan.resolve(50, &mut rng);
         assert_eq!(positions[0].position, 53);
         assert!(positions[0].lazy);
     }
 
     #[test]
     fn test_sorted_by_position() {
+        let mut rng = PerConnRng::new(99);
         let plan = SegmentPlanSet {
             name: "sort-test".into(),
             plans: vec![
@@ -190,7 +245,7 @@ mod tests {
                 },
             ],
         };
-        let positions = plan.resolve(20);
+        let positions = plan.resolve(20, &mut rng);
         // Head+5=5, Sni-3=17, Sni+10=30
         assert_eq!(positions[0].position, 5);
         assert_eq!(positions[1].position, 17);
@@ -217,5 +272,35 @@ noise = 5
         assert_eq!(plan_set.name, "aggressive");
         assert_eq!(plan_set.plans.len(), 2);
         assert!(plan_set.plans[1].lazy);
+    }
+
+    #[test]
+    fn test_natural_jitter_distribution() {
+        let mut rng = PerConnRng::new(12345);
+        let max = 100u32;
+        let n = 10000;
+        let mut sum = 0u64;
+        let mut min_seen = u32::MAX;
+        let mut max_seen = 0u32;
+
+        for _ in 0..n {
+            let j = natural_jitter(max, &mut rng);
+            assert!(j <= max, "jitter {j} exceeded max {max}");
+            sum += j as u64;
+            min_seen = min_seen.min(j);
+            max_seen = max_seen.max(j);
+        }
+
+        let mean = sum as f64 / n as f64;
+        // Log-normal: mean should be less than max/2, and most values small
+        assert!(
+            mean < max as f64 / 2.0,
+            "mean {mean} too high for log-normal"
+        );
+        assert!(
+            min_seen < max / 2,
+            "min_seen {min_seen} too high, expected small values"
+        );
+        assert!(max_seen > 0, "max_seen should be > 0");
     }
 }
