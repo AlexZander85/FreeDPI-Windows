@@ -19,9 +19,8 @@ use crate::desync::{DesyncConfig, DesyncTechnique};
 use crate::dns::fakeip::FakeIpManager;
 use crate::packet_engine::{PacketBufferPool, PacketEngine, PaddedCounter};
 use crate::routing::geo::GeoRouter;
-use crate::Runtime;
 use pnet_packet::ipv4::Ipv4Packet;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -126,7 +125,7 @@ impl Default for ProcessingConfig {
 }
 
 /// Ключ для отслеживания injected SEQ — 5-tuple (src_ip, dst_ip, src_port, dst_port, seq).
-type SeqKey = (u32, u32, u16, u16, u32);
+type SeqKey = (u64, u64, u16, u16, u32);
 
 pub struct ProcessingPipeline {
     packet_engine: Arc<PacketEngine>,
@@ -306,11 +305,11 @@ impl ProcessingPipeline {
     pub async fn run(self: Arc<Self>, shutdown: tokio::sync::broadcast::Receiver<()>) {
         debug!("ProcessingPipeline started");
 
-        const N_WORKERS: usize = 4;
+        let n_workers = num_cpus::get().max(2);
         const QUEUE_SIZE: usize = 1024;
 
         // Per-worker lock-free queues for rendezvous-free handoff
-        let queues: Vec<Arc<crossbeam::queue::ArrayQueue<CapturedPacket>>> = (0..N_WORKERS)
+        let queues: Vec<Arc<crossbeam::queue::ArrayQueue<CapturedPacket>>> = (0..n_workers)
             .map(|_| Arc::new(crossbeam::queue::ArrayQueue::new(QUEUE_SIZE)))
             .collect();
 
@@ -337,8 +336,8 @@ impl ProcessingPipeline {
                             stats.total_received.fetch_add(1, Ordering::Relaxed);
                             let pkt = CapturedPacket { data, addr };
 
-                            // Route by hash of the raw packet data
-                            let idx = (simple_packet_hash(&pkt.data) as usize) % N_WORKERS;
+                            // Route by 4-tuple hash — все пакеты одного TCP-соединения → один воркер
+                            let idx = route_to_worker(&pkt.data, n_workers);
 
                             // Non-blocking push with spin-retry
                             while queues[idx].push(pkt.clone()).is_err() {
@@ -359,7 +358,7 @@ impl ProcessingPipeline {
 
         // ── Workers: N std::threads calling sync methods directly ──
         // All pipeline fields are behind Arc — clone per worker.
-        let mut worker_handles = Vec::with_capacity(N_WORKERS);
+        let mut worker_handles = Vec::with_capacity(n_workers);
         for queue in queues.into_iter() {
             let shutdown_flag = shutdown_flag.clone();
             let self_clone = self.clone();
@@ -411,332 +410,6 @@ impl ProcessingPipeline {
             let _ = handle.join();
         }
         debug!("ProcessingPipeline stopped");
-    }
-
-    async fn forward_packet(&self, captured: &CapturedPacket) {
-        self.send_packet(captured.data.clone(), &captured.addr)
-            .await;
-    }
-
-    async fn send_packet(&self, packet: bytes::Bytes, addr: &WinDivertAddress<NetworkLayer>) {
-        let engine = self.packet_engine.clone();
-        let addr = addr.clone();
-        match tokio::task::spawn_blocking(move || engine.send_blocking(&packet, &addr)).await {
-            Ok(Ok(_)) => {
-                self.stats.forwarded.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(Err(e)) => {
-                error!("Failed to send packet: {}", e);
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                error!("spawn_blocking panicked: {}", e);
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    async fn process_one(
-        &self,
-        captured: &CapturedPacket,
-    ) -> Result<PacketDecision, anyhow::Error> {
-        let classification = Classifier::classify(&captured.data);
-
-        match classification {
-            Classification::Tls(cp) if cp.dst_port == self.config.desync_port => {
-                if self.config.only_outbound && !is_outbound_cached(&cp.src_ip) {
-                    return Ok(PacketDecision::Forward);
-                }
-                // Quick pre-filter: is this a desync-eligible ClientHello?
-                let conn_key = crate::conntrack::ConnKey::new(
-                    cp.src_ip,
-                    cp.dst_ip,
-                    cp.src_port,
-                    cp.dst_port,
-                    cp.protocol,
-                );
-                let desync_applied = self
-                    .conntrack
-                    .get(&conn_key)
-                    .map(|e| e.desync_applied)
-                    .unwrap_or(false);
-                if !Classifier::is_desync_target(&captured.data, desync_applied) {
-                    return Ok(PacketDecision::Forward);
-                }
-                self.process_outbound_tls(captured, &cp).await
-            }
-            Classification::Quic(cp) => {
-                if self.config.only_outbound && !is_outbound_cached(&cp.src_ip) {
-                    return Ok(PacketDecision::Forward);
-                }
-                self.process_quic(captured).await
-            }
-            Classification::Dns(_) => Ok(PacketDecision::Forward),
-            Classification::Http(cp) => {
-                if self.config.only_outbound && !is_outbound_cached(&cp.src_ip) {
-                    return Ok(PacketDecision::Forward);
-                }
-                self.process_http(captured).await
-            }
-            _ => Ok(PacketDecision::Forward),
-        }
-    }
-
-    async fn process_quic(
-        &self,
-        captured: &CapturedPacket,
-    ) -> Result<PacketDecision, anyhow::Error> {
-        let packet = captured.data.clone();
-        // T43: QUIC не использует is_resumption — передаём None
-        let result = self.apply_desync_async(packet, None, None, None).await;
-        if result.inject.is_empty() && result.modified.is_none() && !result.drop {
-            return Ok(PacketDecision::Forward);
-        }
-        if result.drop {
-            return Ok(PacketDecision::Drop);
-        }
-        let inter_delay = result.inter_delay_us;
-        if let Some(modified) = result.modified {
-            if result.inject.is_empty() {
-                return Ok(PacketDecision::Modify(modified));
-            }
-            return Ok(PacketDecision::Desync {
-                inject: result.inject,
-                modified: Some(modified),
-                inject_protocol: InjectProtocol::Udp,
-                inter_delay_us: inter_delay,
-            });
-        }
-        Ok(PacketDecision::Desync {
-            inject: result.inject,
-            modified: None,
-            inject_protocol: InjectProtocol::Udp,
-            inter_delay_us: inter_delay,
-        })
-    }
-
-    async fn process_http(
-        &self,
-        captured: &CapturedPacket,
-    ) -> Result<PacketDecision, anyhow::Error> {
-        let packet = captured.data.clone();
-        // T43: HTTP не использует is_resumption — передаём None
-        let result = self.apply_desync_async(packet, None, None, None).await;
-        if result.inject.is_empty() && result.modified.is_none() && !result.drop {
-            return Ok(PacketDecision::Forward);
-        }
-        if result.drop {
-            return Ok(PacketDecision::Drop);
-        }
-        let inter_delay = result.inter_delay_us;
-        if let Some(modified) = result.modified {
-            if result.inject.is_empty() {
-                return Ok(PacketDecision::Modify(modified));
-            }
-            return Ok(PacketDecision::Desync {
-                inject: result.inject,
-                modified: Some(modified),
-                inject_protocol: InjectProtocol::Tcp,
-                inter_delay_us: inter_delay,
-            });
-        }
-        Ok(PacketDecision::Desync {
-            inject: result.inject,
-            modified: None,
-            inject_protocol: InjectProtocol::Tcp,
-            inter_delay_us: inter_delay,
-        })
-    }
-
-    async fn process_outbound_tls(
-        &self,
-        captured: &CapturedPacket,
-        cp: &ClassifiedPacket,
-    ) -> Result<PacketDecision, anyhow::Error> {
-        self.stats.tls_outbound.fetch_add(1, Ordering::Relaxed);
-
-        let original_packet = &captured.data;
-
-        // 0. Skip retransmits — проверяем 5-tuple + SEQ по DashMap
-        {
-            if let Some(ip) = crate::desync::parse_ip_header(original_packet) {
-                let tcp_data = &original_packet[ip.header_len..];
-                if let Some(tcp) = pnet_packet::tcp::TcpPacket::new(tcp_data) {
-                    let key = (
-                        cp.src_ip.to_bits(),
-                        cp.dst_ip.to_bits(),
-                        cp.src_port,
-                        cp.dst_port,
-                        tcp.get_sequence(),
-                    );
-                    if self.injected_seqs.contains_key(&key) {
-                        return Ok(PacketDecision::Forward);
-                    }
-                }
-            }
-        }
-
-        // 1. Reverse DNS lookup
-        let domain = self.fake_ip.lookup(&cp.dst_ip);
-
-        // 2. Geo-Routing
-        if self.config.geo_routing_enabled {
-            let decision = self.geo_router.resolve(
-                domain.as_deref().unwrap_or("unknown"),
-                Some(std::net::IpAddr::V4(cp.dst_ip)),
-            );
-            if decision.excluded {
-                return Ok(PacketDecision::Forward);
-            }
-        }
-
-        // 3. HopTab observation
-        if self.config.hop_tab_enabled {
-            if let Some(ip_packet) = Ipv4Packet::new(original_packet) {
-                self.hop_tab
-                    .observe(HopTab::ip_to_u32(&cp.dst_ip), ip_packet.get_ttl());
-            }
-        }
-
-        // 4. Conntrack — create or update (не перезаписываем существующий)
-        let conn_key = crate::conntrack::ConnKey::new(
-            cp.src_ip,
-            cp.dst_ip,
-            cp.src_port,
-            cp.dst_port,
-            cp.protocol,
-        );
-        {
-            use crate::conntrack::{ConnState, ConntrackEntry};
-
-            if self.conntrack.get(&conn_key).is_none() {
-                let conn_id = (cp.src_ip.to_bits() as u64)
-                    ^ ((cp.dst_ip.to_bits() as u64) << 32)
-                    ^ ((cp.src_port as u64) << 48)
-                    ^ (cp.dst_port as u64);
-                let entry = ConntrackEntry {
-                    client_isn: 0,
-                    server_isn: 0,
-                    client_seq: 0,
-                    server_seq: 0,
-                    client_ack: 0,
-                    server_ack: 0,
-                    rtt_us: 0,
-                    state: ConnState::SynSent,
-                    desync_applied: false,
-                    dscp_spoof: crate::desync::rand::random_range(0, 48) as u8,
-                    strategy_id: 0,
-                    last_activity: Instant::now(),
-                    dup_ack_count: 0,
-                    rng: Some(crate::desync::rand::PerConnRng::new(conn_id)),
-                    quic_pn: 0,
-                    quic_dcid: vec![],
-                    is_resumption: false,
-                };
-                self.conntrack.insert(conn_key, entry);
-            } else {
-                if let Some(mut entry) = self.conntrack.get_mut(&conn_key) {
-                    entry.last_activity = Instant::now();
-                }
-            }
-        }
-
-        // 4.5. T43: Определяем is_resumption по ClientHello и сохраняем в conntrack
-        let is_resumption = {
-            let payload = &captured.data;
-            has_non_empty_session_ticket(payload)
-        };
-        if let Some(mut entry) = self.conntrack.get_mut(&conn_key) {
-            entry.is_resumption = is_resumption;
-        }
-
-        // 5. DesyncGroup — с per-connection DSCP + AutoTune + is_resumption
-        let packet = captured.data.clone();
-        let dscp_value = self.conntrack.get(&conn_key).map(|e| e.dscp_spoof);
-        let tune_start = Instant::now();
-        let result = self
-            .apply_desync_async(
-                packet,
-                dscp_value,
-                Some(self.get_tuned_config("outbound_tls")),
-                Some(is_resumption),
-            )
-            .await;
-
-        // 5.0. AutoTune — запись результата
-        {
-            let latency_us = tune_start.elapsed().as_micros() as u64;
-            let success = !result.inject.is_empty() || result.modified.is_some();
-            let mut tune = self.auto_tune.lock().unwrap();
-            tune.record("outbound_tls", success, latency_us);
-            if tune.should_escalate("outbound_tls") {
-                warn!(
-                    "AutoTune: outbound_tls strategy degrading (latency={}us)",
-                    latency_us
-                );
-            }
-        }
-
-        // 5.1. Запоминаем SEQ (5-tuple + SEQ) в DashMap
-        if !result.inject.is_empty() {
-            if let Some(ip) = crate::desync::parse_ip_header(original_packet) {
-                let tcp_data = &original_packet[ip.header_len..];
-                if let Some(tcp) = pnet_packet::tcp::TcpPacket::new(tcp_data) {
-                    let key = (
-                        cp.src_ip.to_bits(),
-                        cp.dst_ip.to_bits(),
-                        cp.src_port,
-                        cp.dst_port,
-                        tcp.get_sequence(),
-                    );
-                    self.injected_seqs.insert(key, ());
-                }
-            }
-        }
-
-        if result.inject.is_empty() && result.modified.is_none() && !result.drop {
-            return Ok(PacketDecision::Forward);
-        }
-        if result.drop {
-            return Ok(PacketDecision::Drop);
-        }
-
-        let inter_delay = result.inter_delay_us;
-
-        if let Some(modified) = result.modified {
-            if result.inject.is_empty() {
-                return Ok(PacketDecision::Modify(modified));
-            }
-            return Ok(PacketDecision::Desync {
-                inject: result.inject,
-                modified: Some(modified),
-                inject_protocol: InjectProtocol::Tcp,
-                inter_delay_us: inter_delay,
-            });
-        }
-
-        Ok(PacketDecision::Desync {
-            inject: result.inject,
-            modified: result.modified,
-            inject_protocol: InjectProtocol::Tcp,
-            inter_delay_us: inter_delay,
-        })
-    }
-
-    async fn inject_tcp_packet(&self, packet: bytes::Bytes, addr: &WinDivertAddress<NetworkLayer>) {
-        let engine = self.packet_engine.clone();
-        let addr = addr.clone();
-        match tokio::task::spawn_blocking(move || engine.inject_via_divert(&packet, &addr)).await {
-            Ok(Ok(_)) => {
-                self.stats.fake_ch_injected.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(Err(e)) => {
-                warn!("Failed to inject TCP desync packet: {}", e);
-            }
-            Err(e) => {
-                error!("spawn_blocking panicked in inject: {}", e);
-            }
-        }
     }
 
     // ──────────────────────────────────────────────
@@ -810,7 +483,7 @@ impl ProcessingPipeline {
 
         match classification {
             Classification::Tls(cp) if cp.dst_port == self.config.desync_port => {
-                if self.config.only_outbound && !is_outbound_cached(&cp.src_ip) {
+                if self.config.only_outbound && !is_outbound_cached(cp.src_ip) {
                     return Ok(PacketDecision::Forward);
                 }
                 // Quick pre-filter
@@ -832,14 +505,14 @@ impl ProcessingPipeline {
                 self.process_outbound_tls_sync(captured, &cp)
             }
             Classification::Quic(cp) => {
-                if self.config.only_outbound && !is_outbound_cached(&cp.src_ip) {
+                if self.config.only_outbound && !is_outbound_cached(cp.src_ip) {
                     return Ok(PacketDecision::Forward);
                 }
                 self.process_quic_sync(captured, &cp)
             }
             Classification::Dns(_) => Ok(PacketDecision::Forward),
             Classification::Http(cp) => {
-                if self.config.only_outbound && !is_outbound_cached(&cp.src_ip) {
+                if self.config.only_outbound && !is_outbound_cached(cp.src_ip) {
                     return Ok(PacketDecision::Forward);
                 }
                 self.process_http_sync(captured)
@@ -860,11 +533,11 @@ impl ProcessingPipeline {
         // 0. Skip retransmits
         {
             if let Some(ip) = crate::desync::parse_ip_header(original_packet) {
-                let tcp_data = &original_packet[ip.header_len..];
+                let tcp_data = &original_packet[ip.header_len()..];
                 if let Some(tcp) = pnet_packet::tcp::TcpPacket::new(tcp_data) {
                     let key = (
-                        cp.src_ip.to_bits(),
-                        cp.dst_ip.to_bits(),
+                        ip_to_u64(cp.src_ip),
+                        ip_to_u64(cp.dst_ip),
                         cp.src_port,
                         cp.dst_port,
                         tcp.get_sequence(),
@@ -881,10 +554,9 @@ impl ProcessingPipeline {
 
         // 2. Geo-Routing
         if self.config.geo_routing_enabled {
-            let decision = self.geo_router.resolve(
-                domain.as_deref().unwrap_or("unknown"),
-                Some(std::net::IpAddr::V4(cp.dst_ip)),
-            );
+            let decision = self
+                .geo_router
+                .resolve(domain.as_deref().unwrap_or("unknown"), Some(cp.dst_ip));
             if decision.excluded {
                 return Ok(PacketDecision::Forward);
             }
@@ -910,8 +582,8 @@ impl ProcessingPipeline {
             use crate::conntrack::{ConnState, ConntrackEntry};
 
             if self.conntrack.get(&conn_key).is_none() {
-                let conn_id = (cp.src_ip.to_bits() as u64)
-                    ^ ((cp.dst_ip.to_bits() as u64) << 32)
+                let conn_id = ip_to_u64(cp.src_ip)
+                    ^ (ip_to_u64(cp.dst_ip) << 32)
                     ^ ((cp.src_port as u64) << 48)
                     ^ (cp.dst_port as u64);
                 let entry = ConntrackEntry {
@@ -985,11 +657,11 @@ impl ProcessingPipeline {
         // 5.1. Запоминаем SEQ
         if !result.inject.is_empty() {
             if let Some(ip) = crate::desync::parse_ip_header(original_packet) {
-                let tcp_data = &original_packet[ip.header_len..];
+                let tcp_data = &original_packet[ip.header_len()..];
                 if let Some(tcp) = pnet_packet::tcp::TcpPacket::new(tcp_data) {
                     let key = (
-                        cp.src_ip.to_bits(),
-                        cp.dst_ip.to_bits(),
+                        ip_to_u64(cp.src_ip),
+                        ip_to_u64(cp.dst_ip),
                         cp.src_port,
                         cp.dst_port,
                         tcp.get_sequence(),
@@ -1041,8 +713,8 @@ impl ProcessingPipeline {
             use crate::desync::quic::extract_quic_pn_and_dcid;
 
             if self.conntrack.get(&cp.conn_key).is_none() {
-                let conn_id = (cp.src_ip.to_bits() as u64)
-                    ^ ((cp.dst_ip.to_bits() as u64) << 32)
+                let conn_id = ip_to_u64(cp.src_ip)
+                    ^ (ip_to_u64(cp.dst_ip) << 32)
                     ^ ((cp.src_port as u64) << 48)
                     ^ (cp.dst_port as u64);
                 let (quic_pn, quic_dcid) = extract_quic_pn_and_dcid(&packet).unwrap_or((0, vec![]));
@@ -1207,21 +879,6 @@ impl ProcessingPipeline {
         self.auto_tune.lock().unwrap().recommend(strategy_name)
     }
 
-    async fn apply_desync_async(
-        &self,
-        packet: bytes::Bytes,
-        dscp_value: Option<u8>,
-        tune_params: Option<TuneParams>,
-        is_resumption: Option<bool>,
-    ) -> crate::desync::DesyncResult {
-        let group = self.desync_group.clone();
-        let override_params: Option<crate::desync::group::ConfigOverride> =
-            tune_params.map(Into::into);
-        Runtime::global()
-            .spawn_cpu(move || group.apply(&packet, dscp_value, override_params, is_resumption))
-            .await
-    }
-
     pub fn stats(&self) -> &ProcessingStats {
         &self.stats
     }
@@ -1242,18 +899,31 @@ struct CapturedPacket {
     addr: WinDivertAddress<NetworkLayer>,
 }
 
-/// Simple non-cryptographic hash for packet routing.
-/// Uses the first 8 bytes of packet data (or fewer if packet is shorter).
-fn simple_packet_hash(data: &[u8]) -> u64 {
-    if data.is_empty() {
-        return 0;
+/// Route packet to a worker by hashing the TCP 4-tuple (src_ip, dst_ip, src_port, dst_port).
+/// Все пакеты одного соединения → один воркер (in-order desync).
+fn route_to_worker(packet: &[u8], n_workers: usize) -> usize {
+    if let Some(ip) = crate::desync::parse_ip_header(packet) {
+        if ip.protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp {
+            let tcp_data = &packet[ip.header_len()..];
+            if let Some(tcp) = pnet_packet::tcp::TcpPacket::new(tcp_data) {
+                let mut h = 0u64;
+                h = h
+                    .wrapping_mul(0x9E3779B97F4A7C15)
+                    .wrapping_add(ip_to_u64(ip.src()));
+                h = h
+                    .wrapping_mul(0x9E3779B97F4A7C15)
+                    .wrapping_add(ip_to_u64(ip.dst()));
+                h = h
+                    .wrapping_mul(0x9E3779B97F4A7C15)
+                    .wrapping_add(tcp.get_source() as u64);
+                h = h
+                    .wrapping_mul(0x9E3779B97F4A7C15)
+                    .wrapping_add(tcp.get_destination() as u64);
+                return (h as usize) % n_workers;
+            }
+        }
     }
-    let prefix = &data[..data.len().min(8)];
-    let mut h: u64 = 0;
-    for &b in prefix {
-        h = h.wrapping_mul(131).wrapping_add(b as u64);
-    }
-    h
+    0
 }
 
 /// Cached list of local IP addresses, populated once at startup.
@@ -1272,26 +942,46 @@ pub fn refresh_local_ips() {
     });
 }
 
-/// Fast cached check: does `src_ip` belong to a local interface or private range?
-pub fn is_outbound_cached(src_ip: &Ipv4Addr) -> bool {
-    if let Some(ips) = LOCAL_IPS.get() {
-        for ip in ips.iter() {
-            if let IpAddr::V4(v4) = ip {
-                if *v4 == *src_ip {
-                    return true;
-                }
-            }
+/// Convert an IP address to a u64 for hashing/conn_id purposes.
+/// For IPv4: zero-extend the 32-bit value.
+/// For IPv6: XOR-fold upper and lower 64 bits.
+fn ip_to_u64(ip: IpAddr) -> u64 {
+    match ip {
+        IpAddr::V4(v4) => v4.to_bits() as u64,
+        IpAddr::V6(v6) => {
+            let bits = v6.to_bits();
+            let upper = (bits >> 64) as u64;
+            let lower = bits as u64;
+            upper ^ lower
         }
     }
-    // Fallback: private CIDR ranges
-    let octets = src_ip.octets();
-    match octets[0] {
-        127 => true,
-        10 => true,
-        172 if octets[1] >= 16 && octets[1] <= 31 => true,
-        192 if octets[1] == 168 => true,
-        100 if octets[1] >= 64 && octets[1] <= 127 => true,
-        _ => false,
+}
+
+/// Fast cached check: does `src_ip` belong to a local interface or private range?
+pub fn is_outbound_cached(src_ip: IpAddr) -> bool {
+    if let Some(ips) = LOCAL_IPS.get() {
+        if ips.contains(&src_ip) {
+            return true;
+        }
+    }
+    match src_ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            match octets[0] {
+                127 => true,
+                10 => true,
+                172 if octets[1] >= 16 && octets[1] <= 31 => true,
+                192 if octets[1] == 168 => true,
+                100 if octets[1] >= 64 && octets[1] <= 127 => true,
+                _ => false,
+            }
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // Link-Local
+        }
     }
 }
 

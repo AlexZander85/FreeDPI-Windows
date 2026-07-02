@@ -101,7 +101,7 @@ pub struct WindivertConfig {
 }
 
 fn default_filter() -> String {
-    "ip && (tcp.DstPort == 443 or tcp.SrcPort == 443 \
+    "(ip or ipv6) && (tcp.DstPort == 443 or tcp.SrcPort == 443 \
      or udp.DstPort == 53 or udp.DstPort == 443)"
         .to_string()
 }

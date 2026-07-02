@@ -141,7 +141,8 @@ pub enum EngineMode {
 /// Абстракция над WinDivert + raw socket для перехвата и инъекции.
 pub struct PacketEngine {
     divert: ArcSwap<Option<WinDivert<NetworkLayer>>>,
-    raw_sock: Option<RawSocketTx>,
+    raw_sock_v4: Option<RawSocketTxV4>,
+    raw_sock_v6: Option<RawSocketTxV6>,
     stats: PacketStats,
     mode: EngineMode,
 }
@@ -177,7 +178,7 @@ impl Default for PacketStats {
 impl PacketEngine {
     /// Создаёт WinDivert handle + raw socket.
     ///
-    /// `filter` — WinDivert filter string (например, `"ip && tcp.DstPort == 443"`).
+    /// `filter` — WinDivert filter string (например, `"(ip or ipv6) && tcp.DstPort == 443"`).
     ///
     /// Автоматически устанавливает WinDivert driver если он не загружен.
     /// Требует admin elevation для установки driver.
@@ -200,13 +201,24 @@ impl PacketEngine {
             .set_param(WinDivertParam::QueueTime, 500)
             .context("Failed to set QueueTime")?;
 
-        let raw_sock = match unsafe { RawSocketTx::new() } {
+        let raw_sock_v4 = match unsafe { RawSocketTxV4::new() } {
             Ok(sock) => {
-                debug!("Raw socket created successfully");
+                debug!("Raw socket (IPv4) created successfully");
                 Some(sock)
             }
             Err(e) => {
-                error!("Failed to create raw socket (need admin?): {}", e);
+                error!("Failed to create IPv4 raw socket (need admin?): {}", e);
+                None
+            }
+        };
+
+        let raw_sock_v6 = match unsafe { RawSocketTxV6::new() } {
+            Ok(sock) => {
+                debug!("Raw socket (IPv6) created successfully");
+                Some(sock)
+            }
+            Err(e) => {
+                warn!("Failed to create IPv6 raw socket (need admin?): {}", e);
                 None
             }
         };
@@ -220,7 +232,8 @@ impl PacketEngine {
 
         Ok(Self {
             divert: ArcSwap::new(Arc::new(Some(divert))),
-            raw_sock,
+            raw_sock_v4,
+            raw_sock_v6,
             stats: PacketStats::new(),
             mode: EngineMode::WinDivert,
         })
@@ -228,11 +241,13 @@ impl PacketEngine {
 
     /// Создаёт движок без WinDivert (API-only режим).
     pub fn new_api_only() -> Self {
-        let raw_sock = unsafe { RawSocketTx::new() }.ok();
+        let raw_sock_v4 = unsafe { RawSocketTxV4::new() }.ok();
+        let raw_sock_v6 = unsafe { RawSocketTxV6::new() }.ok();
 
         Self {
             divert: ArcSwap::new(Arc::new(None)),
-            raw_sock,
+            raw_sock_v4,
+            raw_sock_v6,
             stats: PacketStats::new(),
             mode: EngineMode::ApiOnly,
         }
@@ -334,11 +349,28 @@ impl PacketEngine {
     ///
     /// **ТОЛЬКО для UDP и ICMP!** TCP пакеты через raw socket
     /// молча дропаются Windows (XP SP2+). Для TCP используйте `inject_via_divert()`.
+    ///
+    /// Автоматически выбирает IPv4 или IPv6 raw socket по версии пакета (первый полубайт).
     pub fn inject_raw_udp(&self, packet: &[u8]) -> Result<()> {
-        let Some(ref sock) = self.raw_sock else {
-            anyhow::bail!("Raw socket not available");
-        };
-        sock.send(packet)?;
+        if packet.is_empty() {
+            anyhow::bail!("Empty packet");
+        }
+        let version = packet[0] >> 4;
+        match version {
+            4 => {
+                let Some(ref sock) = self.raw_sock_v4 else {
+                    anyhow::bail!("Raw socket (IPv4) not available");
+                };
+                sock.send(packet)?;
+            }
+            6 => {
+                let Some(ref sock) = self.raw_sock_v6 else {
+                    anyhow::bail!("Raw socket (IPv6) not available");
+                };
+                sock.send(packet)?;
+            }
+            _ => anyhow::bail!("Unknown IP version: {}", version),
+        }
         self.stats.packets_injected.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -401,9 +433,19 @@ impl PacketEngine {
         self.divert.load().is_some()
     }
 
-    /// Проверяет, доступен ли raw socket.
+    /// Проверяет, доступен ли хотя бы один raw socket (IPv4 или IPv6).
     pub fn has_raw_socket(&self) -> bool {
-        self.raw_sock.is_some()
+        self.raw_sock_v4.is_some() || self.raw_sock_v6.is_some()
+    }
+
+    /// Проверяет, доступен ли IPv4 raw socket.
+    pub fn has_raw_socket_v4(&self) -> bool {
+        self.raw_sock_v4.is_some()
+    }
+
+    /// Проверяет, доступен ли IPv6 raw socket.
+    pub fn has_raw_socket_v6(&self) -> bool {
+        self.raw_sock_v6.is_some()
     }
 
     /// Асинхронная версия `disable_offload` — не блокирует вызывающий поток.
@@ -494,16 +536,16 @@ pub struct PacketStatsSnapshot {
     pub packets_dropped: u64,
 }
 
-/// Raw socket для инъекции пакетов с полным IP header.
+/// Raw socket для инъекции IPv4 пакетов с полным IP header.
 ///
 /// Использует `WSASocketW(AF_INET, SOCK_RAW, IPPROTO_RAW)` с `IP_HDRINCL`.
 /// Позволяет отправлять пакеты с произвольным IP, TCP, UDP header.
-struct RawSocketTx {
+struct RawSocketTxV4 {
     sock: std::net::UdpSocket, // используется для sendto
 }
 
-impl RawSocketTx {
-    /// Создаёт raw socket.
+impl RawSocketTxV4 {
+    /// Создаёт IPv4 raw socket.
     ///
     /// # Требования
     /// - Admin elevation (UAC или запуск от SYSTEM)
@@ -544,7 +586,7 @@ impl RawSocketTx {
         Ok(Self { sock: udp })
     }
 
-    /// Отправляет raw IP пакет.
+    /// Отправляет raw IPv4 пакет.
     ///
     /// Пакет должен содержать полный IP header + payload.
     /// sendto на raw socket игнорирует адрес назначения — он берётся из IP header.
@@ -553,6 +595,70 @@ impl RawSocketTx {
         let sent = self.sock.send_to(packet, addr)?;
         if sent != packet.len() {
             anyhow::bail!("sendto sent {} of {} bytes", sent, packet.len());
+        }
+        Ok(())
+    }
+}
+
+/// Raw socket для инъекции IPv6 пакетов с полным IP header.
+///
+/// Использует `WSASocketW(AF_INET6, SOCK_RAW, IPPROTO_RAW)` с `IPV6_HDRINCL`.
+struct RawSocketTxV6 {
+    sock: std::net::UdpSocket,
+}
+
+impl RawSocketTxV6 {
+    /// Создаёт IPv6 raw socket.
+    ///
+    /// # Требования
+    /// - Admin elevation (UAC или запуск от SYSTEM)
+    /// - Windows 10/11
+    ///
+    /// # Safety
+    /// Требует admin прав; создаёт raw socket с `IPV6_HDRINCL`.
+    unsafe fn new() -> Result<Self> {
+        use windows::Win32::Networking::WinSock::*;
+
+        let sock = WSASocketW(AF_INET6.0 as i32, SOCK_RAW.0, IPPROTO_RAW.0, None, 0, 0)?;
+
+        if sock == INVALID_SOCKET {
+            anyhow::bail!("WSASocketW (IPv6) failed: {}", WSAGetLastError().0);
+        }
+
+        // IPV6_HDRINCL: весь IPv6 header включён в пакет
+        // Константа 24 согласно MSDN (ws2ipdef.h), windows crate 0.62 даёт 2 — используем кастом.
+        const IPV6_HDRINCL: i32 = 24;
+        let opt: u32 = 1;
+        let opt_ptr = &opt as *const u32 as *const u8;
+        let result = setsockopt(
+            sock,
+            IPPROTO_IPV6.0,
+            IPV6_HDRINCL,
+            Some(std::slice::from_raw_parts(
+                opt_ptr,
+                std::mem::size_of::<u32>(),
+            )),
+        );
+        if result == SOCKET_ERROR {
+            let _ = closesocket(sock);
+            anyhow::bail!("setsockopt(IPV6_HDRINCL) failed: {}", WSAGetLastError().0);
+        }
+
+        // Преобразуем SOCKET в std::net::UdpSocket для sendto
+        use std::os::windows::io::{FromRawSocket, OwnedSocket};
+        let owned = OwnedSocket::from_raw_socket(sock.0 as u64 as std::os::windows::raw::SOCKET);
+        let udp = std::net::UdpSocket::from(owned);
+        Ok(Self { sock: udp })
+    }
+
+    /// Отправляет raw IPv6 пакет.
+    ///
+    /// Пакет должен содержать полный IPv6 header + payload.
+    fn send(&self, packet: &[u8]) -> Result<()> {
+        let addr = std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+        let sent = self.sock.send_to(packet, addr)?;
+        if sent != packet.len() {
+            anyhow::bail!("sendto (IPv6) sent {} of {} bytes", sent, packet.len());
         }
         Ok(())
     }

@@ -19,7 +19,8 @@
 use crate::desync::{parse_ip_header, DesyncResult};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::ipv4::MutableIpv4Packet;
-use std::net::Ipv4Addr;
+use pnet_packet::ipv6::MutableIpv6Packet;
+use std::net::{IpAddr, Ipv4Addr};
 use tracing::debug;
 
 /// [RP8] Entropy padding: Popcount/Shannon padding.
@@ -43,7 +44,7 @@ pub fn entropy_padding(packet: &[u8], target_entropy: f64, fake_ttl_offset: u8) 
         None => return DesyncResult::passthrough(),
     };
 
-    let payload = &packet[ip.header_len..];
+    let payload = &packet[ip.header_len()..];
     if payload.is_empty() {
         return DesyncResult::passthrough();
     }
@@ -64,15 +65,15 @@ pub fn entropy_padding(packet: &[u8], target_entropy: f64, fake_ttl_offset: u8) 
     // Генерируем padding с целевой энтропией
     let padding = generate_entropy_padding(pad_size, target_entropy);
 
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_seg = build_udp_like_segment(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         443,
         443,
         &padding,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!(
@@ -160,7 +161,7 @@ pub fn pad_size(packet: &[u8], target_size: usize, fake_ttl_offset: u8) -> Desyn
         None => return DesyncResult::passthrough(),
     };
 
-    let payload = &packet[ip.header_len..];
+    let payload = &packet[ip.header_len()..];
     if payload.is_empty() || packet.len() >= target_size {
         return DesyncResult::passthrough();
     }
@@ -168,15 +169,15 @@ pub fn pad_size(packet: &[u8], target_size: usize, fake_ttl_offset: u8) -> Desyn
     let pad_needed = target_size - packet.len();
     let padding: Vec<u8> = (0..pad_needed).map(|i| (i * 0x17) as u8).collect();
 
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_seg = build_udp_like_segment(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         443,
         443,
         &padding,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!(
@@ -226,9 +227,9 @@ pub fn xor_first(packet: &[u8], n: usize, key: u8) -> DesyncResult {
             modified[ip_header_len + 17] = 0;
         }
         if ip_header_len + tcp_len(modified.len(), ip_header_len) <= modified.len() {
-            let tcp_csum = crate::desync::tcp_checksum_v4(
-                src,
-                dst,
+            let tcp_csum = crate::desync::tcp_checksum(
+                IpAddr::V4(src),
+                IpAddr::V4(dst),
                 &modified[ip_header_len..ip_header_len + tcp_len(modified.len(), ip_header_len)],
             );
             if ip_header_len + 18 <= modified.len() {
@@ -301,7 +302,7 @@ pub fn wg_obfs(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
         None => return DesyncResult::passthrough(),
     };
 
-    let udp_start = ip.header_len + 8;
+    let udp_start = ip.header_len() + 8;
     if udp_start >= packet.len() {
         return DesyncResult::passthrough();
     }
@@ -315,15 +316,15 @@ pub fn wg_obfs(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
     wg_payload.extend_from_slice(&[0u8; 4]); // receiver index
     wg_payload.extend_from_slice(payload);
 
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_udp = crate::desync::quic::build_udp_packet(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         12345,
         443,
         &wg_payload,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!(
@@ -381,12 +382,12 @@ pub fn udp2icmp(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
         None => return DesyncResult::passthrough(),
     };
 
-    if ip.protocol.0 != 17 {
+    if ip.protocol().0 != 17 {
         // UDP
         return DesyncResult::passthrough();
     }
 
-    let udp_start = ip.header_len + 8;
+    let udp_start = ip.header_len() + 8;
     if udp_start >= packet.len() {
         return DesyncResult::passthrough();
     }
@@ -406,13 +407,13 @@ pub fn udp2icmp(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
     let icmp_csum = icmp_checksum(&icmp_payload);
     icmp_payload[2..4].copy_from_slice(&icmp_csum.to_be_bytes());
 
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_icmp = build_icmp_packet(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         &icmp_payload,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!(
@@ -426,11 +427,11 @@ pub fn udp2icmp(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
 
 // ==================== Вспомогательные функции ====================
 
-/// Строит UDP-подобный сегмент (для инъекции).
+/// Строит UDP-подобный сегмент (для инъекции, IPv4 или IPv6).
 #[allow(clippy::too_many_arguments)]
 fn build_udp_like_segment(
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
     src_port: u16,
     dst_port: u16,
     payload: &[u8],
@@ -438,81 +439,214 @@ fn build_udp_like_segment(
     identification: u16,
 ) -> bytes::Bytes {
     let udp_len = 8 + payload.len();
-    let total_len = 20 + udp_len;
 
-    let mut buf = bytes::BytesMut::with_capacity(total_len);
-    buf.resize(total_len, 0);
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src_v4), IpAddr::V4(dst_v4)) => {
+            let total_len = 20 + udp_len;
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
 
-    // IP Header
-    {
-        let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
-        ip.set_version(4);
-        ip.set_header_length(5);
-        ip.set_total_length(total_len as u16);
-        ip.set_identification(identification);
-        ip.set_flags(0);
-        ip.set_fragment_offset(0);
-        ip.set_ttl(ttl);
-        ip.set_next_level_protocol(IpNextHeaderProtocols::Udp);
-        ip.set_source(src_ip);
-        ip.set_destination(dst_ip);
+            {
+                let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
+                ip.set_version(4);
+                ip.set_header_length(5);
+                ip.set_total_length(total_len as u16);
+                ip.set_identification(identification);
+                ip.set_flags(0);
+                ip.set_fragment_offset(0);
+                ip.set_ttl(ttl);
+                ip.set_next_level_protocol(IpNextHeaderProtocols::Udp);
+                ip.set_source(src_v4);
+                ip.set_destination(dst_v4);
+            }
+
+            let ip_csum = crate::desync::ipv4_checksum(&buf[..20]);
+            buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+            buf[20] = (src_port >> 8) as u8;
+            buf[21] = src_port as u8;
+            buf[22] = (dst_port >> 8) as u8;
+            buf[23] = dst_port as u8;
+            buf[24] = (udp_len >> 8) as u8;
+            buf[25] = udp_len as u8;
+            buf[26] = 0;
+            buf[27] = 0;
+
+            buf[28..28 + payload.len()].copy_from_slice(payload);
+
+            let udp_csum = crate::desync::tcp_checksum(
+                IpAddr::V4(src_v4),
+                IpAddr::V4(dst_v4),
+                &buf[20..20 + udp_len],
+            );
+            buf[26..28].copy_from_slice(&udp_csum.to_be_bytes());
+
+            buf.freeze()
+        }
+        (IpAddr::V6(src_v6), IpAddr::V6(dst_v6)) => {
+            let total_len = 40 + udp_len;
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
+
+            {
+                let mut ip = MutableIpv6Packet::new(&mut buf).unwrap();
+                ip.set_version(6);
+                ip.set_traffic_class(0);
+                ip.set_flow_label(0);
+                ip.set_payload_length(udp_len as u16);
+                ip.set_next_header(IpNextHeaderProtocols::Udp);
+                ip.set_hop_limit(ttl);
+                ip.set_source(src_v6);
+                ip.set_destination(dst_v6);
+            }
+
+            buf[40] = (src_port >> 8) as u8;
+            buf[41] = src_port as u8;
+            buf[42] = (dst_port >> 8) as u8;
+            buf[43] = dst_port as u8;
+            buf[44] = (udp_len >> 8) as u8;
+            buf[45] = udp_len as u8;
+            buf[46] = 0;
+            buf[47] = 0;
+
+            buf[48..48 + payload.len()].copy_from_slice(payload);
+
+            let udp_csum = crate::desync::tcp_checksum(
+                IpAddr::V6(src_v6),
+                IpAddr::V6(dst_v6),
+                &buf[40..40 + udp_len],
+            );
+            buf[46..48].copy_from_slice(&udp_csum.to_be_bytes());
+
+            buf.freeze()
+        }
+        _ => {
+            tracing::warn!("build_udp_like_segment: mixed V4/V6 src/dst, using V4 fallback");
+            let src_v4 = match src_ip {
+                IpAddr::V4(v4) => v4,
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+            let dst_v4 = match dst_ip {
+                IpAddr::V4(v4) => v4,
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+            let total_len = 20 + udp_len;
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
+            let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
+            ip.set_version(4);
+            ip.set_header_length(5);
+            ip.set_total_length(total_len as u16);
+            ip.set_identification(identification);
+            ip.set_flags(0);
+            ip.set_fragment_offset(0);
+            ip.set_ttl(ttl);
+            ip.set_next_level_protocol(IpNextHeaderProtocols::Udp);
+            ip.set_source(src_v4);
+            ip.set_destination(dst_v4);
+            let ip_csum = crate::desync::ipv4_checksum(&buf[..20]);
+            buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+            buf[20] = (src_port >> 8) as u8;
+            buf[21] = src_port as u8;
+            buf[22] = (dst_port >> 8) as u8;
+            buf[23] = dst_port as u8;
+            buf[24] = (udp_len >> 8) as u8;
+            buf[25] = udp_len as u8;
+            buf[26] = 0;
+            buf[27] = 0;
+            buf[28..28 + payload.len()].copy_from_slice(payload);
+            buf.freeze()
+        }
     }
-
-    let ip_csum = crate::desync::ipv4_checksum(&buf[..20]);
-    buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-
-    // UDP Header
-    buf[20] = (src_port >> 8) as u8;
-    buf[21] = src_port as u8;
-    buf[22] = (dst_port >> 8) as u8;
-    buf[23] = dst_port as u8;
-    buf[24] = (udp_len >> 8) as u8;
-    buf[25] = udp_len as u8;
-    buf[26] = 0; // Checksum
-    buf[27] = 0;
-
-    // Payload
-    buf[28..28 + payload.len()].copy_from_slice(payload);
-
-    buf.freeze()
 }
 
-/// Строит ICMP пакет.
+/// Строит ICMP пакет (IPv4 или IPv6).
 #[allow(clippy::too_many_arguments)]
 fn build_icmp_packet(
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
     icmp_payload: &[u8],
     ttl: u8,
     identification: u16,
 ) -> bytes::Bytes {
-    let total_len = 20 + icmp_payload.len();
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src_v4), IpAddr::V4(dst_v4)) => {
+            let total_len = 20 + icmp_payload.len();
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
 
-    let mut buf = bytes::BytesMut::with_capacity(total_len);
-    buf.resize(total_len, 0);
+            {
+                let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
+                ip.set_version(4);
+                ip.set_header_length(5);
+                ip.set_total_length(total_len as u16);
+                ip.set_identification(identification);
+                ip.set_flags(0);
+                ip.set_fragment_offset(0);
+                ip.set_ttl(ttl);
+                ip.set_next_level_protocol(IpNextHeaderProtocols::Icmp);
+                ip.set_source(src_v4);
+                ip.set_destination(dst_v4);
+            }
 
-    // IP Header
-    {
-        let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
-        ip.set_version(4);
-        ip.set_header_length(5);
-        ip.set_total_length(total_len as u16);
-        ip.set_identification(identification);
-        ip.set_flags(0);
-        ip.set_fragment_offset(0);
-        ip.set_ttl(ttl);
-        ip.set_next_level_protocol(IpNextHeaderProtocols::Icmp);
-        ip.set_source(src_ip);
-        ip.set_destination(dst_ip);
+            let ip_csum = crate::desync::ipv4_checksum(&buf[..20]);
+            buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+            buf[20..20 + icmp_payload.len()].copy_from_slice(icmp_payload);
+
+            buf.freeze()
+        }
+        (IpAddr::V6(src_v6), IpAddr::V6(dst_v6)) => {
+            let total_len = 40 + icmp_payload.len();
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
+
+            {
+                let mut ip = MutableIpv6Packet::new(&mut buf).unwrap();
+                ip.set_version(6);
+                ip.set_traffic_class(0);
+                ip.set_flow_label(0);
+                ip.set_payload_length(icmp_payload.len() as u16);
+                ip.set_next_header(IpNextHeaderProtocols::Icmp);
+                ip.set_hop_limit(ttl);
+                ip.set_source(src_v6);
+                ip.set_destination(dst_v6);
+            }
+
+            buf[40..40 + icmp_payload.len()].copy_from_slice(icmp_payload);
+
+            buf.freeze()
+        }
+        _ => {
+            tracing::warn!("build_icmp_packet: mixed V4/V6 src/dst, using V4 fallback");
+            let src_v4 = match src_ip {
+                IpAddr::V4(v4) => v4,
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+            let dst_v4 = match dst_ip {
+                IpAddr::V4(v4) => v4,
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+            let total_len = 20 + icmp_payload.len();
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
+            let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
+            ip.set_version(4);
+            ip.set_header_length(5);
+            ip.set_total_length(total_len as u16);
+            ip.set_identification(identification);
+            ip.set_flags(0);
+            ip.set_fragment_offset(0);
+            ip.set_ttl(ttl);
+            ip.set_next_level_protocol(IpNextHeaderProtocols::Icmp);
+            ip.set_source(src_v4);
+            ip.set_destination(dst_v4);
+            let ip_csum = crate::desync::ipv4_checksum(&buf[..20]);
+            buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+            buf[20..20 + icmp_payload.len()].copy_from_slice(icmp_payload);
+            buf.freeze()
+        }
     }
-
-    let ip_csum = crate::desync::ipv4_checksum(&buf[..20]);
-    buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-
-    // ICMP payload
-    buf[20..20 + icmp_payload.len()].copy_from_slice(icmp_payload);
-
-    buf.freeze()
 }
 
 /// Вычисляет ICMP checksum.
@@ -590,8 +724,8 @@ mod tests {
     #[test]
     fn test_build_icmp_packet() {
         let pkt = build_icmp_packet(
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(8, 8, 8, 8),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             &[0x08, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x01],
             64,
             1,
@@ -603,8 +737,8 @@ mod tests {
     #[test]
     fn test_build_udp_like_segment() {
         let pkt = build_udp_like_segment(
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(8, 8, 8, 8),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             12345,
             443,
             &[0x01, 0x02],

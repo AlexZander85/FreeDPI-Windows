@@ -3613,8 +3613,8 @@ WinDivert recv ──→ bytes::Bytes::copy_from_slice (1 копия)
 
 ### 25.1 Назначение
 
-DPI Probe Module — автономный модуль (не зависит от WinDivert) для определения типа DPI-блокировки
-для конкретного домена/IP. На основе результатов probe'а рекомендует стратегию desync.
+DPI Probe Module — автономный модуль (не зависит от WinDivert) для превентивного определения типа DPI-блокировки
+для конкретного домена/IP. На основе результатов probe'а и сигналов временных аномалий он принимает взвешенное решение о необходимости туннелирования и рекомендует оптимальную стратегию desync.
 
 **Источники:** Ladon, dpi-detector, dpi-checkers, ByeByeDPI.
 
@@ -3622,14 +3622,19 @@ DPI Probe Module — автономный модуль (не зависит от
 
 ```
 core/src/probe/
-├── mod.rs              # ProbeModule orchestrator (5 phases + accumulator)
+├── mod.rs              # ProbeModule orchestrator (7-phase pipeline + integration)
 ├── config.rs           # ProbeConfig (21 поле: DNS/TCP/TLS/HTTP/TCP16/Accumulation/RKN)
-├── classifier.rs       # FailureCode enum (6 DNS + 6 TCP + 15 TLS + 7 HTTP + ConnectionStage)
+├── classifier.rs       # FailureCode enum & Default implementations for all 19 data structures
 ├── dns_probe.rs        # Phase 1: DNS Integrity (UDP vs DoH cross-validation)
 ├── tcp_probe.rs        # Phase 2: TCP Connectivity (parallel dial racing)
-├── tls_probe.rs        # Phase 3: TLS Staged Handshake (1.3 → 1.2, native-tls)
+├── tls_probe.rs        # Phase 3: TLS Staged Handshake (raw socket Hello + native-tls verdict)
 ├── http_probe.rs       # Phase 4: HTTP Application Layer (GET, cutoff, 451, stub)
 ├── tcp16_probe.rs      # Phase 5: Data-Volume (raw TcpStream, 16×4KB HEAD requests)
+├── ja4_probe.rs        # Phase 6: JA4 Fingerprint Probe (4 ClientHello profiles to detect signature blocks)
+├── quic_probe.rs       # Phase 7: QUIC Probe (UDP raw QUIC Initial builder with AES-128-GCM protection)
+├── timing_probe.rs     # Timing metrics accumulator (17 RTT/jitter features)
+├── ml_classifier.rs    # Logistic regression (sigmoid) timing anomaly classifier
+├── decision_engine.rs  # Decision Engine (weighted signal merger & confidence adjustments)
 ├── discriminator.rs    # Server-active vs Path-active classification
 ├── accumulator.rs      # 24h temporal accumulation + eTLD+1 family expansion
 ├── strategy_map.rs     # ProbeResult → StrategyRecommendation mapping
@@ -3642,23 +3647,38 @@ core/src/probe/
 ```
 ProbeModule::probe(domain)
   │
-  ├─ Phase 1: DnsProbe ──────► DnsProbeResult { verdict, udp_ips, doh_ips, fake_ip_detected }
+  ├─ Phase 1: DnsProbe ──────► DnsProbeResult { verdict, udp_ips, doh_ips, udp_rtt_ms, doh_rtt_ms, ... }
   │   (UDP/53 vs DoH cross-validation, fake-IP detection 198.18.0.0/15, 100.64.0.0/10)
   │
   ├─ Phase 2: TcpProbe ──────► TcpProbeResult { verdict, rtt_us, ip }
   │   (parallel dial racing по N IP)
   │
-  ├─ Phase 3: TlsProbe ──────► TlsProbeResult { verdict, tls13_ok, tls12_ok, stage }
-  │   (staged: TLS 1.3 → TLS 1.2, Version12Only detection)
+  ├─ Phase 3: TlsProbe ──────► TlsProbeResult { verdict, server_hello_size, cert_count, negotiated_version, ... }
+  │   (staged TLS: raw socket handshake features + native-tls 1.3 → 1.2 verdict)
   │
-  ├─ Phase 4: HttpProbe ─────► HttpProbeResult { verdict, bytes_read, redirect_url }
+  ├─ Phase 4: HttpProbe ─────► HttpProbeResult { verdict, bytes_read, redirect_url, first_byte_rtt_ms, ... }
   │   (GET /, 451, cutoff, foreign redirect, RKN stub)
   │
   ├─ Phase 5: Tcp16Probe ────► Tcp16ProbeResult { detected, detected_at_kb }
   │   (raw TcpStream keep-alive, 16×4KB HEAD requests, dynamic timeout)
   │
+  ├─ Phase 6: Ja4Probe ──────► Ja4ProbeResult { verdict, blocked_profile, working_profile, ... }
+  │   (4 ClientHello profiles: Chrome, Firefox, Safari, curl to identify fingerprint blocking)
+  │
+  ├─ Phase 7: QuicProbe ─────► QuicProbeResult { response_type, rtt_ms, version, ... }
+  │   (UDP encrypted QUIC Initial to target SNI)
+  │
+  ├─ TimingProbe ────────────► FeatureVector { 17 features: RTTs, payload sizes, ratios, jitter }
+  │   (tracks 11 instants during probe phases to build timed vector)
+  │
+  ├─ MlClassifier ──────────► MlResult { score, verdict, top_features }
+  │   (logistic regression with sigmoid timing anomaly classification)
+  │
   ├─ Discriminator ──────────► DiscriminationResult { origin, verdict, confidence }
   │   (ServerActive vs PathActive vs Ambiguous)
+  │
+  ├─ DecisionEngine ─────────► Decision { verdict, confidence, rationale, signals }
+  │   (weighted combination of hard rules + strong signals + adjustments)
   │
   ├─ Accumulator ────────────► should_tunnel: bool
   │   (24h hot state, promotion to permanent cache, eTLD+1 family expansion)
@@ -3705,7 +3725,28 @@ ProbeModule::probe(domain)
 | Eof | Unexpected EOF | **Blocked** |
 | SilentDrop | TLS hang до timeout | **Blocked** |
 
-### 25.5 Strategy Mapping
+### 25.5 Decision Engine & Timing Anomaly Weighting (T47 / T54)
+
+Для объединения разнородных сигналов в единый вердикт используется **Decision Engine** (`decision_engine.rs`), работающий по ступенчатой схеме принятия решений:
+
+1. **Жесткие правила (Hard Rules)**:
+   - Обнаружение DNS-отравления (`Poisoned`, `NxdomainSpoof`, `EmptySpoof`) сразу возвращает вердикт **Blocked** (confidence: `0.95`).
+   - Перехват DNS-трафика (`Intercepted`) возвращает **Blocked** (confidence: `0.90`).
+   - Активная дискриминация со стороны сервера (`ServerActive`) переопределяет остальные сигналы и возвращает **Clear** (с confidence от дискриминатора).
+   - Частичный обход QUIC (`QuicBypass`) возвращает **Ambiguous** (confidence: `0.70`), сигнализируя о возможности использовать HTTP/3.
+
+2. **Сильные сигналы (Strong Signals)**:
+   - Обнаружение вмешательства на пути (`PathActive`) возвращает **Blocked** с базовой уверенностью из дискриминатора.
+   - Блокировка по фингерпринту JA4 (`FingerprintBlocking`) возвращает **Blocked** (confidence: `0.85`).
+   - Аномалия по результатам ML-классификации (`score >= 0.8`) возвращает **Blocked** (confidence: `score`).
+
+3. **Корректировки уверенности (Confidence Adjustments)**:
+   - Подозрительная оценка ML (`score` в диапазоне `0.3..0.8`) дает дельту `±0.1` к базовой уверенности.
+   - Аномалии сбора признаков T50 (TLS прошел, но `server_hello_size` или `cert_count` равен 0) дают штраф `-0.15` к confidence.
+   - Признак DNS-манипуляций (время DoH значительно меньше UDP RTT: `udp_rtt > 3 * doh_rtt`) дает буст `+0.10`.
+   - Признак DPI-задержки (фаза TLS длится значительно дольше TCP: `tls_rtt > 5 * tcp_rtt`) дает буст `+0.10`.
+
+### 25.6 Strategy Mapping
 
 | Тип блокировки | Рекомендуемая стратегия | Confidence |
 |----------------|------------------------|:----------:|
@@ -3721,7 +3762,7 @@ ProbeModule::probe(domain)
 | HTTP Cutoff | `tcp_window_clamp` | 0.80 |
 | HTTP 451 / Foreign redirect / Stub | `socks5_fallback` | 0.85-0.95 |
 
-### 25.6 Accumulator (24h temporal + eTLD+1)
+### 25.7 Accumulator (24h temporal + eTLD+1)
 
 ```rust
 pub struct Accumulator {
@@ -3734,12 +3775,12 @@ pub struct Accumulator {
 // Family expansion: 10+ поддоменов eTLD+1 заблокированы → весь family flagged
 ```
 
-### 25.7 API Endpoints
+### 25.8 API Endpoints
 
 ```
 POST /api/v1/probe
   { "domain": "rutracker.org", "full": true }
-  → полный pipeline (DNS + TCP + TLS + HTTP + TCP16)
+  → полный pipeline (DNS + TCP + TLS + HTTP + TCP16 + JA4 + QUIC)
 
 POST /api/v1/probe/batch
   { "preset_ids": ["telegram", "discord"], "full": true }
@@ -3752,7 +3793,7 @@ GET /api/v1/probe/history
   → последние 100 результатов probe'ов
 ```
 
-### 25.8 Preset Domain Lists (139+ domains)
+### 25.9 Preset Domain Lists (139+ domains)
 
 | Список | Доменов | Источник |
 |--------|:-------:|----------|
@@ -3765,7 +3806,7 @@ GET /api/v1/probe/history
 | Cloudflare | 4 | ByeByeDPI proxytest_cloudflare.sites |
 | Türkiye | 8 | ByeByeDPI proxytest_türkiye.sites |
 
-### 25.9 GUI Integration (Tauri + React)
+### 25.10 GUI Integration (Tauri + React)
 
 - **ProbePanel.tsx**: Domain input + "Быстрая"/"Полная" кнопки, pipeline visualization, verdict, recommendations, history
 - **ProbePanel.css**: Стили для pipeline, phase cards, verdict banners, preset chips
@@ -3773,16 +3814,14 @@ GET /api/v1/probe/history
 - **System Tray**: "Проверить DPI" пункт → навигация на вкладку probe
 - **Custom Domain Lists**: CRUD для пользовательских списков доменов
 
-### 25.10 Тесты
+### 25.11 Тесты
 
-359 unit tests, включая:
-- DNS cross-validate (7 paths: ok, poisoned, nxdomain, intercepted, empty, doh_blocked, unresolvable)
-- Fake-IP detection (198.18.0.0/15, 100.64.0.0/10)
-- Discriminator rules (11 tests: MITM=Clear, SilentDrop=Blocked, Alert=Ambiguous, Version12Only=Blocked)
-- TCP16 config reading
-- Preset domain counts (telegram=52, discord=21, social=16)
-- Accumulator eTLD+1 expansion
-- Strategy map recommendations
+484+ unit-тестов, включая новые тестовые наборы:
+- Тесты `ja4_probe.rs`: разбор JA4-строк, извлечение размеров ServerHello и подсчет сертификатов.
+- Тесты `quic_probe.rs`: шифрование QUIC Initial пакетов и классификация ответов.
+- Тесты `timing_probe.rs`: замер сетевых таймингов RTT и расчет джиттера.
+- Тесты `ml_classifier.rs`: проверка работы сигмоиды и детекции аномалий.
+- Тесты `decision_engine.rs`: 11 детальных тестов логики принятия вердиктов и корректировок уверенности.
 
 ---
 
@@ -3887,3 +3926,11 @@ FreeProxyPool::refresh()
    - **BadChecksum:** Исправлена передача битых инжектов в `group.rs`, обеспечивая корректное применение техники к сетевому трафику.
    - **MSS Clamping:** Избавлен от операций `splice()` и производит вставку MSS-опции через последовательное выделение памяти в один проход.
    - **TTL Manipulation:** Использование инкрементального обновления контрольной суммы по RFC 1624 для оптимизации производительности в hot path.
+
+4. **Интеграция превентивного зондирования и эволюция до версии 1.1 (T45–T54):**
+   - **7-фазный пайплайн зондирования**: Пайплайн превентивного определения DPI расширен фазами JA4-профилирования (`ja4_probe.rs`) и шифрованного UDP-сканирования QUIC (`quic_probe.rs`) для выявления сигнатурной блокировки ClientHello и возможности QUIC-bypass.
+   - **ML-классификатор временных аномалий**: Реализована логистическая регрессия на 17 признаках с сигмоидой для вычисления вероятности DPI-вмешательства на основе сетевых таймингов и джиттера (`timing_probe.rs`, `ml_classifier.rs`).
+   - **Движок принятия решений (Decision Engine)**: Добавлено взвешенное слияние сигналов (`decision_engine.rs`) на основе жестких приоритетов (hard rules), сильных сигналов и корректировок уверенности по аномалиям сбора признаков T50 (таких как пустые сертификаты или аномальное соотношение RTT фаз).
+   - **Полная поддержка IPv6 (T48 / T52)**: Проведена миграция ядра (connection tracking, классификатор пакетов, desync-технологии, auto-TTL `HopTab`, SEQ Spoofing) на обобщенную поддержку `IpAddr`. Реализованы парсинг цепочек IPv6 Extension Headers и корректный расчет UDP/TCP контрольных сумм с IPv6 псевдозаголовками.
+   - **Закрытие 8 заглушек T52**: Реализованы контентная классификация (TLS/HTTP1/HTTP2), 30 desync-техник, `frag_overlap` с выравниванием по 8 байтам, шифрование QUIC, `HopTab::estimate` для CDN и кэширование исходящих адресов.
+

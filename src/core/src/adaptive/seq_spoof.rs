@@ -33,7 +33,7 @@ use anyhow::Result;
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::ipv4::MutableIpv4Packet;
 use pnet_packet::tcp::MutableTcpPacket;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use tracing::debug;
 
 /// Смещение SEQ для fake ClientHello (насколько далеко от окна).
@@ -78,8 +78,8 @@ pub struct SeqSpoofResult {
 #[allow(clippy::too_many_arguments)]
 pub fn build_seq_spoof_packet(
     fake_sni: &str,
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
     src_port: u16,
     dst_port: u16,
     client_isn: u32,
@@ -88,14 +88,23 @@ pub fn build_seq_spoof_packet(
 ) -> Result<SeqSpoofResult> {
     let fake_ch =
         if let Some(entry) = _conntrack.get(&ConnKey::new(src_ip, dst_ip, src_port, dst_port, 6)) {
-            // Create independent RNG for fake CH (not cloning — PerConnRng is !Clone)
+            let src_u64 = match src_ip {
+                IpAddr::V4(v4) => v4.to_bits() as u64,
+                IpAddr::V6(v6) => {
+                    let bits = v6.to_bits();
+                    (bits >> 64) as u64 ^ bits as u64
+                }
+            };
+            let dst_u64 = match dst_ip {
+                IpAddr::V4(v4) => v4.to_bits() as u64,
+                IpAddr::V6(v6) => {
+                    let bits = v6.to_bits();
+                    (bits >> 64) as u64 ^ bits as u64
+                }
+            };
             let mut rng = crate::desync::rand::PerConnRng::new(
-                (src_ip.to_bits() as u64)
-                    ^ (dst_ip.to_bits() as u64)
-                    ^ ((src_port as u64) << 48)
-                    ^ (dst_port as u64),
+                src_u64 ^ dst_u64 ^ ((src_port as u64) << 48) ^ (dst_port as u64),
             );
-            // T43: учитываем is_resumption для 0-RTT defense
             if entry.is_resumption {
                 ch_gen::build_client_hello_with_resumption(fake_sni, &mut rng, true)
             } else {
@@ -105,23 +114,21 @@ pub fn build_seq_spoof_packet(
             ch_gen::build_client_hello_default(fake_sni)
         };
 
-    // Определяем fake TTL из HopTab
-    let fake_ttl = hop_tab.fake_ttl_for_ip(&dst_ip).unwrap_or(64); // fallback, если нет данных
+    let fake_ttl = hop_tab.fake_ttl_for_ip(&dst_ip).unwrap_or(64);
 
-    // Строим полный IP + TCP пакет
     let packet = build_fake_tcp_packet(
         src_ip,
         dst_ip,
         src_port,
         dst_port,
-        client_isn.wrapping_add(SPOOF_OFFSET), // SEQ вне окна
-        0,                                     // ACK = 0 (fake SYN-like)
+        client_isn.wrapping_add(SPOOF_OFFSET),
+        0,
         &fake_ch,
         fake_ttl,
     )?;
 
     debug!(
-        "SEQ Spoof: {}:{} → {}:{} fake_seq={} real_isn={} fake_ttl={} sni={}",
+        "SEQ Spoof: {} :{} → {} :{} fake_seq={} real_isn={} fake_ttl={} sni={}",
         src_ip,
         src_port,
         dst_ip,
@@ -138,24 +145,10 @@ pub fn build_seq_spoof_packet(
     })
 }
 
-/// Строит fake IP + TCP пакет с payload и указанным SEQ.
-///
-/// # Arguments
-/// * `src_ip` — IP источника
-/// * `dst_ip` — IP назначения
-/// * `src_port` — порт источника
-/// * `dst_port` — порт назначения
-/// * `seq_num` — TCP sequence number (fake, out-of-window)
-/// * `ack_num` — TCP acknowledgement number
-/// * `payload` — данные (TLS ClientHello)
-/// * `ttl` — IP TTL (может быть fake для предотвращения доставки)
-///
-/// # Returns
-/// Полный IP пакет (Vec<u8>), готовый для отправки через raw socket.
 #[allow(clippy::too_many_arguments)]
 fn build_fake_tcp_packet(
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
     src_port: u16,
     dst_port: u16,
     seq_num: u32,
@@ -163,58 +156,120 @@ fn build_fake_tcp_packet(
     payload: &[u8],
     ttl: u8,
 ) -> Result<bytes::Bytes> {
-    const IP_HLEN: usize = 20;
-    const TCP_HLEN: usize = 20;
-    let total_len = IP_HLEN + TCP_HLEN + payload.len();
-
-    let mut buf = bytes::BytesMut::with_capacity(total_len);
-    buf.resize(total_len, 0);
-
-    // --- IP Header (use pnet_packet to set fields, compute checksum after scope) ---
-    {
-        let mut ip = MutableIpv4Packet::new(&mut buf[..IP_HLEN])
-            .ok_or_else(|| anyhow::anyhow!("Failed to create IP packet"))?;
-        ip.set_version(4);
-        ip.set_header_length((IP_HLEN / 4) as u8);
-        ip.set_total_length(total_len as u16);
-        ip.set_ttl(ttl);
-        ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
-        ip.set_source(src_ip);
-        ip.set_destination(dst_ip);
-    }
-    // Write IP checksum manually (after MutableIpv4Packet scope ends)
-    let cksum = ipv4_checksum(&buf[..IP_HLEN]);
-    let cksum_bytes = cksum.to_be_bytes();
-    buf[10] = cksum_bytes[0];
-    buf[11] = cksum_bytes[1];
-
-    // --- TCP Header (use pnet_packet to set fields, compute checksum after scope) ---
-    {
-        let mut tcp = MutableTcpPacket::new(&mut buf[IP_HLEN..])
-            .ok_or_else(|| anyhow::anyhow!("Failed to create TCP packet"))?;
-        tcp.set_source(src_port);
-        tcp.set_destination(dst_port);
-        tcp.set_sequence(seq_num);
-        tcp.set_acknowledgement(ack_num);
-        tcp.set_data_offset((TCP_HLEN / 4) as u8);
-        tcp.set_flags(0x02); // SYN flag
-        tcp.set_window(65535);
-        tcp.set_urgent_ptr(0);
-    }
-    // Copy payload (after TCP header)
-    if !payload.is_empty() {
-        buf[IP_HLEN + TCP_HLEN..][..payload.len()].copy_from_slice(payload);
-    }
-    // Write TCP checksum manually (after MutableTcpPacket scope ends)
-    let cksum = tcp_checksum_v4(&src_ip.octets(), &dst_ip.octets(), &buf[IP_HLEN..]);
-    let cksum_bytes = cksum.to_be_bytes();
-    buf[IP_HLEN + 16] = cksum_bytes[0];
-    buf[IP_HLEN + 17] = cksum_bytes[1];
-
-    Ok(buf.freeze())
+    build_fake_tcp_packet_with_flags(
+        src_ip, dst_ip, src_port, dst_port, seq_num, ack_num, payload, ttl, 0x02, // SYN
+    )
 }
 
-/// Вычисляет IP header checksum.
+#[allow(clippy::too_many_arguments)]
+fn build_fake_tcp_packet_with_flags(
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    seq_num: u32,
+    ack_num: u32,
+    payload: &[u8],
+    ttl: u8,
+    flags: u8,
+) -> Result<bytes::Bytes> {
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            const IP_HLEN: usize = 20;
+            const TCP_HLEN: usize = 20;
+            let total_len = IP_HLEN + TCP_HLEN + payload.len();
+
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
+
+            // --- IP Header ---
+            {
+                let mut ip = MutableIpv4Packet::new(&mut buf[..IP_HLEN])
+                    .ok_or_else(|| anyhow::anyhow!("Failed to create IP packet"))?;
+                ip.set_version(4);
+                ip.set_header_length((IP_HLEN / 4) as u8);
+                ip.set_total_length(total_len as u16);
+                ip.set_ttl(ttl);
+                ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+                ip.set_source(src);
+                ip.set_destination(dst);
+            }
+            let cksum = ipv4_checksum(&buf[..IP_HLEN]);
+            let cksum_bytes = cksum.to_be_bytes();
+            buf[10] = cksum_bytes[0];
+            buf[11] = cksum_bytes[1];
+
+            // --- TCP Header ---
+            {
+                let mut tcp = MutableTcpPacket::new(&mut buf[IP_HLEN..])
+                    .ok_or_else(|| anyhow::anyhow!("Failed to create TCP packet"))?;
+                tcp.set_source(src_port);
+                tcp.set_destination(dst_port);
+                tcp.set_sequence(seq_num);
+                tcp.set_acknowledgement(ack_num);
+                tcp.set_data_offset((TCP_HLEN / 4) as u8);
+                tcp.set_flags(flags);
+                tcp.set_window(65535);
+                tcp.set_urgent_ptr(0);
+                if !payload.is_empty() {
+                    buf[IP_HLEN + TCP_HLEN..][..payload.len()].copy_from_slice(payload);
+                }
+            }
+            let cksum = crate::desync::tcp_checksum(src_ip, dst_ip, &buf[IP_HLEN..]);
+            let cksum_bytes = cksum.to_be_bytes();
+            buf[IP_HLEN + 16] = cksum_bytes[0];
+            buf[IP_HLEN + 17] = cksum_bytes[1];
+
+            Ok(buf.freeze())
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            use pnet_packet::ipv6::MutableIpv6Packet;
+            const IP_HLEN: usize = 40;
+            const TCP_HLEN: usize = 20;
+            let total_len = IP_HLEN + TCP_HLEN + payload.len();
+
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
+
+            // --- IP Header ---
+            {
+                let mut ip = MutableIpv6Packet::new(&mut buf[..IP_HLEN])
+                    .ok_or_else(|| anyhow::anyhow!("Failed to create IPv6 packet"))?;
+                ip.set_version(6);
+                ip.set_payload_length((TCP_HLEN + payload.len()) as u16);
+                ip.set_next_header(IpNextHeaderProtocols::Tcp);
+                ip.set_hop_limit(ttl);
+                ip.set_source(src);
+                ip.set_destination(dst);
+            }
+
+            // --- TCP Header ---
+            {
+                let mut tcp = MutableTcpPacket::new(&mut buf[IP_HLEN..])
+                    .ok_or_else(|| anyhow::anyhow!("Failed to create TCP packet"))?;
+                tcp.set_source(src_port);
+                tcp.set_destination(dst_port);
+                tcp.set_sequence(seq_num);
+                tcp.set_acknowledgement(ack_num);
+                tcp.set_data_offset((TCP_HLEN / 4) as u8);
+                tcp.set_flags(flags);
+                tcp.set_window(65535);
+                tcp.set_urgent_ptr(0);
+                if !payload.is_empty() {
+                    buf[IP_HLEN + TCP_HLEN..][..payload.len()].copy_from_slice(payload);
+                }
+            }
+            let cksum = crate::desync::tcp_checksum(src_ip, dst_ip, &buf[IP_HLEN..]);
+            let cksum_bytes = cksum.to_be_bytes();
+            buf[IP_HLEN + 16] = cksum_bytes[0];
+            buf[IP_HLEN + 17] = cksum_bytes[1];
+
+            Ok(buf.freeze())
+        }
+        _ => anyhow::bail!("Mixed IPv4/IPv6 addresses"),
+    }
+}
+
 fn ipv4_checksum(header: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
@@ -222,56 +277,16 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
         sum += u16::from_be_bytes([header[i], header[i + 1]]) as u32;
         i += 2;
     }
-    // One's complement
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
 }
 
-/// Вычисляет TCP checksum с IPv4 псевдо-header.
-fn tcp_checksum_v4(src_ip: &[u8; 4], dst_ip: &[u8; 4], tcp_segment: &[u8]) -> u16 {
-    // Псевдо-header: src_ip(4) + dst_ip(4) + zeros(1) + proto(1) + tcp_len(2) = 12 байт
-    let tcp_len = tcp_segment.len() as u16;
-    let mut sum: u32 = 0;
-
-    // Псевдо-header
-    sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u32;
-    sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u32;
-    sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u32;
-    sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u32;
-    sum += 6u32; // TCP protocol number
-    sum += tcp_len as u32;
-
-    // TCP segment (с checksum = 0)
-    let mut i = 0;
-    while i + 1 < tcp_segment.len() {
-        sum += u16::from_be_bytes([tcp_segment[i], tcp_segment[i + 1]]) as u32;
-        i += 2;
-    }
-    if i < tcp_segment.len() {
-        sum += (tcp_segment[i] as u32) << 8;
-    }
-
-    // One's complement
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-/// Альтернативная стратегия: fake CH с badsum (dpibreak).
-///
-/// Отличается от `build_seq_spoof_packet` тем, что использует
-/// **неправильную** TCP checksum. Fake пакет гарантированно будет
-/// отброшен сервером (но DPI может его обработать до проверки checksum).
-///
-/// Плюс: не нужен HopTab (fake TTL не обязателен).
-/// Минус: некоторые DPI проверяют checksum.
 pub fn build_seq_spoof_packet_badsum(
     fake_sni: &str,
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
     src_port: u16,
     dst_port: u16,
     client_isn: u32,
@@ -286,11 +301,15 @@ pub fn build_seq_spoof_packet_badsum(
         client_isn.wrapping_add(SPOOF_OFFSET),
         0,
         &fake_ch,
-        64, // TTL не важен для badsum
+        64,
     )?;
 
-    // Инвертируем checksum (делаем заведомо неправильной)
-    let tcp_start = 20; // IP header = 20 bytes
+    let tcp_start = match (src_ip, dst_ip) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => 20,
+        (IpAddr::V6(_), IpAddr::V6(_)) => 40,
+        _ => 20,
+    };
+
     let packet = if packet.len() > tcp_start + 18 {
         let mut m = bytes::BytesMut::from(&packet[..]);
         let cksum = m[tcp_start + 16..tcp_start + 18].to_vec();
@@ -303,7 +322,7 @@ pub fn build_seq_spoof_packet_badsum(
     };
 
     debug!(
-        "SEQ Spoof (badsum): {}:{} → {}:{}",
+        "SEQ Spoof (badsum): {} :{} → {} :{}",
         src_ip, src_port, dst_ip, dst_port
     );
 
@@ -313,62 +332,25 @@ pub fn build_seq_spoof_packet_badsum(
     })
 }
 
-/// Строит fake TCP RST пакет для сброса DPI состояния.
-///
-/// Отправляется сразу после fake CH, чтобы сбить DPI с толку.
 pub fn build_fake_rst_packet(
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
     src_port: u16,
     dst_port: u16,
     seq_num: u32,
     ack_num: u32,
 ) -> Result<bytes::Bytes> {
-    const IP_HLEN: usize = 20;
-    const TCP_HLEN: usize = 20;
-    let total_len = IP_HLEN + TCP_HLEN;
-
-    let mut buf = bytes::BytesMut::with_capacity(total_len);
-    buf.resize(total_len, 0);
-
-    // --- IP Header ---
-    {
-        let mut ip = MutableIpv4Packet::new(&mut buf[..IP_HLEN])
-            .ok_or_else(|| anyhow::anyhow!("Failed to create IP packet"))?;
-        ip.set_version(4);
-        ip.set_header_length((IP_HLEN / 4) as u8);
-        ip.set_total_length(total_len as u16);
-        ip.set_ttl(64);
-        ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
-        ip.set_source(src_ip);
-        ip.set_destination(dst_ip);
-    }
-    // Write IP checksum manually
-    let cksum = ipv4_checksum(&buf[..IP_HLEN]);
-    let cksum_bytes = cksum.to_be_bytes();
-    buf[10] = cksum_bytes[0];
-    buf[11] = cksum_bytes[1];
-
-    // --- TCP Header ---
-    {
-        let mut tcp = MutableTcpPacket::new(&mut buf[IP_HLEN..])
-            .ok_or_else(|| anyhow::anyhow!("Failed to create TCP packet"))?;
-        tcp.set_source(src_port);
-        tcp.set_destination(dst_port);
-        tcp.set_sequence(seq_num);
-        tcp.set_acknowledgement(ack_num);
-        tcp.set_data_offset((TCP_HLEN / 4) as u8);
-        tcp.set_flags(0x04 | 0x10); // RST + ACK
-        tcp.set_window(0);
-        tcp.set_urgent_ptr(0);
-    }
-    // Write TCP checksum manually
-    let cksum = tcp_checksum_v4(&src_ip.octets(), &dst_ip.octets(), &buf[IP_HLEN..]);
-    let cksum_bytes = cksum.to_be_bytes();
-    buf[IP_HLEN + 16] = cksum_bytes[0];
-    buf[IP_HLEN + 17] = cksum_bytes[1];
-
-    Ok(buf.freeze())
+    build_fake_tcp_packet_with_flags(
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq_num,
+        ack_num,
+        &[],
+        64,
+        0x04 | 0x10, // RST + ACK
+    )
 }
 
 #[cfg(test)]
@@ -376,7 +358,7 @@ mod tests {
     use super::*;
     use crate::adaptive::hop_tab::HopTab;
     use crate::conntrack::{ConnState, Conntrack, ConntrackEntry};
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::time::Instant;
 
     fn setup_conntrack() -> Conntrack {
@@ -416,12 +398,12 @@ mod tests {
         let ct = setup_conntrack();
         let ht = HopTab::new();
         let ip = Ipv4Addr::new(142, 250, 185, 46);
-        ht.insert(HopTab::ip_to_u32(&ip), 12);
+        ht.insert(HopTab::ip_to_u32(&IpAddr::V4(ip)), 12);
 
         let result = build_seq_spoof_packet(
             "example.com",
-            Ipv4Addr::new(192, 168, 1, 2),
-            ip,
+            Ipv4Addr::new(192, 168, 1, 2).into(),
+            ip.into(),
             54321,
             443,
             1000,
@@ -441,12 +423,12 @@ mod tests {
         let ct = setup_conntrack();
         let ht = HopTab::new();
         let ip = Ipv4Addr::new(142, 250, 185, 46);
-        ht.insert(HopTab::ip_to_u32(&ip), 12);
+        ht.insert(HopTab::ip_to_u32(&IpAddr::V4(ip)), 12);
 
         let result = build_seq_spoof_packet(
             "test.com",
-            Ipv4Addr::new(192, 168, 1, 2),
-            ip,
+            Ipv4Addr::new(192, 168, 1, 2).into(),
+            ip.into(),
             54321,
             443,
             1000,
@@ -473,12 +455,12 @@ mod tests {
         let ct = setup_conntrack();
         let ht = HopTab::new();
         let ip = Ipv4Addr::new(142, 250, 185, 46);
-        ht.insert(HopTab::ip_to_u32(&ip), 12); // 12 hops
+        ht.insert(HopTab::ip_to_u32(&IpAddr::V4(ip)), 12); // 12 hops
 
         let result = build_seq_spoof_packet(
             "example.com",
-            Ipv4Addr::new(192, 168, 1, 2),
-            ip,
+            Ipv4Addr::new(192, 168, 1, 2).into(),
+            ip.into(),
             54321,
             443,
             1000,
@@ -502,8 +484,8 @@ mod tests {
         // HopTab empty → fallback TTL = 64
         let result = build_seq_spoof_packet(
             "example.com",
-            Ipv4Addr::new(192, 168, 1, 2),
-            ip,
+            Ipv4Addr::new(192, 168, 1, 2).into(),
+            ip.into(),
             54321,
             443,
             1000,
@@ -521,12 +503,12 @@ mod tests {
         let ct = setup_conntrack();
         let ht = HopTab::new();
         let ip = Ipv4Addr::new(142, 250, 185, 46);
-        ht.insert(HopTab::ip_to_u32(&ip), 8);
+        ht.insert(HopTab::ip_to_u32(&IpAddr::V4(ip)), 8);
 
         let result = build_seq_spoof_packet(
             "example.com",
-            Ipv4Addr::new(192, 168, 1, 2),
-            ip,
+            Ipv4Addr::new(192, 168, 1, 2).into(),
+            ip.into(),
             54321,
             443,
             1000,
@@ -548,8 +530,8 @@ mod tests {
     fn test_seq_spoof_badsum() {
         let result = build_seq_spoof_packet_badsum(
             "example.com",
-            Ipv4Addr::new(192, 168, 1, 2),
-            Ipv4Addr::new(142, 250, 185, 46),
+            Ipv4Addr::new(192, 168, 1, 2).into(),
+            Ipv4Addr::new(142, 250, 185, 46).into(),
             54321,
             443,
             1000,
@@ -564,8 +546,8 @@ mod tests {
     #[test]
     fn test_fake_rst_packet() {
         let pkt = build_fake_rst_packet(
-            Ipv4Addr::new(192, 168, 1, 2),
-            Ipv4Addr::new(142, 250, 185, 46),
+            Ipv4Addr::new(192, 168, 1, 2).into(),
+            Ipv4Addr::new(142, 250, 185, 46).into(),
             54321,
             443,
             1001,
@@ -590,18 +572,6 @@ mod tests {
             0x01, 0x01, 0x08, 0x08, 0x08, 0x08,
         ];
         let cksum = ipv4_checksum(&header);
-        assert!(cksum != 0);
-    }
-
-    #[test]
-    fn test_tcp_checksum_v4() {
-        let src = [192, 168, 1, 1];
-        let dst = [8, 8, 8, 8];
-        let tcp = vec![
-            0x00, 0x35, 0x01, 0xbb, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02,
-            0x71, 0x10, 0x00, 0x00, 0x00, 0x00,
-        ];
-        let cksum = tcp_checksum_v4(&src, &dst, &tcp);
         assert!(cksum != 0);
     }
 
@@ -638,12 +608,12 @@ mod tests {
 
         let ht = HopTab::new();
         let ip = Ipv4Addr::new(142, 250, 185, 46);
-        ht.insert(HopTab::ip_to_u32(&ip), 10);
+        ht.insert(HopTab::ip_to_u32(&IpAddr::V4(ip)), 10);
 
         let result = build_seq_spoof_packet(
             "example.com",
-            Ipv4Addr::new(192, 168, 1, 2),
-            ip,
+            Ipv4Addr::new(192, 168, 1, 2).into(),
+            ip.into(),
             54321,
             443,
             1000,
@@ -681,5 +651,67 @@ mod tests {
             found_ticket_non_empty,
             "Resumption CH should have non-empty session_ticket"
         );
+    }
+
+    #[test]
+    fn test_seq_spoof_ipv6() {
+        use std::net::Ipv6Addr;
+        let ct = Conntrack::default();
+        let key = crate::conntrack::ConnKey::new(
+            Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+            54321,
+            443,
+            6,
+        );
+        let entry = ConntrackEntry {
+            client_isn: 1000,
+            server_isn: 5000,
+            client_seq: 1001,
+            server_seq: 5001,
+            client_ack: 5001,
+            server_ack: 1001,
+            rtt_us: 50000,
+            state: ConnState::SynReceived,
+            desync_applied: false,
+            dscp_spoof: 0,
+            strategy_id: 0,
+            last_activity: Instant::now(),
+            dup_ack_count: 0,
+            rng: None,
+            quic_pn: 0,
+            quic_dcid: vec![],
+            is_resumption: false,
+        };
+        ct.insert(key, entry);
+
+        let ht = HopTab::new();
+        let src_ip = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
+        let dst_ip = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+
+        let result = build_seq_spoof_packet(
+            "example.com",
+            IpAddr::V6(src_ip),
+            IpAddr::V6(dst_ip),
+            54321,
+            443,
+            1000,
+            &ct,
+            &ht,
+        )
+        .unwrap();
+
+        let packet_len = result.fake_packet.len();
+        assert!(
+            packet_len >= 572,
+            "IPv6 packet too small: {} bytes",
+            packet_len
+        );
+
+        let pkt = &result.fake_packet;
+        assert_eq!(pkt[0] >> 4, 6); // IPv6 version
+        assert_eq!(pkt[6], 6); // TCP next header
+        assert_eq!(&pkt[8..24], src_ip.octets().as_slice());
+        assert_eq!(&pkt[24..40], dst_ip.octets().as_slice());
     }
 }

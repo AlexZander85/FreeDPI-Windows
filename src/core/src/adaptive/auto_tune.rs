@@ -194,16 +194,16 @@ impl AutoTune {
     pub fn all_metrics(&self) -> std::collections::HashMap<String, StrategySnapshot> {
         self.strategy_indices
             .iter()
-            .filter_map(|(name, &idx)| {
+            .map(|(name, &idx)| {
                 let m = &self.metrics[idx];
-                Some((
+                (
                     name.clone(),
                     StrategySnapshot {
                         success_count: m.success_count.load(Ordering::Relaxed),
                         fail_count: m.fail_count.load(Ordering::Relaxed),
                         avg_latency_us: m.avg_latency_us(),
                     },
-                ))
+                )
             })
             .collect()
     }

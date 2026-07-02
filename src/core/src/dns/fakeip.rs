@@ -23,7 +23,7 @@
 //! FakeIP DNS (dns.fakeip).
 
 use dashmap::DashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tracing::debug;
@@ -41,12 +41,13 @@ const FAKEIP_MASK: u32 = 0x00FF_FFFF;
 ///
 /// # Пример
 /// ```rust
+/// use std::net::{IpAddr, Ipv4Addr};
 /// use freedpi_core::dns::fakeip::FakeIpManager;
 ///
 /// let manager = FakeIpManager::new(10_000);
-/// let ip = manager.allocate("example.com").unwrap();
+/// let ip: Ipv4Addr = manager.allocate("example.com").unwrap();
 /// assert!(FakeIpManager::is_fake_ip(&ip));
-/// assert_eq!(manager.lookup(&ip), Some("example.com".to_string()));
+/// assert_eq!(manager.lookup(&IpAddr::V4(ip)), Some("example.com".to_string()));
 /// ```
 pub struct FakeIpManager {
     /// Маппинг domain → fake IP
@@ -124,8 +125,11 @@ impl FakeIpManager {
     ///
     /// # Returns
     /// `Some(String)` с доменом, если IP найден в маппинге
-    pub fn lookup(&self, fake_ip: &Ipv4Addr) -> Option<String> {
-        self.ip_to_domain.get(fake_ip).map(|d| d.clone())
+    pub fn lookup(&self, fake_ip: &IpAddr) -> Option<String> {
+        match fake_ip {
+            IpAddr::V4(v4) => self.ip_to_domain.get(v4).map(|d| d.clone()),
+            IpAddr::V6(_) => None,
+        }
     }
 
     /// Удаляет маппинг для домена.
@@ -194,7 +198,7 @@ mod tests {
         assert!(FakeIpManager::is_fake_ip(&ip));
         assert!(ip.octets()[0] == 10);
 
-        let domain = manager.lookup(&ip);
+        let domain = manager.lookup(&IpAddr::V4(ip));
         assert_eq!(domain, Some("example.com".to_string()));
     }
 
@@ -220,7 +224,7 @@ mod tests {
         let ip = manager.allocate("example.com").unwrap();
 
         manager.remove("example.com");
-        assert!(manager.lookup(&ip).is_none());
+        assert!(manager.lookup(&IpAddr::V4(ip)).is_none());
         assert_eq!(manager.len(), 0);
     }
 

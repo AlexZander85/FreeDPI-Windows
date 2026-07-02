@@ -1,8 +1,9 @@
 //! Packet Classifier — классификация пакетов по протоколу и направлению.
+//! Поддерживает IPv4 и IPv6.
 
 use crate::conntrack::ConnKey;
-use pnet_packet::{ipv4::Ipv4Packet, tcp::TcpPacket, udp::UdpPacket};
-use std::net::Ipv4Addr;
+use pnet_packet::{ipv4::Ipv4Packet, ipv6::Ipv6Packet, tcp::TcpPacket, udp::UdpPacket};
+use std::net::IpAddr;
 
 /// Направление пакета относительно origin.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -16,10 +17,10 @@ pub enum PacketDirection {
 /// Классифицированный пакет.
 #[derive(Debug)]
 pub struct ClassifiedPacket {
-    /// Исходный IP
-    pub src_ip: Ipv4Addr,
-    /// IP назначения
-    pub dst_ip: Ipv4Addr,
+    /// Исходный IP (IPv4 или IPv6)
+    pub src_ip: IpAddr,
+    /// IP назначения (IPv4 или IPv6)
+    pub dst_ip: IpAddr,
     /// Порт источника
     pub src_port: u16,
     /// Порт назначения
@@ -56,18 +57,55 @@ pub enum Classification {
 pub struct Classifier;
 
 impl Classifier {
-    /// Классифицирует raw IP пакет.
+    /// Классифицирует raw IP пакет (IPv4 или IPv6).
     pub fn classify(packet: &[u8]) -> Classification {
+        if packet.is_empty() {
+            return Classification::Unknown;
+        }
+        let version = packet[0] >> 4;
+        match version {
+            4 => Self::classify_ipv4(packet),
+            6 => Self::classify_ipv6(packet),
+            _ => Classification::Unknown,
+        }
+    }
+
+    fn classify_ipv4(packet: &[u8]) -> Classification {
         let ip = match Ipv4Packet::new(packet) {
             Some(ip) => ip,
             None => return Classification::Unknown,
         };
 
-        let src_ip = ip.get_source();
-        let dst_ip = ip.get_destination();
+        let src_ip = IpAddr::V4(ip.get_source());
+        let dst_ip = IpAddr::V4(ip.get_destination());
         let protocol = ip.get_next_level_protocol().0;
         let header_len = ip.get_header_length() as usize * 4;
 
+        Self::classify_transport(packet, src_ip, dst_ip, protocol, header_len)
+    }
+
+    fn classify_ipv6(packet: &[u8]) -> Classification {
+        let ip = match Ipv6Packet::new(packet) {
+            Some(ip) => ip,
+            None => return Classification::Unknown,
+        };
+
+        let src_ip = IpAddr::V6(ip.get_source());
+        let dst_ip = IpAddr::V6(ip.get_destination());
+        let protocol = ip.get_next_header().0;
+        // IPv6 fixed header = 40 bytes (extension headers не учитываем для простоты)
+        let header_len = 40;
+
+        Self::classify_transport(packet, src_ip, dst_ip, protocol, header_len)
+    }
+
+    fn classify_transport(
+        packet: &[u8],
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        protocol: u8,
+        header_len: usize,
+    ) -> Classification {
         match protocol {
             6 => {
                 // TCP
@@ -179,7 +217,7 @@ impl Classifier {
     ///
     /// Если src_ip — локальный → Outbound.
     /// Иначе → Inbound (ответ сервера).
-    pub fn determine_direction(local_ips: &[Ipv4Addr], cp: &ClassifiedPacket) -> PacketDirection {
+    pub fn determine_direction(local_ips: &[IpAddr], cp: &ClassifiedPacket) -> PacketDirection {
         if local_ips.contains(&cp.src_ip) {
             PacketDirection::Outbound
         } else {
@@ -289,6 +327,7 @@ impl Classifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn test_classify_tcp_syn() {
@@ -311,7 +350,7 @@ mod tests {
         match Classifier::classify(&pkt) {
             Classification::Tls(cp) => {
                 assert_eq!(cp.dst_port, 443);
-                assert_eq!(cp.src_ip, Ipv4Addr::new(192, 168, 1, 1));
+                assert_eq!(cp.src_ip, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
             }
             _ => panic!("Expected TLS classification"),
         }
@@ -350,17 +389,18 @@ mod tests {
 
     #[test]
     fn test_direction_detection() {
-        let local_ips = vec![Ipv4Addr::new(192, 168, 1, 1)];
-        let remote = Ipv4Addr::new(8, 8, 8, 8);
+        let local_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let remote = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let local_ips = vec![local_ip];
 
         let cp = ClassifiedPacket {
-            src_ip: Ipv4Addr::new(192, 168, 1, 1),
+            src_ip: local_ip,
             dst_ip: remote,
             src_port: 12345,
             dst_port: 443,
             protocol: 6,
             direction: PacketDirection::Outbound,
-            conn_key: ConnKey::new(Ipv4Addr::new(192, 168, 1, 1), remote, 12345, 443, 6),
+            conn_key: ConnKey::new(local_ip, remote, 12345, 443, 6),
             payload_offset: 40,
             payload_len: 0,
         };

@@ -22,9 +22,10 @@ use aes_gcm::{Aes128Gcm, Key, Nonce};
 use hmac::{Hmac, Mac};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::ipv4::MutableIpv4Packet;
+use pnet_packet::ipv6::MutableIpv6Packet;
 use pnet_packet::udp::MutableUdpPacket;
 use sha2::Sha256;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use tracing::debug;
 
 /// QUIC Version 1 (RFC 9000).
@@ -67,7 +68,7 @@ pub fn quic_initial_inject(packet: &[u8], fake_sni: &str, fake_ttl_offset: u8) -
         None => return DesyncResult::passthrough(),
     };
 
-    let udp_data = &packet[ip.header_len + 8..]; // skip UDP header
+    let udp_data = &packet[ip.header_len() + 8..]; // skip UDP header
     if udp_data.len() < 20 {
         return DesyncResult::passthrough();
     }
@@ -106,16 +107,16 @@ pub fn quic_initial_inject(packet: &[u8], fake_sni: &str, fake_ttl_offset: u8) -
         .unwrap_or_else(|| build_quic_initial(dcid, fake_sni));
 
     // Fake UDP дейтаграмм
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_src_port = extract_src_port(packet).unwrap_or(443);
     let fake_udp = build_udp_packet(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         fake_src_port,
         443,
         &fake_payload,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!(
@@ -138,7 +139,7 @@ pub fn quic_short_header_poison(packet: &[u8], fake_ttl_offset: u8) -> DesyncRes
         None => return DesyncResult::passthrough(),
     };
 
-    let udp_data = &packet[ip.header_len + 8..];
+    let udp_data = &packet[ip.header_len() + 8..];
     if udp_data.is_empty() {
         return DesyncResult::passthrough();
     }
@@ -150,20 +151,20 @@ pub fn quic_short_header_poison(packet: &[u8], fake_ttl_offset: u8) -> DesyncRes
 
     // Фейковый short header пакет (8 байт padding)
     let fake_payload = vec![0u8; 8];
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
 
     // Извлекаем source port из UDP
-    let udp = pnet_packet::udp::UdpPacket::new(&packet[ip.header_len..]);
+    let udp = pnet_packet::udp::UdpPacket::new(&packet[ip.header_len()..]);
     let src_port = udp.map(|u| u.get_source()).unwrap_or(443);
 
     let fake_udp = build_udp_packet(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         src_port,
         443,
         &fake_payload,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!("[QUIC] Short header poison: 8 bytes fake payload");
@@ -184,7 +185,7 @@ pub fn quic_padding_flood(packet: &[u8], count: usize, fake_ttl_offset: u8) -> D
     };
 
     let src_port = extract_src_port(packet).unwrap_or(443);
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let mut inject = Vec::with_capacity(count);
 
     for _ in 0..count {
@@ -194,8 +195,8 @@ pub fn quic_padding_flood(packet: &[u8], count: usize, fake_ttl_offset: u8) -> D
 
         let ip_id = crate::desync::rand::random_u32() as u16;
         let fake_udp = build_udp_packet(
-            ip.src,
-            ip.dst,
+            ip.src(),
+            ip.dst(),
             src_port,
             443,
             &fake_payload,
@@ -227,7 +228,7 @@ pub fn udp_coalescing(packet: &[u8], extra_packets: &[&[u8]], fake_ttl_offset: u
 
     // Объединяем payload
     let mut combined = Vec::new();
-    let udp_start = ip.header_len + 8;
+    let udp_start = ip.header_len() + 8;
     if udp_start < packet.len() {
         combined.extend_from_slice(&packet[udp_start..]);
     }
@@ -235,15 +236,15 @@ pub fn udp_coalescing(packet: &[u8], extra_packets: &[&[u8]], fake_ttl_offset: u
         combined.extend_from_slice(extra);
     }
 
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let combined_udp = build_udp_packet(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         extract_src_port(packet).unwrap_or(443),
         443,
         &combined,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!(
@@ -273,15 +274,15 @@ pub fn doppelganger_grease(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
     fake_payload.extend_from_slice(&grease_version.to_be_bytes());
     fake_payload.extend_from_slice(&[0u8; 8]); // CID placeholder
 
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         extract_src_port(packet).unwrap_or(443),
         443,
         &fake_payload,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!("[QUIC] Doppelganger GREASE: version={:#x}", grease_version);
@@ -304,7 +305,7 @@ pub fn quic_long_header_drop(packet: &[u8]) -> DesyncResult {
         None => return DesyncResult::passthrough(),
     };
 
-    let udp_data = &packet[ip.header_len + 8..];
+    let udp_data = &packet[ip.header_len() + 8..];
     if udp_data.is_empty() {
         return DesyncResult::passthrough();
     }
@@ -316,7 +317,7 @@ pub fn quic_long_header_drop(packet: &[u8]) -> DesyncResult {
 
     debug!(
         "[OF8] LongHeaderDrop: dropping QUIC Long Header packet from {}",
-        ip.src
+        ip.src()
     );
 
     DesyncResult::drop_packet()
@@ -333,7 +334,7 @@ pub fn quic_normalizer(packet: &[u8]) -> DesyncResult {
         None => return DesyncResult::passthrough(),
     };
 
-    let udp_data = &packet[ip.header_len + 8..];
+    let udp_data = &packet[ip.header_len() + 8..];
     if udp_data.len() < 5 {
         return DesyncResult::passthrough();
     }
@@ -348,7 +349,7 @@ pub fn quic_normalizer(packet: &[u8]) -> DesyncResult {
     // Нормализуем GREASE версию на Version 1
     if (version & 0x0a0a_0a0a) == 0x0a0a_0a0a {
         let mut modified = packet.to_vec();
-        let version_offset = ip.header_len + 8 + 1; // +1 for first byte
+        let version_offset = ip.header_len() + 8 + 1; // +1 for first byte
         modified[version_offset..version_offset + 4].copy_from_slice(&QUIC_VERSION_1.to_be_bytes());
 
         // Пересчитываем IP checksum
@@ -378,11 +379,11 @@ pub fn quic_blocking(packet: &[u8]) -> DesyncResult {
     };
 
     // Проверяем UDP:443
-    if ip.protocol.0 != 17 {
+    if ip.protocol().0 != 17 {
         return DesyncResult::passthrough();
     }
 
-    let udp_data = &packet[ip.header_len..];
+    let udp_data = &packet[ip.header_len()..];
     if udp_data.len() < 8 {
         return DesyncResult::passthrough();
     }
@@ -392,7 +393,7 @@ pub fn quic_blocking(packet: &[u8]) -> DesyncResult {
         return DesyncResult::passthrough();
     }
 
-    debug!("[Z20] QUIC Blocking: dropping UDP:443 from {}", ip.src);
+    debug!("[Z20] QUIC Blocking: dropping UDP:443 from {}", ip.src());
 
     DesyncResult::drop_packet()
 }
@@ -413,7 +414,7 @@ pub fn quic_version_downgrade(
         None => return DesyncResult::passthrough(),
     };
 
-    let udp_data = &packet[ip.header_len + 8..];
+    let udp_data = &packet[ip.header_len() + 8..];
     if udp_data.len() < 5 || udp_data[0] & 0x80 == 0 {
         return DesyncResult::passthrough();
     }
@@ -440,15 +441,15 @@ pub fn quic_version_downgrade(
         fake_payload.extend_from_slice(&udp_data[scid_start..scid_start + 8]);
     }
 
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         extract_src_port(packet).unwrap_or(443),
         443,
         &fake_payload,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!(
@@ -471,7 +472,7 @@ pub fn quic_retry_inject(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
         None => return DesyncResult::passthrough(),
     };
 
-    let udp_data = &packet[ip.header_len + 8..];
+    let udp_data = &packet[ip.header_len() + 8..];
     if udp_data.len() < 5 || udp_data[0] & 0x80 == 0 {
         return DesyncResult::passthrough();
     }
@@ -509,15 +510,15 @@ pub fn quic_retry_inject(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
         fake_payload.push(crate::desync::rand::random_u32() as u8);
     }
 
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         extract_src_port(packet).unwrap_or(443),
         443,
         &fake_payload,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!("[Z22] QUIC RetryInject: fake Retry token injected");
@@ -537,7 +538,7 @@ pub fn quic_connection_close(packet: &[u8], error_code: u64, fake_ttl_offset: u8
         None => return DesyncResult::passthrough(),
     };
 
-    let udp_data = &packet[ip.header_len + 8..];
+    let udp_data = &packet[ip.header_len() + 8..];
     if udp_data.len() < 5 || udp_data[0] & 0x80 == 0 {
         return DesyncResult::passthrough();
     }
@@ -598,15 +599,15 @@ pub fn quic_connection_close(packet: &[u8], error_code: u64, fake_ttl_offset: u8
     // Padding
     initial.resize(initial.len() + 16, 0);
 
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         extract_src_port(packet).unwrap_or(443),
         443,
         &initial,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!("[Z23] QUIC ConnectionClose: error_code={}", error_code);
@@ -625,7 +626,7 @@ pub fn quic_stream_reset(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
         None => return DesyncResult::passthrough(),
     };
 
-    let udp_data = &packet[ip.header_len + 8..];
+    let udp_data = &packet[ip.header_len() + 8..];
     if udp_data.len() < 5 || udp_data[0] & 0x80 == 0 {
         return DesyncResult::passthrough();
     }
@@ -651,15 +652,15 @@ pub fn quic_stream_reset(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
     short.extend_from_slice(&frame);
     short.resize(short.len() + 8, 0); // padding
 
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         extract_src_port(packet).unwrap_or(443),
         443,
         &short,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!("[Z24] QUIC StreamReset: RESET_STREAM for stream 0");
@@ -679,7 +680,7 @@ pub fn quic_max_streams(packet: &[u8], max_streams: u32, fake_ttl_offset: u8) ->
         None => return DesyncResult::passthrough(),
     };
 
-    let udp_data = &packet[ip.header_len + 8..];
+    let udp_data = &packet[ip.header_len() + 8..];
     if udp_data.len() < 5 || udp_data[0] & 0x80 == 0 {
         return DesyncResult::passthrough();
     }
@@ -727,15 +728,15 @@ pub fn quic_max_streams(packet: &[u8], max_streams: u32, fake_ttl_offset: u8) ->
     initial.extend_from_slice(&frame);
     initial.resize(initial.len() + 8, 0);
 
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         extract_src_port(packet).unwrap_or(443),
         443,
         &initial,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!("[Z25] QUIC MaxStreams: max={}", max_streams);
@@ -754,7 +755,7 @@ pub fn quic_new_connection_id(packet: &[u8], fake_ttl_offset: u8) -> DesyncResul
         None => return DesyncResult::passthrough(),
     };
 
-    let udp_data = &packet[ip.header_len + 8..];
+    let udp_data = &packet[ip.header_len() + 8..];
     if udp_data.len() < 5 || udp_data[0] & 0x80 == 0 {
         return DesyncResult::passthrough();
     }
@@ -786,15 +787,15 @@ pub fn quic_new_connection_id(packet: &[u8], fake_ttl_offset: u8) -> DesyncResul
     short.extend_from_slice(&frame);
     short.resize(short.len() + 8, 0);
 
-    let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         extract_src_port(packet).unwrap_or(443),
         443,
         &short,
         fake_ttl,
-        ip.identification.wrapping_add(1),
+        ip.identification().wrapping_add(1),
     );
 
     debug!("[Z26] QUIC NewConnectionID: fake CID injected");
@@ -1261,11 +1262,11 @@ pub fn build_quic_initial_with_crypto(dcid: &[u8], scid: &[u8], fake_sni: &str) 
     }
 }
 
-/// Строит UDP пакет с IP header.
+/// Строит UDP пакет с IP header (IPv4 или IPv6).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_udp_packet(
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
     src_port: u16,
     dst_port: u16,
     payload: &[u8],
@@ -1273,47 +1274,120 @@ pub(crate) fn build_udp_packet(
     identification: u16,
 ) -> bytes::Bytes {
     let udp_len = 8 + payload.len();
-    let total_len = 20 + udp_len;
 
-    let mut buf = bytes::BytesMut::with_capacity(total_len);
-    buf.resize(total_len, 0);
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src_v4), IpAddr::V4(dst_v4)) => {
+            let total_len = 20 + udp_len;
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
 
-    // IP Header
-    {
-        let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
-        ip.set_version(4);
-        ip.set_header_length(5);
-        ip.set_total_length(total_len as u16);
-        ip.set_identification(identification);
-        ip.set_flags(0);
-        ip.set_fragment_offset(0);
-        ip.set_ttl(ttl);
-        ip.set_next_level_protocol(IpNextHeaderProtocols::Udp);
-        ip.set_source(src_ip);
-        ip.set_destination(dst_ip);
+            {
+                let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
+                ip.set_version(4);
+                ip.set_header_length(5);
+                ip.set_total_length(total_len as u16);
+                ip.set_identification(identification);
+                ip.set_flags(0);
+                ip.set_fragment_offset(0);
+                ip.set_ttl(ttl);
+                ip.set_next_level_protocol(IpNextHeaderProtocols::Udp);
+                ip.set_source(src_v4);
+                ip.set_destination(dst_v4);
+            }
+
+            let ip_csum = ipv4_checksum(&buf[..20]);
+            buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+            {
+                let mut udp = MutableUdpPacket::new(&mut buf[20..]).unwrap();
+                udp.set_source(src_port);
+                udp.set_destination(dst_port);
+                udp.set_length(udp_len as u16);
+                udp.set_checksum(0);
+            }
+
+            buf[28..28 + payload.len()].copy_from_slice(payload);
+
+            let udp_csum = crate::desync::udp_checksum(
+                IpAddr::V4(src_v4),
+                IpAddr::V4(dst_v4),
+                &buf[20..20 + udp_len],
+            );
+            buf[26..28].copy_from_slice(&udp_csum.to_be_bytes());
+
+            buf.freeze()
+        }
+        (IpAddr::V6(src_v6), IpAddr::V6(dst_v6)) => {
+            let total_len = 40 + udp_len;
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
+
+            {
+                let mut ip = MutableIpv6Packet::new(&mut buf).unwrap();
+                ip.set_version(6);
+                ip.set_traffic_class(0);
+                ip.set_flow_label(0);
+                ip.set_payload_length(udp_len as u16);
+                ip.set_next_header(IpNextHeaderProtocols::Udp);
+                ip.set_hop_limit(ttl);
+                ip.set_source(src_v6);
+                ip.set_destination(dst_v6);
+            }
+
+            {
+                let mut udp = MutableUdpPacket::new(&mut buf[40..]).unwrap();
+                udp.set_source(src_port);
+                udp.set_destination(dst_port);
+                udp.set_length(udp_len as u16);
+                udp.set_checksum(0);
+            }
+
+            buf[48..48 + payload.len()].copy_from_slice(payload);
+
+            let udp_csum = crate::desync::udp_checksum(
+                IpAddr::V6(src_v6),
+                IpAddr::V6(dst_v6),
+                &buf[40..40 + udp_len],
+            );
+            buf[46..48].copy_from_slice(&udp_csum.to_be_bytes());
+
+            buf.freeze()
+        }
+        _ => {
+            tracing::warn!("build_udp_packet: mixed V4/V6 src/dst, using V4 fallback");
+            let src_v4 = match src_ip {
+                IpAddr::V4(v4) => v4,
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+            let dst_v4 = match dst_ip {
+                IpAddr::V4(v4) => v4,
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+            let total_len = 20 + udp_len;
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
+            let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
+            ip.set_version(4);
+            ip.set_header_length(5);
+            ip.set_total_length(total_len as u16);
+            ip.set_identification(identification);
+            ip.set_flags(0);
+            ip.set_fragment_offset(0);
+            ip.set_ttl(ttl);
+            ip.set_next_level_protocol(IpNextHeaderProtocols::Udp);
+            ip.set_source(src_v4);
+            ip.set_destination(dst_v4);
+            let ip_csum = ipv4_checksum(&buf[..20]);
+            buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+            let mut udp = MutableUdpPacket::new(&mut buf[20..]).unwrap();
+            udp.set_source(src_port);
+            udp.set_destination(dst_port);
+            udp.set_length(udp_len as u16);
+            udp.set_checksum(0);
+            buf[28..28 + payload.len()].copy_from_slice(payload);
+            buf.freeze()
+        }
     }
-
-    // IP checksum
-    let ip_csum = ipv4_checksum(&buf[..20]);
-    buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-
-    // UDP Header
-    {
-        let mut udp = MutableUdpPacket::new(&mut buf[20..]).unwrap();
-        udp.set_source(src_port);
-        udp.set_destination(dst_port);
-        udp.set_length(udp_len as u16);
-        udp.set_checksum(0);
-    }
-
-    // UDP payload
-    buf[28..28 + payload.len()].copy_from_slice(payload);
-
-    // UDP checksum (optional for IPv4, but set for correctness)
-    let udp_csum = crate::desync::tcp_checksum_v4(src_ip, dst_ip, &buf[20..20 + udp_len]);
-    buf[26..28].copy_from_slice(&udp_csum.to_be_bytes());
-
-    buf.freeze()
 }
 
 // ============================================================================
@@ -1628,8 +1702,8 @@ fn build_test_quic_initial_packet(pn: u32) -> Vec<u8> {
 
     // Wrap in IP packet
     build_ip_packet(
-        src_ip,
-        dst_ip,
+        IpAddr::V4(src_ip),
+        IpAddr::V4(dst_ip),
         pnet_packet::ip::IpNextHeaderProtocols::Udp,
         64,
         0x1234,
@@ -1659,8 +1733,8 @@ mod tests {
     #[test]
     fn test_build_udp_packet() {
         let pkt = build_udp_packet(
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(8, 8, 8, 8),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             crate::desync::rand::random_range(1024, 65535) as u16,
             443,
             &[0x01, 0x02],

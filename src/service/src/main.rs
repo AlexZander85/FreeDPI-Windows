@@ -438,11 +438,13 @@ unsafe extern "system" fn service_control_handler(
             }
             // Report stopped status to SCM
             if let Some(handle) = SERVICE_STATUS_HANDLE {
-                let mut status = SERVICE_STATUS::default();
-                status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-                status.dwCurrentState = SERVICE_STOPPED;
-                status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
-                status.dwWin32ExitCode = 0;
+                let status = SERVICE_STATUS {
+                    dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+                    dwCurrentState: SERVICE_STOPPED,
+                    dwControlsAccepted: SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
+                    dwWin32ExitCode: 0,
+                    ..Default::default()
+                };
                 let _ = SetServiceStatus(handle, &status);
             }
             NO_ERROR.0
@@ -470,11 +472,13 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     SERVICE_STATUS_HANDLE = Some(handle);
 
     // Report SERVICE_RUNNING to SCM
-    let mut status = SERVICE_STATUS::default();
-    status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-    status.dwCurrentState = SERVICE_RUNNING;
-    status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
-    status.dwWin32ExitCode = 0;
+    let mut status = SERVICE_STATUS {
+        dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+        dwCurrentState: SERVICE_RUNNING,
+        dwControlsAccepted: SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
+        dwWin32ExitCode: 0,
+        ..Default::default()
+    };
     let _ = SetServiceStatus(handle, &status);
 
     // Create shutdown channel
@@ -484,7 +488,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     // Build minimal config (load from default path)
     let config = match Config::load(std::path::Path::new("config.toml")) {
         Ok(c) => c,
-        Err(e) => {
+        Err(_e) => {
             let status = SERVICE_STATUS {
                 dwServiceType: SERVICE_WIN32_OWN_PROCESS,
                 dwCurrentState: SERVICE_STOPPED,
@@ -607,9 +611,7 @@ fn main() -> anyhow::Result<()> {
     ];
 
     // StartServiceCtrlDispatcherW succeeds only if launched by SCM
-    let launched_by_scm = unsafe {
-        StartServiceCtrlDispatcherW(dispatch_table.as_ptr() as *const SERVICE_TABLE_ENTRYW).is_ok()
-    };
+    let launched_by_scm = unsafe { StartServiceCtrlDispatcherW(dispatch_table.as_ptr()).is_ok() };
     if launched_by_scm {
         // Runs until service stops; SCM dispatcher handled everything.
         return Ok(());

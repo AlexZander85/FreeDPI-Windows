@@ -42,7 +42,7 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
         None => return DesyncResult::passthrough(),
     };
 
-    let tcp_data = &packet[ip.header_len..];
+    let tcp_data = &packet[ip.header_len()..];
     let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
         Some(t) => t,
         None => return DesyncResult::passthrough(),
@@ -58,8 +58,8 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
     let seq = tcp.get_sequence();
     let ack = tcp.get_acknowledgement();
     let window = tcp.get_window();
-    let src = ip.src;
-    let dst = ip.dst;
+    let src = ip.src();
+    let dst = ip.dst();
     let src_port = tcp.get_source();
     let dst_port = tcp.get_destination();
 
@@ -101,8 +101,8 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
         TcpFlags::PSH | TcpFlags::ACK,
         window,
         frag1_payload,
-        ip.ttl.saturating_sub(fake_ttl_offset),
-        ip.identification.wrapping_add(1),
+        ip.ttl().saturating_sub(fake_ttl_offset),
+        ip.identification().wrapping_add(1),
     );
     inject.push(frag1);
 
@@ -120,8 +120,8 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
         TcpFlags::PSH | TcpFlags::ACK,
         window,
         frag2_payload,
-        ip.ttl,
-        ip.identification.wrapping_add(2),
+        ip.ttl(),
+        ip.identification().wrapping_add(2),
     );
     inject.push(frag2);
 
@@ -156,7 +156,7 @@ pub fn tls_record_pad(packet: &[u8], pad_size: usize, _fake_ttl_offset: u8) -> D
         None => return DesyncResult::passthrough(),
     };
 
-    let tcp_data = &packet[ip.header_len..];
+    let tcp_data = &packet[ip.header_len()..];
     let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
         Some(t) => t,
         None => return DesyncResult::passthrough(),
@@ -193,7 +193,7 @@ pub fn tls_record_pad(packet: &[u8], pad_size: usize, _fake_ttl_offset: u8) -> D
 
     // Модифицируем пакет in-place
     let mut modified = packet.to_vec();
-    let tcp_payload_offset = ip.header_len + data_offset;
+    let tcp_payload_offset = ip.header_len() + data_offset;
 
     // Вставляем padding после тела ClientHello
     let insert_pos = tcp_payload_offset + ch_end;
@@ -213,10 +213,10 @@ pub fn tls_record_pad(packet: &[u8], pad_size: usize, _fake_ttl_offset: u8) -> D
     modified[10..12].copy_from_slice(&ip_csum.to_be_bytes());
 
     // Пересчитываем TCP checksum
-    let tcp_start = ip.header_len;
+    let tcp_start = ip.header_len();
     modified[tcp_start + 16] = 0;
     modified[tcp_start + 17] = 0;
-    let tcp_csum = crate::desync::tcp_checksum_v4(ip.src, ip.dst, &modified[tcp_start..]);
+    let tcp_csum = crate::desync::tcp_checksum(ip.src(), ip.dst(), &modified[tcp_start..]);
     modified[tcp_start + 16..tcp_start + 18].copy_from_slice(&tcp_csum.to_be_bytes());
 
     debug!(
@@ -262,7 +262,7 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
         None => return DesyncResult::passthrough(),
     };
 
-    let tcp_data = &packet[ip.header_len..];
+    let tcp_data = &packet[ip.header_len()..];
     let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
         Some(t) => t,
         None => return DesyncResult::passthrough(),
@@ -280,8 +280,8 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
     let seq = tcp.get_sequence();
     let ack = tcp.get_acknowledgement();
     let window = tcp.get_window();
-    let src = ip.src;
-    let dst = ip.dst;
+    let src = ip.src();
+    let dst = ip.dst();
     let src_port = tcp.get_source();
     let dst_port = tcp.get_destination();
 
@@ -290,7 +290,7 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
 
     for i in 0..micro_count {
         let frag_payload = &payload[i..i + 1];
-        let fake_ttl = ip.ttl.saturating_sub(fake_ttl_offset);
+        let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
         let frag_seq = seq.wrapping_add(i as u32);
         let frag = crate::desync::tcp::build_ip_tcp_packet_with_options(
             packet,
@@ -304,7 +304,7 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
             window,
             frag_payload,
             fake_ttl,
-            ip.identification.wrapping_add(i as u16 + 1),
+            ip.identification().wrapping_add(i as u16 + 1),
         );
         inject.push(frag);
     }
@@ -322,8 +322,8 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
         TcpFlags::PSH | TcpFlags::ACK,
         window,
         remaining,
-        ip.ttl,
-        ip.identification.wrapping_add(micro_count as u16 + 1),
+        ip.ttl(),
+        ip.identification().wrapping_add(micro_count as u16 + 1),
     );
 
     debug!(
@@ -461,7 +461,7 @@ pub fn sni_masking(packet: &[u8], mask_byte: u8) -> DesyncResult {
         None => return DesyncResult::passthrough(),
     };
 
-    let tcp_data = &packet[ip.header_len..];
+    let tcp_data = &packet[ip.header_len()..];
     let tcp = match crate::desync::parse_tcp_packet(tcp_data) {
         Some(t) => t,
         None => return DesyncResult::passthrough(),
@@ -541,7 +541,7 @@ pub fn sni_masking(packet: &[u8], mask_byte: u8) -> DesyncResult {
             }
 
             let mut modified = packet.to_vec();
-            let tcp_offset = ip.header_len;
+            let tcp_offset = ip.header_len();
             let payload_offset = tcp_offset + tcp.data_offset;
 
             for i in hostname_start..hostname_end {
@@ -549,9 +549,9 @@ pub fn sni_masking(packet: &[u8], mask_byte: u8) -> DesyncResult {
             }
 
             let _tcp_len = modified.len() - tcp_offset;
-            let src_ip = ip.src;
-            let dst_ip = ip.dst;
-            let tcp_csum = crate::desync::tcp_checksum_v4(src_ip, dst_ip, &modified[tcp_offset..]);
+            let src_ip = ip.src();
+            let dst_ip = ip.dst();
+            let tcp_csum = crate::desync::tcp_checksum(src_ip, dst_ip, &modified[tcp_offset..]);
             modified[tcp_offset + 16..tcp_offset + 18].copy_from_slice(&tcp_csum.to_be_bytes());
 
             debug!(
@@ -601,7 +601,7 @@ mod tests {
     fn test_find_sni_offset() {
         let pkt = build_test_tls_ch_packet();
         let ip = parse_ip_header(&pkt).unwrap();
-        let tcp_data = &pkt[ip.header_len..];
+        let tcp_data = &pkt[ip.header_len()..];
         let tcp = pnet_packet::tcp::TcpPacket::new(tcp_data).unwrap();
         let data_offset = tcp.get_data_offset() as usize * 4;
         let payload = &tcp_data[data_offset..];
@@ -692,7 +692,7 @@ pub fn tls_version_overwrite(packet: &[u8]) -> DesyncResult {
         Some(h) => h,
         None => return DesyncResult::passthrough(),
     };
-    let tcp_data = &packet[ip.header_len..];
+    let tcp_data = &packet[ip.header_len()..];
     let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
         Some(t) => t,
         None => return DesyncResult::passthrough(),
@@ -705,7 +705,7 @@ pub fn tls_version_overwrite(packet: &[u8]) -> DesyncResult {
     }
 
     let mut modified = packet.to_vec();
-    let payload_start = ip.header_len + data_offset;
+    let payload_start = ip.header_len() + data_offset;
     modified[payload_start + 1] = 0x03;
     modified[payload_start + 2] = 0x04;
 
@@ -729,7 +729,7 @@ pub fn tls_record_rewrap(packet: &[u8], chunk_size: usize, fake_ttl_offset: u8) 
         Some(h) => h,
         None => return DesyncResult::passthrough(),
     };
-    let tcp_data = &packet[ip.header_len..];
+    let tcp_data = &packet[ip.header_len()..];
     let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
         Some(t) => t,
         None => return DesyncResult::passthrough(),
@@ -761,8 +761,8 @@ pub fn tls_record_rewrap(packet: &[u8], chunk_size: usize, fake_ttl_offset: u8) 
 
     let inject_pkt = crate::desync::tcp::build_ip_tcp_packet_with_options(
         packet,
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         tcp.get_source(),
         tcp.get_destination(),
         seq,
@@ -770,8 +770,8 @@ pub fn tls_record_rewrap(packet: &[u8], chunk_size: usize, fake_ttl_offset: u8) 
         TcpFlags::PSH | TcpFlags::ACK,
         window,
         &rewrapped,
-        ip.ttl.saturating_sub(fake_ttl_offset),
-        ip.identification.wrapping_add(1),
+        ip.ttl().saturating_sub(fake_ttl_offset),
+        ip.identification().wrapping_add(1),
     );
 
     debug!(
@@ -793,7 +793,7 @@ pub fn sni_record_frag(packet: &[u8], chunk_size: usize, fake_ttl_offset: u8) ->
         Some(h) => h,
         None => return DesyncResult::passthrough(),
     };
-    let tcp_data = &packet[ip.header_len..];
+    let tcp_data = &packet[ip.header_len()..];
     let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
         Some(t) => t,
         None => return DesyncResult::passthrough(),
@@ -913,8 +913,8 @@ fn build_sni_frag_result(
 
     let inject_pkt = crate::desync::tcp::build_ip_tcp_packet_with_options(
         packet,
-        ip.src,
-        ip.dst,
+        ip.src(),
+        ip.dst(),
         tcp.get_source(),
         tcp.get_destination(),
         seq,
@@ -922,8 +922,8 @@ fn build_sni_frag_result(
         TcpFlags::PSH | TcpFlags::ACK,
         window,
         &rewrapped,
-        ip.ttl.saturating_sub(fake_ttl_offset),
-        ip.identification.wrapping_add(1),
+        ip.ttl().saturating_sub(fake_ttl_offset),
+        ip.identification().wrapping_add(1),
     );
 
     debug!(

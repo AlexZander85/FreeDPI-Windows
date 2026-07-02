@@ -19,7 +19,7 @@ use std::time::Duration;
 use tracing::debug;
 
 /// Результат TCP16 probe.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Tcp16ProbeResult {
     /// Обнаружена ли блокировка
     pub detected: bool,

@@ -113,6 +113,125 @@ const HPKE_AEAD_AES_128_GCM: u16 = 0x0001;
 const P256_PUBLIC_KEY_SIZE: usize = 65; // 0x04 prefix + 32 X + 32 Y
 
 // ============================================================================
+// TlsProfile — 4 профиля для JA4 fingerprint probe
+// ============================================================================
+
+/// Профиль TLS клиента с характерным набором расширений и шифров.
+///
+/// Используется в `build_client_hello_with_profile()` для генерации
+/// 4 разных ClientHello для fingerprint-анализа (T49).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsProfile {
+    Chrome130,
+    Firefox120,
+    Safari17,
+    Curl8,
+}
+
+impl TlsProfile {
+    /// Имя профиля для логирования.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Chrome130 => "chrome_130",
+            Self::Firefox120 => "firefox_120",
+            Self::Safari17 => "safari_17",
+            Self::Curl8 => "curl_8",
+        }
+    }
+
+    /// Cipher suites профиля (без GREASE — GREASE добавляется отдельно).
+    fn cipher_suites(&self) -> &'static [u16] {
+        match self {
+            Self::Chrome130 | Self::Safari17 => &[
+                CS_TLS_AES_128_GCM_SHA256,
+                CS_TLS_AES_256_GCM_SHA384,
+                CS_TLS_CHACHA20_POLY1305_SHA256,
+            ],
+            Self::Firefox120 => &[
+                CS_TLS_AES_128_GCM_SHA256,
+                CS_TLS_CHACHA20_POLY1305_SHA256,
+                CS_TLS_AES_256_GCM_SHA384,
+            ],
+            Self::Curl8 => &[
+                CS_TLS_AES_128_GCM_SHA256,
+                CS_TLS_AES_256_GCM_SHA384,
+                CS_TLS_CHACHA20_POLY1305_SHA256,
+            ],
+        }
+    }
+
+    /// Supported groups (named groups / key exchange).
+    fn supported_groups(&self) -> &'static [u16] {
+        match self {
+            Self::Chrome130 => &[
+                GROUP_X25519MLKEM768,
+                GROUP_X25519,
+                GROUP_SECP256R1,
+                GROUP_SECP384R1,
+            ],
+            Self::Safari17 => &[
+                GROUP_X25519,
+                GROUP_SECP256R1,
+                GROUP_SECP384R1,
+                GROUP_X25519MLKEM768,
+            ],
+            Self::Firefox120 | Self::Curl8 => &[GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1],
+        }
+    }
+
+    /// ALPN протоколы.
+    fn alpn(&self) -> &'static [&'static [u8]] {
+        match self {
+            Self::Chrome130 | Self::Safari17 | Self::Firefox120 => &[b"h2", b"http/1.1"],
+            Self::Curl8 => &[b"http/1.1"],
+        }
+    }
+
+    /// Добавлять GREASE extension?
+    fn has_grease(&self) -> bool {
+        matches!(self, Self::Chrome130 | Self::Safari17 | Self::Firefox120)
+    }
+
+    /// Добавлять ECH GREASE extension (0xFE0D)?
+    fn has_ech_grease(&self) -> bool {
+        matches!(self, Self::Chrome130)
+    }
+
+    /// Добавлять compress_certificate extension?
+    ///
+    /// Chrome: да (brotli+zlib+none в старой реализации, brotli-only в profile-aware)
+    /// Safari: да (brotli)
+    /// Firefox: нет — в реальном Firefox 120 нет compress_certificate в начальном CH
+    /// curl: нет
+    fn has_compress_certificate(&self) -> bool {
+        matches!(self, Self::Chrome130 | Self::Safari17)
+    }
+
+    /// Добавлять application_settings extension (0x4469)?
+    fn has_application_settings(&self) -> bool {
+        matches!(self, Self::Chrome130)
+    }
+
+    /// Добавлять session_ticket extension?
+    fn has_session_ticket(&self) -> bool {
+        matches!(self, Self::Chrome130 | Self::Safari17 | Self::Firefox120)
+    }
+
+    /// Добавлять SCT extension (0x0012)?
+    fn has_sct(&self) -> bool {
+        !matches!(self, Self::Curl8)
+    }
+
+    /// Размер session_id (0 = empty).
+    fn session_id_size(&self) -> usize {
+        match self {
+            Self::Curl8 => 0,
+            _ => 32,
+        }
+    }
+}
+
+// ============================================================================
 // Публичный API
 // ============================================================================
 
@@ -138,6 +257,30 @@ const P256_PUBLIC_KEY_SIZE: usize = 65; // 0x04 prefix + 32 X + 32 Y
 /// Vec<u8> — полный TLS record (ContentType + Version + Length + Handshake + CH)
 pub fn build_client_hello(sni: &str, rng: &mut PerConnRng) -> Vec<u8> {
     build_client_hello_with_resumption(sni, rng, false)
+}
+
+/// Chrome 130 ClientHello: X25519MLKEM768 + X25519 + P-256, ECH GREASE,
+/// compress_certificate, application_settings, h2 ALPN.
+pub fn build_chrome_130_ch(sni: &str, rng: &mut PerConnRng) -> Vec<u8> {
+    build_client_hello_with_profile(sni, rng, TlsProfile::Chrome130, false)
+}
+
+/// Firefox 120 ClientHello: X25519 + P-256 (no PQ), no ECH GREASE,
+/// no compress_certificate, h2 ALPN.
+pub fn build_firefox_120_ch(sni: &str, rng: &mut PerConnRng) -> Vec<u8> {
+    build_client_hello_with_profile(sni, rng, TlsProfile::Firefox120, false)
+}
+
+/// Safari 17 ClientHello: похож на Chrome но без ECH GREASE,
+/// без application_settings, h2 ALPN.
+pub fn build_safari_17_ch(sni: &str, rng: &mut PerConnRng) -> Vec<u8> {
+    build_client_hello_with_profile(sni, rng, TlsProfile::Safari17, false)
+}
+
+/// curl 8.x ClientHello: минимальный, без ECH, без PQ, без compress_certificate,
+/// без application_settings, без SCT, http/1.1 ALPN only.
+pub fn build_curl_8_ch(sni: &str, rng: &mut PerConnRng) -> Vec<u8> {
+    build_client_hello_with_profile(sni, rng, TlsProfile::Curl8, false)
 }
 
 /// Строит ClientHello с опцией 0-RTT resumption.
@@ -1240,6 +1383,368 @@ fn wrap_record(handshake: &[u8]) -> Vec<u8> {
 }
 
 // ============================================================================
+// Profile-aware extension helpers (T49 — JA4 fingerprint probe)
+// ============================================================================
+
+/// Push GREASE extension (type = grease_value, empty data).
+fn push_grease_extension(buf: &mut Vec<u8>, grease_value: u16) {
+    buf.extend_from_slice(&grease_value.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes()); // length = 0
+}
+
+/// Push renegotiation_info extension (0xFF01).
+fn push_renegotiation_info(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&EXT_RENEGOTIATION_INFO.to_be_bytes());
+    buf.extend_from_slice(&1u16.to_be_bytes()); // length = 1
+    buf.push(0x00); // renegotiated_connection length = 0
+}
+
+/// Push supported_groups extension (profile-aware).
+///
+/// Добавляет GREASE первым (если профиль использует GREASE),
+/// затем groups из профиля.
+fn push_supported_groups_profiled(buf: &mut Vec<u8>, profile: TlsProfile, grease_group: u16) {
+    let groups = profile.supported_groups();
+    let grease_count = if profile.has_grease() { 1 } else { 0 };
+    let list_len = ((groups.len() + grease_count) * 2) as u16;
+    let ext_len = list_len + 2;
+
+    buf.extend_from_slice(&EXT_SUPPORTED_GROUPS.to_be_bytes());
+    buf.extend_from_slice(&ext_len.to_be_bytes());
+    buf.extend_from_slice(&list_len.to_be_bytes());
+    if profile.has_grease() {
+        buf.extend_from_slice(&grease_group.to_be_bytes());
+    }
+    for &g in groups {
+        buf.extend_from_slice(&g.to_be_bytes());
+    }
+}
+
+/// Push ALPN extension (profile-aware).
+fn push_alpn_extension_profiled(buf: &mut Vec<u8>, protocols: &[&[u8]]) {
+    let protocols_len: usize = protocols.iter().map(|p| 1 + p.len()).sum();
+    let list_len = protocols_len as u16;
+    let ext_len = list_len + 2;
+
+    buf.extend_from_slice(&EXT_ALPN.to_be_bytes());
+    buf.extend_from_slice(&ext_len.to_be_bytes());
+    buf.extend_from_slice(&list_len.to_be_bytes());
+    for proto in protocols {
+        buf.push(proto.len() as u8);
+        buf.extend_from_slice(proto);
+    }
+}
+
+/// Push key_share extension (profile-aware).
+///
+/// Включает key share только для групп, которые являются key exchange группами
+/// (X25519MLKEM768, X25519, P-256, P-384). P-256/P-384 получают uncompressed
+/// точки (0x04 prefix).
+fn push_key_share_extension_profiled(buf: &mut Vec<u8>, rng: &mut PerConnRng, profile: TlsProfile) {
+    let groups = profile.supported_groups();
+    let mut entries = Vec::new();
+
+    for &group in groups {
+        let key_len = match group {
+            GROUP_X25519MLKEM768 => MLKEM768_PUBLIC_KEY_SIZE,
+            GROUP_X25519 => X25519_PUBLIC_KEY_SIZE,
+            GROUP_SECP256R1 => 65, // 0x04 + 32X + 32Y
+            GROUP_SECP384R1 => 97, // 0x04 + 48X + 48Y
+            _ => continue,
+        };
+        let mut key = vec![0u8; key_len];
+        rng.fill_bytes(&mut key);
+        // Uncompressed point format for EC groups
+        if group == GROUP_SECP256R1 || group == GROUP_SECP384R1 {
+            key[0] = 0x04;
+        }
+        entries.push((group, key));
+    }
+
+    let total_entries_len: usize = entries.iter().map(|(_g, k)| 2 + 2 + k.len()).sum();
+    let ext_len = total_entries_len + 2; // + client_shares_len field
+
+    buf.extend_from_slice(&EXT_KEY_SHARE.to_be_bytes());
+    buf.extend_from_slice(&(ext_len as u16).to_be_bytes());
+    buf.extend_from_slice(&(total_entries_len as u16).to_be_bytes());
+    for (group, key) in entries {
+        buf.extend_from_slice(&group.to_be_bytes());
+        buf.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&key);
+    }
+}
+
+/// Push PSK key exchange modes (0x002D) — всегда psk_dhe_ke.
+fn push_psk_kex_modes(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&EXT_PSK_KEX_MODES.to_be_bytes());
+    buf.extend_from_slice(&2u16.to_be_bytes()); // length = 2
+    buf.push(1); // list length
+    buf.push(1); // psk_dhe_ke
+}
+
+/// Push compress_certificate extension (0x001B) — brotli only.
+fn push_compress_certificate(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&EXT_COMPRESS_CERTIFICATE.to_be_bytes());
+    buf.extend_from_slice(&3u16.to_be_bytes()); // ext data len
+    buf.extend_from_slice(&1u16.to_be_bytes()); // algorithms list len
+    buf.push(0x02); // brotli
+}
+
+/// Push application_settings extension (0x4469) — Chrome-specific.
+fn push_application_settings(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&EXT_APPLICATION_SETTINGS.to_be_bytes());
+    buf.extend_from_slice(&2u16.to_be_bytes()); // length = 2
+    buf.extend_from_slice(&0u16.to_be_bytes()); // empty settings
+}
+
+/// Push ECH GREASE extension (0xFE0D) — Chrome 122+.
+fn push_ech_grease_extension(buf: &mut Vec<u8>, rng: &mut PerConnRng) {
+    let config_id = rng.next_u32() as u8;
+
+    // Random P-256 public key
+    let mut pub_key = vec![0u8; P256_PUBLIC_KEY_SIZE];
+    rng.fill_bytes(&mut pub_key);
+    pub_key[0] = 0x04; // uncompressed
+
+    // Random payload
+    let payload_len = rng.next_range(16, 256) as usize;
+    let mut payload = vec![0u8; payload_len];
+    rng.fill_bytes(&mut payload);
+
+    // Build ECHConfigContents
+    let mut config_contents = Vec::with_capacity(85);
+    config_contents.push(config_id);
+    config_contents.extend_from_slice(&HPKE_KEM_P256.to_be_bytes());
+    config_contents.extend_from_slice(&(P256_PUBLIC_KEY_SIZE as u16).to_be_bytes());
+    config_contents.extend_from_slice(&pub_key);
+    config_contents.extend_from_slice(&4u16.to_be_bytes()); // cipher_suites_len
+    config_contents.extend_from_slice(&HPKE_KDF_HKDF_SHA256.to_be_bytes());
+    config_contents.extend_from_slice(&HPKE_AEAD_AES_128_GCM.to_be_bytes());
+    config_contents.push(0); // max_name_length
+    config_contents.push(0); // public_name_len
+    config_contents.extend_from_slice(&0u16.to_be_bytes()); // extensions_len
+
+    // Wrap in ECHConfig
+    let mut config = Vec::with_capacity(4 + config_contents.len());
+    config.extend_from_slice(&0xFE0Du16.to_be_bytes()); // version
+    config.extend_from_slice(&(config_contents.len() as u16).to_be_bytes());
+    config.extend_from_slice(&config_contents);
+
+    // Build ECHClientHello (config + enc + payload)
+    let mut ech = Vec::with_capacity(config.len() + 4 + payload_len);
+    ech.extend_from_slice(&config);
+    ech.extend_from_slice(&0u16.to_be_bytes()); // enc_len (empty for GREASE)
+    ech.extend_from_slice(&(payload_len as u16).to_be_bytes());
+    ech.extend_from_slice(&payload);
+
+    // Wrap in extension header
+    buf.extend_from_slice(&EXT_ENCRYPTED_CLIENT_HELLO.to_be_bytes());
+    buf.extend_from_slice(&(ech.len() as u16).to_be_bytes());
+    buf.extend_from_slice(&ech);
+}
+
+/// Push early_data extension (0x4433) — для 0-RTT resumption.
+fn push_early_data_extension(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&EXT_EARLY_DATA.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes()); // length = 0 (no max_early_data_size)
+}
+
+/// Push padding extension (0x0015) — доводит CH до целевого размера.
+///
+/// В отличие от `add_padding` (Chrome 130+ random multiple of 16),
+/// этот helper использует фиксированный target = 512 для всех профилей.
+fn push_padding_extension(buf: &mut Vec<u8>, rng: &mut PerConnRng) {
+    let current_size = buf.len();
+    // Target size: random multiple of 16 in [512, 4096]
+    let target_base = 512usize.max(current_size + 4).next_multiple_of(16);
+    let max_padded = 4096usize;
+    let max_extra = max_padded.saturating_sub(target_base);
+    let extra_steps = max_extra / 16;
+    let extra = if extra_steps > 0 {
+        (rng.next_range_internal(0, extra_steps as u64) * 16) as usize
+    } else {
+        0
+    };
+    let target_size = target_base + extra;
+
+    let pad_len = target_size.saturating_sub(current_size + 4);
+    if pad_len > 0 {
+        buf.extend_from_slice(&EXT_PADDING.to_be_bytes());
+        buf.extend_from_slice(&(pad_len as u16).to_be_bytes());
+        buf.extend(std::iter::repeat_n(0, pad_len));
+    }
+}
+
+/// Build ClientHello body (profile-aware) — session_id, cipher_suites, extensions.
+fn build_ch_body_profiled(
+    rng: &mut PerConnRng,
+    grease: (u16, u16, u16, u16),
+    extensions: &[u8],
+    profile: TlsProfile,
+) -> Vec<u8> {
+    let (cipher_g, _, _, _) = grease;
+    let mut body = Vec::with_capacity(512);
+
+    // Version: TLS 1.2 legacy (0x0303) — все профили
+    body.extend_from_slice(&[0x03, 0x03]);
+
+    // TLS Random — 32 bytes
+    let mut random = [0u8; 32];
+    rng.fill_bytes(&mut random);
+    body.extend_from_slice(&random);
+
+    // Session ID — 32 bytes (Chrome/Firefox/Safari), 0 bytes (curl)
+    let sid_len = profile.session_id_size();
+    body.push(sid_len as u8);
+    if sid_len > 0 {
+        let mut session_id = vec![0u8; sid_len];
+        rng.fill_bytes(&mut session_id);
+        body.extend_from_slice(&session_id);
+    }
+
+    // Cipher suites: GREASE (если профиль использует GREASE) + base + GREASE (Chrome в конце)
+    let base_ciphers = profile.cipher_suites();
+    let grease_count = if profile.has_grease() { 1 } else { 0 };
+    let trailing_grease = if matches!(profile, TlsProfile::Chrome130) {
+        1 // Chrome добавляет GREASE в конце cipher suites
+    } else {
+        0
+    };
+    let total_ciphers = base_ciphers.len() + grease_count + trailing_grease;
+    let cs_len = (total_ciphers * 2) as u16;
+    body.extend_from_slice(&cs_len.to_be_bytes());
+    if profile.has_grease() {
+        body.extend_from_slice(&cipher_g.to_be_bytes()); // GREASE first
+    }
+    for &cs in base_ciphers {
+        body.extend_from_slice(&cs.to_be_bytes());
+    }
+    if trailing_grease > 0 {
+        body.extend_from_slice(&cipher_g.to_be_bytes()); // GREASE at end (Chrome)
+    }
+
+    // Compression methods — null only (все профили)
+    body.push(1); // list length
+    body.push(0x00); // null compression
+
+    // Extensions
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(extensions);
+
+    body
+}
+
+/// Builds ClientHello с указанным профилем.
+fn build_client_hello_with_profile(
+    sni: &str,
+    rng: &mut PerConnRng,
+    profile: TlsProfile,
+    is_resumption: bool,
+) -> Vec<u8> {
+    assert!(
+        sni.len() >= MIN_SNI_LEN && sni.len() <= MAX_SNI_LEN,
+        "SNI length {} out of range [{}, {}]",
+        sni.len(),
+        MIN_SNI_LEN,
+        MAX_SNI_LEN
+    );
+
+    let grease = rng.generate_grease_set();
+    let (_cipher_g, ext_g, group_g, ver_g) = grease;
+
+    // 1. Build extensions based on profile
+    let mut extensions = Vec::with_capacity(1400);
+
+    // GREASE extension (first, empty data) — для Chrome/Safari/Firefox
+    if profile.has_grease() {
+        push_grease_extension(&mut extensions, ext_g);
+    }
+
+    // SNI (0x0000) — всегда
+    push_sni_extension(&mut extensions, sni);
+
+    // extended_master_secret (0x0017) — все
+    push_empty_extension(&mut extensions, EXT_EXTENDED_MASTER_SECRET);
+
+    // renegotiation_info (0xFF01) — все
+    push_renegotiation_info(&mut extensions);
+
+    // supported_groups (0x000A) — profile-specific
+    push_supported_groups_profiled(&mut extensions, profile, group_g);
+
+    // session_ticket (0x0023) — profile-specific
+    if profile.has_session_ticket() {
+        if is_resumption {
+            // Non-empty session ticket для 0-RTT resumption
+            let ticket: [u8; 4] = rng.next_wire_u64().to_be_bytes()[..4].try_into().unwrap();
+            extensions.extend_from_slice(&EXT_SESSION_TICKET.to_be_bytes());
+            extensions.extend_from_slice(&4u16.to_be_bytes());
+            extensions.extend_from_slice(&ticket);
+        } else {
+            push_empty_extension(&mut extensions, EXT_SESSION_TICKET);
+        }
+    }
+
+    // ALPN (0x0010) — profile-specific
+    push_alpn_extension_profiled(&mut extensions, profile.alpn());
+
+    // SCT (0x0012) — все кроме curl
+    if profile.has_sct() {
+        push_empty_extension(&mut extensions, EXT_SCT);
+    }
+
+    // signature_algorithms (0x000D) — все
+    push_sig_algs_extension(&mut extensions);
+
+    // key_share (0x0033) — profile-specific
+    push_key_share_extension_profiled(&mut extensions, rng, profile);
+
+    // PSK kex modes (0x002D) — все
+    push_psk_kex_modes(&mut extensions);
+
+    // supported_versions (0x002B) — все (используем существующую правильную реализацию)
+    push_supported_versions(&mut extensions, ver_g);
+
+    // compress_certificate (0x001B) — profile-specific
+    if profile.has_compress_certificate() {
+        push_compress_certificate(&mut extensions);
+    }
+
+    // application_settings (0x4469) — только Chrome
+    if profile.has_application_settings() {
+        push_application_settings(&mut extensions);
+    }
+
+    // ECH GREASE (0xFE0D) — только Chrome
+    if profile.has_ech_grease() {
+        push_ech_grease_extension(&mut extensions, rng);
+    }
+
+    // early_data (0x4433) — только при resumption
+    if is_resumption {
+        push_early_data_extension(&mut extensions);
+    }
+
+    // GREASE extension (second, before padding) — для Chrome/Safari/Firefox
+    if profile.has_grease() {
+        let grease2 = rng.pick_grease();
+        push_grease_extension(&mut extensions, grease2);
+    }
+
+    // padding (0x0015) — последний
+    push_padding_extension(&mut extensions, rng);
+
+    // 2. Build ClientHello body
+    let body = build_ch_body_profiled(rng, grease, &extensions, profile);
+
+    // 3. Wrap in handshake header
+    let handshake = wrap_handshake(&body);
+
+    // 4. Wrap in TLS record layer
+    wrap_record(&handshake)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1705,5 +2210,134 @@ mod tests {
             ja4.starts_with("t13d"),
             "Template JA4 should start with t13d"
         );
+    }
+
+    // ========================================================================
+    // T49: 4 profile-specific builders — JA4 fingerprint tests
+    // ========================================================================
+
+    #[test]
+    fn test_profile_chrome_has_ech_grease() {
+        let mut rng = PerConnRng::new(42);
+        let chrome_ch = build_chrome_130_ch("example.com", &mut rng);
+        assert!(
+            chrome_ch
+                .windows(2)
+                .any(|w| w == EXT_ENCRYPTED_CLIENT_HELLO.to_be_bytes()),
+            "Chrome CH must have ECH GREASE extension (0xFE0D)"
+        );
+    }
+
+    #[test]
+    fn test_profile_firefox_no_ech_grease() {
+        let mut rng = PerConnRng::new(42);
+        let firefox_ch = build_firefox_120_ch("example.com", &mut rng);
+        assert!(
+            !firefox_ch
+                .windows(2)
+                .any(|w| w == EXT_ENCRYPTED_CLIENT_HELLO.to_be_bytes()),
+            "Firefox CH must NOT have ECH GREASE extension (0xFE0D)"
+        );
+    }
+
+    #[test]
+    fn test_profile_curl_no_h2_alpn() {
+        let mut rng = PerConnRng::new(42);
+        let curl_ch = build_curl_8_ch("example.com", &mut rng);
+        // curl не должен иметь h2 ALPN (h2 = 0x02 0x68 0x32)
+        assert!(
+            !curl_ch.windows(3).any(|w| w == b"\x02h2"),
+            "curl CH must NOT have h2 ALPN"
+        );
+    }
+
+    #[test]
+    fn test_profile_chrome_has_x25519mlkem768() {
+        let mut rng = PerConnRng::new(42);
+        let chrome_ch = build_chrome_130_ch("example.com", &mut rng);
+        assert!(
+            chrome_ch
+                .windows(2)
+                .any(|w| w == GROUP_X25519MLKEM768.to_be_bytes()),
+            "Chrome CH must have X25519MLKEM768 (0x11EC) in supported_groups"
+        );
+    }
+
+    #[test]
+    fn test_profile_firefox_no_x25519mlkem768() {
+        let mut rng = PerConnRng::new(42);
+        let firefox_ch = build_firefox_120_ch("example.com", &mut rng);
+        assert!(
+            !firefox_ch
+                .windows(2)
+                .any(|w| w == GROUP_X25519MLKEM768.to_be_bytes()),
+            "Firefox CH must NOT have X25519MLKEM768 (0x11EC)"
+        );
+    }
+
+    #[test]
+    fn test_ja4_different_per_profile() {
+        let mut rng = PerConnRng::new(42);
+        let chrome_ch = build_chrome_130_ch("example.com", &mut rng);
+        let firefox_ch = build_firefox_120_ch("example.com", &mut rng);
+        let safari_ch = build_safari_17_ch("example.com", &mut rng);
+        let curl_ch = build_curl_8_ch("example.com", &mut rng);
+
+        let chrome_ja4 = calculate_ja4(&chrome_ch).unwrap();
+        let firefox_ja4 = calculate_ja4(&firefox_ch).unwrap();
+        let safari_ja4 = calculate_ja4(&safari_ch).unwrap();
+        let curl_ja4 = calculate_ja4(&curl_ch).unwrap();
+
+        // Все 4 JA4 должны быть РАЗНЫМИ
+        let mut ja4s = vec![&chrome_ja4, &firefox_ja4, &safari_ja4, &curl_ja4];
+        ja4s.sort();
+        ja4s.dedup();
+        assert_eq!(
+            ja4s.len(),
+            4,
+            "All 4 JA4 fingerprints should be different, got: {:?}",
+            ja4s
+        );
+
+        // Каждый JA4 должен начинаться с t13d
+        assert!(chrome_ja4.starts_with("t13d"), "Chrome JA4: {}", chrome_ja4);
+        assert!(
+            firefox_ja4.starts_with("t13d"),
+            "Firefox JA4: {}",
+            firefox_ja4
+        );
+        assert!(safari_ja4.starts_with("t13d"), "Safari JA4: {}", safari_ja4);
+        assert!(curl_ja4.starts_with("t13d"), "curl JA4: {}", curl_ja4);
+    }
+
+    #[test]
+    fn test_profile_chrome_valid_tls_record() {
+        let mut rng = PerConnRng::new(42);
+        let ch = build_chrome_130_ch("example.com", &mut rng);
+        assert!(is_client_hello(&ch), "Chrome CH should be valid TLS record");
+    }
+
+    #[test]
+    fn test_profile_firefox_valid_tls_record() {
+        let mut rng = PerConnRng::new(42);
+        let ch = build_firefox_120_ch("example.com", &mut rng);
+        assert!(
+            is_client_hello(&ch),
+            "Firefox CH should be valid TLS record"
+        );
+    }
+
+    #[test]
+    fn test_profile_curl_valid_tls_record() {
+        let mut rng = PerConnRng::new(42);
+        let ch = build_curl_8_ch("example.com", &mut rng);
+        assert!(is_client_hello(&ch), "curl CH should be valid TLS record");
+    }
+
+    #[test]
+    fn test_profile_safari_valid_tls_record() {
+        let mut rng = PerConnRng::new(42);
+        let ch = build_safari_17_ch("example.com", &mut rng);
+        assert!(is_client_hello(&ch), "Safari CH should be valid TLS record");
     }
 }

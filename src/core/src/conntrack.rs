@@ -1,7 +1,7 @@
 //! Connection tracking — отслеживание состояния TCP/UDP соединений.
 
 use dashmap::DashMap;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,8 +9,8 @@ use tracing::debug;
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub struct ConnKey {
-    pub src_ip: Ipv4Addr,
-    pub dst_ip: Ipv4Addr,
+    pub src_ip: IpAddr,
+    pub dst_ip: IpAddr,
     pub src_port: u16,
     pub dst_port: u16,
     pub proto: u8,
@@ -18,19 +18,29 @@ pub struct ConnKey {
 
 impl ConnKey {
     pub fn new(
-        src_ip: Ipv4Addr,
-        dst_ip: Ipv4Addr,
+        src_ip: impl Into<IpAddr>,
+        dst_ip: impl Into<IpAddr>,
         src_port: u16,
         dst_port: u16,
         proto: u8,
     ) -> Self {
         Self {
-            src_ip,
-            dst_ip,
+            src_ip: src_ip.into(),
+            dst_ip: dst_ip.into(),
             src_port,
             dst_port,
             proto,
         }
+    }
+
+    /// Возвращает true если оба IP — IPv4.
+    pub fn is_ipv4(&self) -> bool {
+        self.src_ip.is_ipv4() && self.dst_ip.is_ipv4()
+    }
+
+    /// Возвращает true если оба IP — IPv6.
+    pub fn is_ipv6(&self) -> bool {
+        self.src_ip.is_ipv6() && self.dst_ip.is_ipv6()
     }
 }
 
@@ -246,7 +256,7 @@ impl Default for Conntrack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::time::Instant;
 
     fn test_key() -> ConnKey {

@@ -19,6 +19,17 @@ pub struct TcpProbeResult {
     pub ip: Option<Ipv4Addr>,
 }
 
+// === T54.5: Default implementation ===
+impl Default for TcpProbeResult {
+    fn default() -> Self {
+        Self {
+            verdict: TcpFailureCode::ConnectOk,
+            rtt_us: 0,
+            ip: None,
+        }
+    }
+}
+
 /// TCP Probe — parallel dial racing.
 pub struct TcpProbe {
     config: ProbeConfig,

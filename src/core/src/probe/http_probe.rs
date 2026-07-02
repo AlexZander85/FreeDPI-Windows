@@ -24,6 +24,42 @@ pub struct HttpProbeResult {
     pub bytes_read: u64,
     pub redirect_url: Option<String>,
     pub latency_us: u64,
+    // T50.2: expanded timing & metadata
+    /// HTTP status code (200, 451, 302, etc.)
+    pub status_code: u16,
+    /// Total size of HTTP response headers in bytes
+    pub headers_size: u64,
+    /// Time to first byte of HTTP response (ms), 0 if failed
+    pub first_byte_rtt_ms: f64,
+    /// Total HTTP response time (ms), 0 if failed
+    pub total_rtt_ms: f64,
+}
+
+// === T54.5: Default implementation ===
+impl Default for HttpProbeResult {
+    fn default() -> Self {
+        Self {
+            verdict: HttpFailureCode::Ok,
+            bytes_read: 0,
+            redirect_url: None,
+            latency_us: 0,
+            status_code: 0,
+            headers_size: 0,
+            first_byte_rtt_ms: 0.0,
+            total_rtt_ms: 0.0,
+        }
+    }
+}
+
+/// Compute approximate HTTP response headers wire size.
+fn compute_headers_size(headers: &reqwest::header::HeaderMap) -> u64 {
+    let mut size: u64 = 15; // approximate "HTTP/1.1 200 OK\r\n"
+    for (name, value) in headers {
+        size += name.as_str().len() as u64 + 2; // ": "
+        size += value.len() as u64 + 2; // value + "\r\n"
+    }
+    size += 2; // final \r\n
+    size
 }
 
 /// HTTP Probe — GET request + response analysis.
@@ -59,8 +95,10 @@ impl HttpProbe {
         .await
         {
             Ok(Ok(resp)) => {
-                let latency = start.elapsed().as_micros() as u64;
+                let first_byte_us = start.elapsed().as_micros() as u64;
+                let first_byte_rtt_ms = first_byte_us as f64 / 1000.0;
                 let status = resp.status().as_u16();
+                let headers_size = compute_headers_size(resp.headers());
 
                 // HTTP 451: legal block
                 if status == 451 {
@@ -69,7 +107,11 @@ impl HttpProbe {
                         verdict: HttpFailureCode::Http451,
                         bytes_read: 0,
                         redirect_url: None,
-                        latency_us: latency,
+                        latency_us: first_byte_us,
+                        status_code: 451,
+                        headers_size,
+                        first_byte_rtt_ms,
+                        total_rtt_ms: first_byte_rtt_ms,
                     };
                 }
 
@@ -101,7 +143,11 @@ impl HttpProbe {
                             },
                             bytes_read: 0,
                             redirect_url: Some(redir.clone()),
-                            latency_us: latency,
+                            latency_us: first_byte_us,
+                            status_code: status,
+                            headers_size,
+                            first_byte_rtt_ms,
+                            total_rtt_ms: first_byte_rtt_ms,
                         };
                     }
                 }
@@ -109,6 +155,7 @@ impl HttpProbe {
                 // Read response body
                 match resp.bytes().await {
                     Ok(body) => {
+                        let total_rtt_ms = start.elapsed().as_micros() as f64 / 1000.0;
                         let bytes_read = body.len() as u64;
 
                         // Check for RKN stub (configurable substrings)
@@ -118,7 +165,11 @@ impl HttpProbe {
                                 verdict: HttpFailureCode::StubPage,
                                 bytes_read,
                                 redirect_url: None,
-                                latency_us: latency,
+                                latency_us: first_byte_us,
+                                status_code: status,
+                                headers_size,
+                                first_byte_rtt_ms,
+                                total_rtt_ms,
                             };
                         }
 
@@ -129,7 +180,11 @@ impl HttpProbe {
                                 verdict: HttpFailureCode::Cutoff,
                                 bytes_read,
                                 redirect_url: None,
-                                latency_us: latency,
+                                latency_us: first_byte_us,
+                                status_code: status,
+                                headers_size,
+                                first_byte_rtt_ms,
+                                total_rtt_ms,
                             };
                         }
 
@@ -137,16 +192,25 @@ impl HttpProbe {
                             verdict: HttpFailureCode::Ok,
                             bytes_read,
                             redirect_url: None,
-                            latency_us: latency,
+                            latency_us: first_byte_us,
+                            status_code: status,
+                            headers_size,
+                            first_byte_rtt_ms,
+                            total_rtt_ms,
                         }
                     }
                     Err(e) => {
                         debug!("HTTP read error for {}: {}", domain, e);
+                        let failed_total_ms = start.elapsed().as_micros() as f64 / 1000.0;
                         HttpProbeResult {
                             verdict: HttpFailureCode::Cutoff,
                             bytes_read: 0,
                             redirect_url: None,
-                            latency_us: start.elapsed().as_micros() as u64,
+                            latency_us: first_byte_us,
+                            status_code: status,
+                            headers_size,
+                            first_byte_rtt_ms,
+                            total_rtt_ms: failed_total_ms,
                         }
                     }
                 }
@@ -158,6 +222,10 @@ impl HttpProbe {
                     bytes_read: 0,
                     redirect_url: None,
                     latency_us: start.elapsed().as_micros() as u64,
+                    status_code: 0,
+                    headers_size: 0,
+                    first_byte_rtt_ms: 0.0,
+                    total_rtt_ms: 0.0,
                 }
             }
             Err(_) => {
@@ -167,6 +235,10 @@ impl HttpProbe {
                     bytes_read: 0,
                     redirect_url: None,
                     latency_us: self.config.http_read_timeout.as_micros() as u64,
+                    status_code: 0,
+                    headers_size: 0,
+                    first_byte_rtt_ms: 0.0,
+                    total_rtt_ms: 0.0,
                 }
             }
         }
@@ -184,10 +256,35 @@ mod tests {
             bytes_read: 500,
             redirect_url: Some("https://other.com".into()),
             latency_us: 12000,
+            status_code: 200,
+            headers_size: 128,
+            first_byte_rtt_ms: 45.0,
+            total_rtt_ms: 120.0,
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: HttpProbeResult = serde_json::from_str(&json).unwrap();
         assert_eq!(back.verdict, HttpFailureCode::Cutoff);
         assert_eq!(back.bytes_read, 500);
+        assert_eq!(back.status_code, 200);
+        assert_eq!(back.headers_size, 128);
+        assert!((back.first_byte_rtt_ms - 45.0).abs() < 0.001);
+        assert!((back.total_rtt_ms - 120.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_compute_headers_size_empty() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert_eq!(compute_headers_size(&headers), 17); // status line + final \r\n
+    }
+
+    #[test]
+    fn test_compute_headers_size_with_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "text/html".parse().unwrap());
+        headers.insert("content-length", "1234".parse().unwrap());
+        let size = compute_headers_size(&headers);
+        // 15 (status) + (12+2+9+2) "content-type: text/html\r\n" + (14+2+4+2) "content-length: 1234\r\n" + 2 (final \r\n)
+        // = 15 + 25 + 22 + 2 = 64
+        assert_eq!(size, 64);
     }
 }

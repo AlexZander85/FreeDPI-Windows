@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Вердикт probe'а: заблокировано, доступно или неоднозначно.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProbeVerdict {
     /// Сервер доступен, DPI не блокирует
@@ -15,6 +15,7 @@ pub enum ProbeVerdict {
     /// DPI блокирует соединение
     Blocked,
     /// Неоднозначно, нужен re-probe
+    #[default]
     Ambiguous,
 }
 
@@ -44,7 +45,7 @@ impl ProbeVerdict {
 }
 
 /// Типы DNS-блокировок.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DnsFailureCode {
     /// UDP возвращает другие IP чем DoH (DNS poisoning)
@@ -60,6 +61,7 @@ pub enum DnsFailureCode {
     /// Ни UDP, ни DoH не резолвит (unresolvable)
     Unresolvable,
     /// DNS работает корректно
+    #[default]
     Ok,
 }
 
@@ -84,10 +86,11 @@ impl DnsFailureCode {
 }
 
 /// Типы TCP-блокировок.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TcpFailureCode {
     /// TCP handshake прошёл успешно
+    #[default]
     ConnectOk,
     /// ConnectionResetError (TCP RST injection)
     Reset,
@@ -119,10 +122,11 @@ impl TcpFailureCode {
 }
 
 /// Типы TLS-блокировок.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsFailureCode {
     /// TLS handshake прошёл
+    #[default]
     HandshakeOk,
     /// TLS 1.3 работает
     Version13Ok,
@@ -191,10 +195,11 @@ impl TlsFailureCode {
 }
 
 /// Типы HTTP-блокировок.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HttpFailureCode {
     /// HTTP 200 OK
+    #[default]
     Ok,
     /// Response обрезан (данные оборваны)
     Cutoff,
@@ -229,10 +234,11 @@ impl HttpFailureCode {
 }
 
 /// Этап TCP/TLS соединения (stage tracking).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionStage {
     /// TCP connect (SYN phase)
+    #[default]
     TcpConnect,
     /// SYN-ACK получен
     TcpConnected,

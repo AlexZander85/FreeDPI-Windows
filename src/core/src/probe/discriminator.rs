@@ -18,7 +18,7 @@ use crate::probe::classifier::{HttpFailureCode, ProbeVerdict, TlsFailureCode};
 use serde::{Deserialize, Serialize};
 
 /// Тип происхождения блокировки.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockOrigin {
     /// Блокировка от сервера (geo-block, mTLS, rate limit)
@@ -26,11 +26,12 @@ pub enum BlockOrigin {
     /// Блокировка на пути (DPI, middlebox)
     PathActive,
     /// Неоднозначно
+    #[default]
     Ambiguous,
 }
 
 /// Результат дискриминации.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DiscriminationResult {
     pub origin: BlockOrigin,
     pub verdict: ProbeVerdict,

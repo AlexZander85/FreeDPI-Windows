@@ -8,6 +8,9 @@
 
 use crate::adaptive::strategy::StrategyCategory;
 use crate::probe::classifier::*;
+use crate::probe::ja4_probe::FingerprintVerdict;
+use crate::probe::ml_classifier::MlVerdict;
+use crate::probe::quic_probe::QuicVerdict;
 use crate::probe::ProbeResult;
 use serde::{Deserialize, Serialize};
 
@@ -176,6 +179,94 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
         }
     }
 
+    // JA4 Fingerprint recommendations (T45)
+    if let Some(ref ja4) = result.ja4 {
+        match ja4.verdict {
+            FingerprintVerdict::FingerprintBlocking => {
+                let working = ja4.working_profile.as_deref().unwrap_or("unknown");
+                recs.push(StrategyRecommendation {
+                    strategy_id: 50,
+                    strategy_name: "ja4_spoof".into(),
+                    category: StrategyCategory::Tls,
+                    confidence: 0.90,
+                    rationale: format!("Fingerprint blocking detected — spoof JA4 of {}", working,),
+                });
+            }
+            FingerprintVerdict::SniBasedBlocking => {
+                recs.push(StrategyRecommendation {
+                    strategy_id: 4,
+                    strategy_name: "hostfake".into(),
+                    category: StrategyCategory::Tcp,
+                    confidence: 0.85,
+                    rationale:
+                        "SNI-based blocking confirmed by JA4 probe (all fingerprints blocked)"
+                            .into(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // QUIC recommendations (T46)
+    if let Some(ref quic_verdict) = result.quic_verdict {
+        match quic_verdict {
+            QuicVerdict::QuicBlocked => {
+                recs.push(StrategyRecommendation {
+                    strategy_id: 60,
+                    strategy_name: "force_tcp_http2".into(),
+                    category: StrategyCategory::General,
+                    confidence: 0.85,
+                    rationale: "QUIC blocked — force HTTP/2 over TCP (disable HTTP/3)".into(),
+                });
+            }
+            QuicVerdict::QuicBypass => {
+                recs.push(StrategyRecommendation {
+                    strategy_id: 61,
+                    strategy_name: "force_quic".into(),
+                    category: StrategyCategory::General,
+                    confidence: 0.90,
+                    rationale: "TCP blocked, QUIC works — force HTTP/3 (disable TCP fallback)"
+                        .into(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // ML-based recommendations (T47)
+    if let Some(ref ml) = result.ml {
+        match ml.verdict {
+            MlVerdict::Blocked => {
+                recs.push(StrategyRecommendation {
+                    strategy_id: 70,
+                    strategy_name: "ml_anomaly_response".into(),
+                    category: StrategyCategory::Tcp,
+                    confidence: ml.score,
+                    rationale: format!(
+                        "ML anomaly score {:.2} — timing analysis suggests DPI interference",
+                        ml.score,
+                    ),
+                });
+            }
+            MlVerdict::Suspicious => {
+                // Suspicious — soft recommendation, lower confidence
+                recs.push(StrategyRecommendation {
+                    strategy_id: 70,
+                    strategy_name: "ml_anomaly_response".into(),
+                    category: StrategyCategory::Tcp,
+                    confidence: ml.score * 0.7,
+                    rationale: format!(
+                        "ML anomaly score {:.2} — suspicious timing, consider reprobe",
+                        ml.score,
+                    ),
+                });
+            }
+            MlVerdict::Clear => {
+                // Clear signal — no ML-based action needed
+            }
+        }
+    }
+
     // Data-volume recommendations
     if let Some(ref tcp16) = result.tcp16 {
         if tcp16.detected {
@@ -232,6 +323,10 @@ mod tests {
                 doh_ips: vec![],
                 latency_us: 0,
                 fake_ip_detected: false,
+                udp_rtt_ms: 0.0,
+                doh_rtt_ms: 0.0,
+                udp_response_size: 0,
+                doh_response_size: 0,
             },
             tcp: TcpProbeResult {
                 verdict: tcp,
@@ -244,12 +339,22 @@ mod tests {
                 tls12_ok: false,
                 stage: crate::probe::classifier::ConnectionStage::TlsConnected,
                 latency_us: 50000,
+                server_hello_size: 0,
+                cert_count: 0,
+                negotiated_version: None,
+                negotiated_cipher: None,
             }),
             http: None,
             tcp16: None,
             discrimination: None,
+            ja4: None,
+            quic: None,
+            quic_verdict: None,
+            features: None,
+            ml: None,
             should_tunnel: false,
             timestamp: "".into(),
+            decision: None,
         }
     }
 
@@ -301,8 +406,48 @@ mod tests {
             bytes_read: 0,
             redirect_url: None,
             latency_us: 0,
+            status_code: 451,
+            headers_size: 0,
+            first_byte_rtt_ms: 0.0,
+            total_rtt_ms: 0.0,
         });
         let recs = recommend(&result);
         assert!(recs.iter().any(|r| r.strategy_name == "socks5_fallback"));
+    }
+
+    #[test]
+    fn test_recommend_ml_blocked() {
+        let mut result = make_test_result(
+            DnsFailureCode::Ok,
+            TcpFailureCode::ConnectOk,
+            Some(TlsFailureCode::HandshakeOk),
+        );
+        result.ml = Some(crate::probe::ml_classifier::MlResult {
+            score: 0.85,
+            verdict: MlVerdict::Blocked,
+            top_features: vec![("tls_tcp_ratio".into(), 1.5)],
+        });
+        let recs = recommend(&result);
+        assert!(recs
+            .iter()
+            .any(|r| r.strategy_name == "ml_anomaly_response"));
+    }
+
+    #[test]
+    fn test_recommend_ml_suspicious() {
+        let mut result = make_test_result(
+            DnsFailureCode::Ok,
+            TcpFailureCode::ConnectOk,
+            Some(TlsFailureCode::HandshakeOk),
+        );
+        result.ml = Some(crate::probe::ml_classifier::MlResult {
+            score: 0.45,
+            verdict: MlVerdict::Suspicious,
+            top_features: vec![("inter_phase_jitter".into(), 0.8)],
+        });
+        let recs = recommend(&result);
+        assert!(recs
+            .iter()
+            .any(|r| r.strategy_name == "ml_anomaly_response"));
     }
 }

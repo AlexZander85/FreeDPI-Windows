@@ -2,6 +2,7 @@
 //!
 //! 4-way set-associative hash table (1024 sets × 4 ways) для O(1) lookup.
 
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const NUM_SETS: usize = 1024;
@@ -62,8 +63,16 @@ impl HopTab {
         init_ttl.saturating_sub(recv_ttl)
     }
 
-    pub fn ip_to_u32(ip: &std::net::Ipv4Addr) -> u32 {
-        ip.to_bits()
+    pub fn ip_to_u32(ip: &IpAddr) -> u32 {
+        match ip {
+            IpAddr::V4(v4) => v4.to_bits(),
+            IpAddr::V6(v6) => {
+                let bits = v6.to_bits() as u64;
+                let upper = (bits >> 32) as u32;
+                let lower = bits as u32;
+                upper ^ lower
+            }
+        }
     }
 
     fn hash(ip: u32) -> usize {
@@ -124,7 +133,7 @@ impl HopTab {
         })
     }
 
-    pub fn fake_ttl_for_ip(&self, ip: &std::net::Ipv4Addr) -> Option<u8> {
+    pub fn fake_ttl_for_ip(&self, ip: &IpAddr) -> Option<u8> {
         self.fake_ttl(Self::ip_to_u32(ip))
     }
 
@@ -241,7 +250,7 @@ mod tests {
     #[test]
     fn test_insert_get() {
         let tab = HopTab::new();
-        let ip = HopTab::ip_to_u32(&Ipv4Addr::new(8, 8, 8, 8));
+        let ip = HopTab::ip_to_u32(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         tab.insert(ip, 13);
         assert_eq!(tab.get(ip), Some(13));
     }
@@ -249,7 +258,7 @@ mod tests {
     #[test]
     fn test_fake_ttl() {
         let tab = HopTab::new();
-        let ip = HopTab::ip_to_u32(&Ipv4Addr::new(8, 8, 8, 8));
+        let ip = HopTab::ip_to_u32(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         tab.insert(ip, 13);
         assert_eq!(tab.fake_ttl(ip), Some(12));
     }
@@ -264,14 +273,14 @@ mod tests {
             tab.insert(ip, (i % 60) as u8 + 1);
         }
         // Verify some entries are still accessible
-        let ip = HopTab::ip_to_u32(&Ipv4Addr::new(1, 0, 0, 0));
+        let ip = HopTab::ip_to_u32(&IpAddr::V4(Ipv4Addr::new(1, 0, 0, 0)));
         assert!(tab.get(ip).is_some());
     }
 
     #[test]
     fn test_observe_robust_no_outlier() {
         let tab = HopTab::new();
-        let ip = HopTab::ip_to_u32(&Ipv4Addr::new(8, 8, 8, 8));
+        let ip = HopTab::ip_to_u32(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         tab.observe_robust(ip, 58); // estimate=2 (Cloudflare: 60-58)
         tab.observe_robust(ip, 59); // estimate=1, diff=1, accepted
         let hops = tab.get(ip).unwrap();
@@ -282,7 +291,7 @@ mod tests {
     #[test]
     fn test_observe_robust_outlier_rejected() {
         let tab = HopTab::new();
-        let ip = HopTab::ip_to_u32(&Ipv4Addr::new(8, 8, 8, 8));
+        let ip = HopTab::ip_to_u32(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         tab.observe_robust(ip, 58); // estimate=2 (Cloudflare: 60-58)
         tab.observe_robust(ip, 10); // estimate=44 (Windows: 128-10), diff=42 > 5, rejected
         assert_eq!(tab.get(ip), Some(2));

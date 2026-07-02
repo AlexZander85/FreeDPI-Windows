@@ -35,8 +35,9 @@ use smallvec::{smallvec, SmallVec};
 
 use pnet_packet::ip::IpNextHeaderProtocol;
 use pnet_packet::ipv4::MutableIpv4Packet;
+use pnet_packet::ipv6::MutableIpv6Packet;
 use pnet_packet::MutablePacket;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Результат применения desync техники.
 ///
@@ -662,36 +663,189 @@ pub fn ipv4_checksum(header: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-/// Вспомогательная функция: вычисляет TCP checksum.
-pub fn tcp_checksum_v4(src: Ipv4Addr, dst: Ipv4Addr, segment: &[u8]) -> u16 {
+/// Вспомогательная функция: вычисляет TCP checksum (IPv4 или IPv6).
+pub fn tcp_checksum(src: IpAddr, dst: IpAddr, segment: &[u8]) -> u16 {
     use pnet_packet::util;
-    util::ipv4_checksum(
-        segment,
-        8,
-        &[],
-        &src,
-        &dst,
-        pnet_packet::ip::IpNextHeaderProtocols::Tcp,
-    )
+    match (src, dst) {
+        (IpAddr::V4(src_v4), IpAddr::V4(dst_v4)) => util::ipv4_checksum(
+            segment,
+            8,
+            &[],
+            &src_v4,
+            &dst_v4,
+            pnet_packet::ip::IpNextHeaderProtocols::Tcp,
+        ),
+        (IpAddr::V6(src_v6), IpAddr::V6(dst_v6)) => util::ipv6_checksum(
+            segment,
+            8,
+            &[],
+            &src_v6,
+            &dst_v6,
+            pnet_packet::ip::IpNextHeaderProtocols::Tcp,
+        ),
+        _ => 0, // разнородные пары V4/V6 не встречаются
+    }
 }
 
-/// Парсит IP header для извлечения полей.
+/// Вспомогательная функция: вычисляет UDP checksum (IPv4 или IPv6).
+/// Для IPv4 checksum опционален (0 = отключён).
+/// Для IPv6 checksum обязателен (RFC 2460 §8.1).
+pub fn udp_checksum(src: IpAddr, dst: IpAddr, segment: &[u8]) -> u16 {
+    use pnet_packet::util;
+    match (src, dst) {
+        (IpAddr::V4(src_v4), IpAddr::V4(dst_v4)) => util::ipv4_checksum(
+            segment,
+            8,
+            &[],
+            &src_v4,
+            &dst_v4,
+            pnet_packet::ip::IpNextHeaderProtocols::Udp,
+        ),
+        (IpAddr::V6(src_v6), IpAddr::V6(dst_v6)) => util::ipv6_checksum(
+            segment,
+            8,
+            &[],
+            &src_v6,
+            &dst_v6,
+            pnet_packet::ip::IpNextHeaderProtocols::Udp,
+        ),
+        _ => 0,
+    }
+}
+
+/// Парсит IP header (IPv4 или IPv6).
 pub fn parse_ip_header(packet: &[u8]) -> Option<ParsedIpHeader> {
-    let ip = pnet_packet::ipv4::Ipv4Packet::new(packet)?;
-    Some(ParsedIpHeader {
+    if packet.is_empty() {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    match version {
+        4 => {
+            let ip = pnet_packet::ipv4::Ipv4Packet::new(packet)?;
+            Some(ParsedIpHeader::V4(ParsedIpHeaderV4 {
+                src: ip.get_source(),
+                dst: ip.get_destination(),
+                protocol: ip.get_next_level_protocol(),
+                identification: ip.get_identification(),
+                ttl: ip.get_ttl(),
+                header_len: (ip.get_header_length() as usize) * 4,
+                total_len: ip.get_total_length() as usize,
+            }))
+        }
+        6 => {
+            let v6 = parse_ipv6_header(packet)?;
+            Some(ParsedIpHeader::V6(ParsedIpHeaderV6 {
+                src: v6.src,
+                dst: v6.dst,
+                next_header: v6.protocol,
+                hop_limit: v6.hop_limit,
+                header_len: v6.header_len,
+                total_len: v6.header_len + v6.payload_len,
+                fragment_offset: v6.fragment_offset,
+                fragment_identification: v6.fragment_identification,
+                fragment_more: v6.fragment_more,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Парсит IPv6 header с цепочкой extension headers (RFC 2460 §4).
+///
+/// Поддерживает:
+/// - Hop-by-Hop Options (0)
+/// - Routing (43)
+/// - Fragment Header (44) — извлекает offset/identification/More
+/// - Destination Options (60)
+/// - ESP (50) / AH (51) — останавливает парсинг (зашифровано)
+/// - No Next Header (59) — конец пакета
+///
+/// Возвращает `ParsedIpv6Header` с актуальным `header_len` (включая extension headers)
+/// и `protocol` = реальный протокол (TCP, UDP, ICMPv6, ...).
+pub fn parse_ipv6_header(packet: &[u8]) -> Option<ParsedIpv6Header> {
+    let ip = pnet_packet::ipv6::Ipv6Packet::new(packet)?;
+    let mut next_header = ip.get_next_header().0;
+    let mut offset = 40; // start after fixed IPv6 header (40 bytes)
+    let mut fragment_offset_units: Option<u16> = None;
+    let mut fragment_identification: Option<u32> = None;
+    let mut fragment_more: Option<bool> = None;
+
+    // Parse extension headers chain (RFC 2460 §4)
+    loop {
+        match next_header {
+            0 | 43 | 60 => {
+                // Hop-by-Hop / Routing / Destination Options
+                // Format: next_header(1) + header_ext_len(1) + options(...)
+                // header_ext_len is in 8-byte units, NOT including the first 8 bytes
+                if offset + 2 > packet.len() {
+                    break;
+                }
+                let ext_next = packet[offset];
+                let ext_len = packet[offset + 1] as usize;
+                let ext_total = (ext_len + 1) * 8; // +1 because length doesn't include first 8 bytes
+                if offset + ext_total > packet.len() {
+                    break;
+                }
+                offset += ext_total;
+                next_header = ext_next;
+            }
+            44 => {
+                // Fragment Header (RFC 2460 §4.5) — fixed 8 bytes
+                // Format: next_header(1) + reserved(1) + fragment_offset(13bits)+res(2bits)+M(1bit) (2) + identification(4)
+                if offset + 8 > packet.len() {
+                    break;
+                }
+                let frag_next = packet[offset];
+                let frag_field = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+                fragment_offset_units = Some(frag_field >> 3); // 13 bits
+                fragment_more = Some((frag_field & 0x01) != 0);
+                fragment_identification = Some(u32::from_be_bytes([
+                    packet[offset + 4],
+                    packet[offset + 5],
+                    packet[offset + 6],
+                    packet[offset + 7],
+                ]));
+                offset += 8;
+                next_header = frag_next;
+            }
+            50 | 51 => {
+                // ESP / AH — skip (encrypted/authenticated, can't parse further)
+                break;
+            }
+            59 => {
+                // No Next Header — packet ends here
+                break;
+            }
+            _ => {
+                // Terminal protocol (TCP=6, UDP=17, ICMPv6=58, etc.)
+                break;
+            }
+        }
+    }
+
+    Some(ParsedIpv6Header {
         src: ip.get_source(),
         dst: ip.get_destination(),
-        protocol: ip.get_next_level_protocol(),
-        identification: ip.get_identification(),
-        ttl: ip.get_ttl(),
-        header_len: (ip.get_header_length() as usize) * 4,
-        total_len: ip.get_total_length() as usize,
+        protocol: pnet_packet::ip::IpNextHeaderProtocol(next_header),
+        hop_limit: ip.get_hop_limit(),
+        header_len: offset, // actual offset including extension headers
+        payload_len: packet.len().saturating_sub(offset),
+        fragment_offset: fragment_offset_units,
+        fragment_identification,
+        fragment_more,
     })
 }
 
-/// Распарсенный IP header.
+/// Распарсенный IP header (IPv4 или IPv6).
 #[derive(Debug, Clone)]
-pub struct ParsedIpHeader {
+pub enum ParsedIpHeader {
+    V4(ParsedIpHeaderV4),
+    V6(ParsedIpHeaderV6),
+}
+
+/// Поля IPv4-заголовка.
+#[derive(Debug, Clone)]
+pub struct ParsedIpHeaderV4 {
     pub src: Ipv4Addr,
     pub dst: Ipv4Addr,
     pub protocol: IpNextHeaderProtocol,
@@ -699,6 +853,88 @@ pub struct ParsedIpHeader {
     pub ttl: u8,
     pub header_len: usize,
     pub total_len: usize,
+}
+
+/// Поля IPv6-заголовка (no identification, no header checksum).
+#[derive(Debug, Clone)]
+pub struct ParsedIpHeaderV6 {
+    pub src: Ipv6Addr,
+    pub dst: Ipv6Addr,
+    pub next_header: IpNextHeaderProtocol,
+    pub hop_limit: u8,
+    pub header_len: usize,
+    pub total_len: usize,
+    /// Fragment offset in 8-byte units (если есть Fragment Header)
+    pub fragment_offset: Option<u16>,
+    /// Fragment identification (если есть Fragment Header)
+    pub fragment_identification: Option<u32>,
+    /// More fragments flag (если есть Fragment Header)
+    pub fragment_more: Option<bool>,
+}
+
+/// Полный распарсенный IPv6 заголовок с extension headers.
+#[derive(Debug, Clone)]
+pub struct ParsedIpv6Header {
+    pub src: Ipv6Addr,
+    pub dst: Ipv6Addr,
+    pub protocol: IpNextHeaderProtocol,
+    pub hop_limit: u8,
+    pub header_len: usize,
+    pub payload_len: usize,
+    /// Fragment offset in 8-byte units (если есть Fragment Header)
+    pub fragment_offset: Option<u16>,
+    /// Fragment identification (если есть Fragment Header)
+    pub fragment_identification: Option<u32>,
+    /// More fragments flag (если есть Fragment Header)
+    pub fragment_more: Option<bool>,
+}
+
+impl ParsedIpHeader {
+    pub fn src(&self) -> IpAddr {
+        match self {
+            ParsedIpHeader::V4(v4) => IpAddr::V4(v4.src),
+            ParsedIpHeader::V6(v6) => IpAddr::V6(v6.src),
+        }
+    }
+    pub fn dst(&self) -> IpAddr {
+        match self {
+            ParsedIpHeader::V4(v4) => IpAddr::V4(v4.dst),
+            ParsedIpHeader::V6(v6) => IpAddr::V6(v6.dst),
+        }
+    }
+    pub fn protocol(&self) -> IpNextHeaderProtocol {
+        match self {
+            ParsedIpHeader::V4(v4) => v4.protocol,
+            ParsedIpHeader::V6(v6) => v6.next_header,
+        }
+    }
+    /// Identification (IPv4: реальное значение; IPv6: 0 — нет фиксированного поля ID).
+    pub fn identification(&self) -> u16 {
+        match self {
+            ParsedIpHeader::V4(v4) => v4.identification,
+            ParsedIpHeader::V6(_) => 0,
+        }
+    }
+    /// TTL (IPv4) / Hop Limit (IPv6).
+    pub fn ttl(&self) -> u8 {
+        match self {
+            ParsedIpHeader::V4(v4) => v4.ttl,
+            ParsedIpHeader::V6(v6) => v6.hop_limit,
+        }
+    }
+    /// Длина IP заголовка (IPv4: IHL*4; IPv6: 40 + extension headers).
+    pub fn header_len(&self) -> usize {
+        match self {
+            ParsedIpHeader::V4(v4) => v4.header_len,
+            ParsedIpHeader::V6(v6) => v6.header_len,
+        }
+    }
+    pub fn total_len(&self) -> usize {
+        match self {
+            ParsedIpHeader::V4(v4) => v4.total_len,
+            ParsedIpHeader::V6(v6) => v6.total_len,
+        }
+    }
 }
 
 /// Парсит TCP пакет (payload после IP header).
@@ -732,37 +968,81 @@ pub struct ParsedTcpPacket<'a> {
     pub urg_ptr: u16,
 }
 
-/// Строит новый IP пакет (zero-copy: возвращает Bytes).
+/// Строит новый IP пакет (IPv4 или IPv6).
 pub fn build_ip_packet(
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
+    src: IpAddr,
+    dst: IpAddr,
     protocol: IpNextHeaderProtocol,
     ttl: u8,
     identification: u16,
     payload: &[u8],
 ) -> bytes::Bytes {
-    let total_len = 20 + payload.len();
-    let mut buf = bytes::BytesMut::with_capacity(total_len);
-    buf.resize(total_len, 0);
+    match (src, dst) {
+        (IpAddr::V4(src_v4), IpAddr::V4(dst_v4)) => {
+            let total_len = 20 + payload.len();
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
 
-    {
-        let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
-        ip.set_version(4);
-        ip.set_header_length(5);
-        ip.set_total_length(total_len as u16);
-        ip.set_identification(identification);
-        ip.set_flags(0);
-        ip.set_fragment_offset(0);
-        ip.set_ttl(ttl);
-        ip.set_next_level_protocol(protocol);
-        ip.set_source(src);
-        ip.set_destination(dst);
-        ip.payload_mut().copy_from_slice(payload);
+            {
+                let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
+                ip.set_version(4);
+                ip.set_header_length(5);
+                ip.set_total_length(total_len as u16);
+                ip.set_identification(identification);
+                ip.set_flags(0);
+                ip.set_fragment_offset(0);
+                ip.set_ttl(ttl);
+                ip.set_next_level_protocol(protocol);
+                ip.set_source(src_v4);
+                ip.set_destination(dst_v4);
+                ip.payload_mut().copy_from_slice(payload);
+            }
+
+            let checksum = ipv4_checksum(&buf[..20]);
+            buf[10..12].copy_from_slice(&checksum.to_be_bytes());
+            buf.freeze()
+        }
+        (IpAddr::V6(src_v6), IpAddr::V6(dst_v6)) => {
+            let total_len = 40 + payload.len();
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
+
+            {
+                let mut ip = MutableIpv6Packet::new(&mut buf).unwrap();
+                ip.set_version(6);
+                ip.set_traffic_class(0);
+                ip.set_flow_label(0);
+                ip.set_payload_length(payload.len() as u16);
+                ip.set_next_header(protocol);
+                ip.set_hop_limit(ttl);
+                ip.set_source(src_v6);
+                ip.set_destination(dst_v6);
+                ip.payload_mut().copy_from_slice(payload);
+            }
+
+            buf.freeze()
+        }
+        _ => {
+            // Разнородные V4/V6 — невалидная комбинация, строим V4 с нулевыми адресами
+            tracing::warn!("build_ip_packet: mixed V4/V6 src/dst, using V4 fallback");
+            let total_len = 20 + payload.len();
+            let mut buf = bytes::BytesMut::with_capacity(total_len);
+            buf.resize(total_len, 0);
+            let mut ip = MutableIpv4Packet::new(&mut buf).unwrap();
+            ip.set_version(4);
+            ip.set_header_length(5);
+            ip.set_total_length(total_len as u16);
+            ip.set_identification(identification);
+            ip.set_flags(0);
+            ip.set_fragment_offset(0);
+            ip.set_ttl(ttl);
+            ip.set_next_level_protocol(protocol);
+            ip.payload_mut().copy_from_slice(payload);
+            let checksum = ipv4_checksum(&buf[..20]);
+            buf[10..12].copy_from_slice(&checksum.to_be_bytes());
+            buf.freeze()
+        }
     }
-
-    let checksum = ipv4_checksum(&buf[..20]);
-    buf[10..12].copy_from_slice(&checksum.to_be_bytes());
-    buf.freeze()
 }
 
 /// Incremental IP/TCP checksum update для одного 16-bit слова.

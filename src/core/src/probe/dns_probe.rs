@@ -29,17 +29,44 @@ pub struct DnsProbeResult {
     pub latency_us: u64,
     /// Обнаружены ли fake-IP адреса
     pub fake_ip_detected: bool,
+    // T50.3: раздельные метрики UDP и DoH
+    /// UDP DNS query RTT (ms), 0.0 if failed
+    pub udp_rtt_ms: f64,
+    /// DoH DNS query RTT (ms), 0.0 if failed
+    pub doh_rtt_ms: f64,
+    /// UDP DNS response size in bytes
+    pub udp_response_size: usize,
+    /// DoH DNS response size in bytes
+    pub doh_response_size: usize,
+}
+
+// === T54.5: Default implementation ===
+impl Default for DnsProbeResult {
+    fn default() -> Self {
+        Self {
+            verdict: DnsFailureCode::Ok,
+            resolved_ips: Vec::new(),
+            udp_ips: Vec::new(),
+            doh_ips: Vec::new(),
+            latency_us: 0,
+            fake_ip_detected: false,
+            udp_rtt_ms: 0.0,
+            doh_rtt_ms: 0.0,
+            udp_response_size: 0,
+            doh_response_size: 0,
+        }
+    }
 }
 
 /// Результат одного UDP DNS запроса.
 #[derive(Debug, Clone)]
 enum UdpDnsResult {
-    /// Успешный ответ с IP адресами
-    Ok(Vec<Ipv4Addr>),
+    /// Успешный ответ с IP адресами + latency_us + response_size
+    Ok(Vec<Ipv4Addr>, u64, usize),
     /// NXDOMAIN — домен не существует (по rcode)
-    Nxdomain,
+    Nxdomain(usize),
     /// Пустой ответ ( есть заголовок, но нет A-записей)
-    EmptyResponse,
+    EmptyResponse(usize),
     /// Таймаут — нет ответа
     Timeout,
     /// Ошибка парсинга или другая ошибка
@@ -84,6 +111,8 @@ impl DnsProbe {
             }
         };
 
+        let query_start = std::time::Instant::now();
+
         if let Err(e) = socket.send_to(&query, sock_addr).await {
             warn!("UDP send failed to {}: {}", server, e);
             return UdpDnsResult::Error;
@@ -91,7 +120,13 @@ impl DnsProbe {
 
         let mut buf = vec![0u8; 512];
         match tokio::time::timeout(self.config.dns_timeout, socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, _))) => parse_dns_response_detailed(&buf[..len]),
+            Ok(Ok((len, _))) => {
+                let latency = query_start.elapsed().as_micros() as u64;
+                match parse_dns_response_detailed(&buf[..len]) {
+                    UdpDnsResult::Ok(ips, _, _) => UdpDnsResult::Ok(ips, latency, len),
+                    other => other, // Nxdomain, EmptyResponse, etc. already have sizes
+                }
+            }
             Ok(Err(e)) => {
                 debug!("UDP recv error from {}: {}", server, e);
                 UdpDnsResult::Error
@@ -104,11 +139,13 @@ impl DnsProbe {
     }
 
     /// Запрос A-записи через DoH (RFC 8484, GET с base64).
-    async fn query_doh(&self, domain: &str, url: &str) -> Vec<Ipv4Addr> {
+    /// Возвращает (ips, latency_us, response_size).
+    async fn query_doh(&self, domain: &str, url: &str) -> (Vec<Ipv4Addr>, u64, usize) {
         let query = build_dns_query(domain);
         let encoded = base64url_encode(&query);
 
         let doh_url = format!("{}?dns={}", url, encoded);
+        let query_start = std::time::Instant::now();
 
         match tokio::time::timeout(
             self.config.dns_timeout,
@@ -117,26 +154,30 @@ impl DnsProbe {
         .await
         {
             Ok(Ok(resp)) => {
+                let latency = query_start.elapsed().as_micros() as u64;
                 if resp.status().is_success() {
                     match resp.bytes().await {
-                        Ok(body) => parse_dns_response_ips(&body),
+                        Ok(body) => {
+                            let size = body.len();
+                            (parse_dns_response_ips(&body), latency, size)
+                        }
                         Err(e) => {
                             debug!("DoH read error: {}", e);
-                            vec![]
+                            (vec![], latency, 0)
                         }
                     }
                 } else {
                     debug!("DoH HTTP status: {}", resp.status());
-                    vec![]
+                    (vec![], latency, 0)
                 }
             }
             Ok(Err(e)) => {
                 debug!("DoH request error: {}", e);
-                vec![]
+                (vec![], 0, 0)
             }
             Err(_) => {
                 debug!("DoH timeout for {}", url);
-                vec![]
+                (vec![], 0, 0)
             }
         }
     }
@@ -180,13 +221,23 @@ impl DnsProbe {
         let mut all_udp_ips: Vec<Ipv4Addr> = Vec::new();
         let mut any_udp_timeout = false;
         let mut any_udp_nxdomain = false;
+        let mut udp_latencies: Vec<u64> = Vec::new();
+        let mut udp_response_sizes: Vec<usize> = Vec::new();
 
         for result in udp_results {
             match result {
-                UdpDnsResult::Ok(ips) => {
+                UdpDnsResult::Ok(ips, latency, size) => {
                     all_udp_ips.extend(ips);
+                    udp_latencies.push(latency);
+                    udp_response_sizes.push(size);
                 }
-                UdpDnsResult::Nxdomain => any_udp_nxdomain = true,
+                UdpDnsResult::Nxdomain(size) => {
+                    any_udp_nxdomain = true;
+                    udp_response_sizes.push(size);
+                }
+                UdpDnsResult::EmptyResponse(size) => {
+                    udp_response_sizes.push(size);
+                }
                 UdpDnsResult::Timeout => any_udp_timeout = true,
                 _ => {}
             }
@@ -195,7 +246,18 @@ impl DnsProbe {
         all_udp_ips.dedup();
 
         // Merge DoH results
-        let mut doh_ips: Vec<Ipv4Addr> = doh_results.into_iter().flatten().collect();
+        let mut doh_ips: Vec<Ipv4Addr> = Vec::new();
+        let mut doh_latencies: Vec<u64> = Vec::new();
+        let mut doh_response_sizes: Vec<usize> = Vec::new();
+        for (ips, latency, size) in doh_results {
+            if !ips.is_empty() {
+                doh_latencies.push(latency);
+            }
+            if size > 0 {
+                doh_response_sizes.push(size);
+            }
+            doh_ips.extend(ips);
+        }
         doh_ips.sort();
         doh_ips.dedup();
 
@@ -214,6 +276,22 @@ impl DnsProbe {
         // Check for fake-IP ranges
         let fake_ip_detected = resolved_ips.iter().any(|ip| is_fake_ip(*ip));
 
+        // Compute aggregate RTT/response-size: use min RTT, max response size
+        let udp_rtt_ms = udp_latencies
+            .iter()
+            .min()
+            .copied()
+            .map(|v| v as f64 / 1000.0)
+            .unwrap_or(0.0);
+        let doh_rtt_ms = doh_latencies
+            .iter()
+            .min()
+            .copied()
+            .map(|v| v as f64 / 1000.0)
+            .unwrap_or(0.0);
+        let udp_response_size = udp_response_sizes.iter().max().copied().unwrap_or(0);
+        let doh_response_size = doh_response_sizes.iter().max().copied().unwrap_or(0);
+
         DnsProbeResult {
             verdict,
             resolved_ips,
@@ -221,6 +299,10 @@ impl DnsProbe {
             doh_ips,
             latency_us,
             fake_ip_detected,
+            udp_rtt_ms,
+            doh_rtt_ms,
+            udp_response_size,
+            doh_response_size,
         }
     }
 }
@@ -329,7 +411,8 @@ fn build_dns_query(domain: &str) -> Vec<u8> {
 
 /// Parse DNS response с детекцией NXDOMAIN (rcode).
 fn parse_dns_response_detailed(response: &[u8]) -> UdpDnsResult {
-    if response.len() < 12 {
+    let resp_len = response.len();
+    if resp_len < 12 {
         return UdpDnsResult::Error;
     }
 
@@ -339,7 +422,7 @@ fn parse_dns_response_detailed(response: &[u8]) -> UdpDnsResult {
 
     // NXDOMAIN = rcode 3
     if rcode == 3 {
-        return UdpDnsResult::Nxdomain;
+        return UdpDnsResult::Nxdomain(resp_len);
     }
 
     // SERVFAIL = rcode 2, REFUSED = rcode 5
@@ -349,9 +432,9 @@ fn parse_dns_response_detailed(response: &[u8]) -> UdpDnsResult {
 
     let ips = parse_dns_response_ips(response);
     if ips.is_empty() {
-        UdpDnsResult::EmptyResponse
+        UdpDnsResult::EmptyResponse(resp_len)
     } else {
-        UdpDnsResult::Ok(ips)
+        UdpDnsResult::Ok(ips, 0, resp_len)
     }
 }
 
@@ -569,6 +652,6 @@ mod tests {
         response[2] = 0x81; // QR=1, OPCODE=0
         response[3] = 0x83; // RCODE=3 (NXDOMAIN)
         let result = parse_dns_response_detailed(&response);
-        assert!(matches!(result, UdpDnsResult::Nxdomain));
+        assert!(matches!(result, UdpDnsResult::Nxdomain(..)));
     }
 }

@@ -121,7 +121,7 @@ impl Protocol {
 /// Результат обработки пакета
 #[derive(Debug)]
 pub enum PacketAction {
-    /// Пропустить пакет без изменений (forward)
+    /// Пропустить пакет как есть (forward)
     Forward,
     /// Заблокировать пакет (drop)
     Drop,
