@@ -11,16 +11,24 @@ use tracing::{debug, error, info, warn};
 pub struct SocksRedirector {
     table: Arc<RedirectTable>,
     proxy_provider: Arc<Mutex<OperaVpnProvider>>,
+    pub custom_proxy: Arc<std::sync::RwLock<crate::config::CustomProxyConfig>>,
 }
 
 impl SocksRedirector {
-    pub fn new(table: Arc<RedirectTable>) -> Self {
+    pub fn new(table: Arc<RedirectTable>, custom_proxy: crate::config::CustomProxyConfig) -> Self {
         // Default runtime blocks on temp thread in Default impl of OperaVpnProvider
         let provider = OperaVpnProvider::default();
         Self {
             table,
             proxy_provider: Arc::new(Mutex::new(provider)),
+            custom_proxy: Arc::new(std::sync::RwLock::new(custom_proxy)),
         }
+    }
+
+    /// Обновляет параметры кастомного прокси.
+    pub fn update_custom_proxy(&self, cfg: crate::config::CustomProxyConfig) {
+        let mut w = self.custom_proxy.write().unwrap();
+        *w = cfg;
     }
 
     /// Запуск SOCKS5 редиректора и фонового пинга прокси.
@@ -74,52 +82,42 @@ impl SocksRedirector {
             .clone()
             .unwrap_or_else(|| entry.orig_dst_ip.to_string());
 
-        // 1. Выбираем лучший живой прокси
-        let proxy_opt = {
-            let provider = self.proxy_provider.lock().await;
-            let alive = provider.alive_proxies();
-            if !alive.is_empty() {
-                // Выбираем первый живой
-                Some((alive[0].host.clone(), alive[0].port))
-            } else {
-                None
-            }
-        };
+        let custom = { self.custom_proxy.read().unwrap().clone() };
 
-        let mut outbound = if let Some((proxy_host, proxy_port)) = proxy_opt {
+        let mut outbound = if custom.enabled {
             debug!(
-                "SocksRedirector: routing connection to {}:{} via SOCKS5 proxy {}:{}",
-                target_host, entry.orig_dst_port, proxy_host, proxy_port
+                "SocksRedirector: routing connection to {}:{} via custom SOCKS5 proxy {}:{}",
+                target_host, entry.orig_dst_port, custom.host, custom.port
             );
-
-            match TcpStream::connect((proxy_host.as_str(), proxy_port)).await {
-                Ok(mut proxy_conn) => {
-                    // SOCKS5 Handshake
-                    if let Err(e) = socks5_handshake_noauth(&mut proxy_conn).await {
-                        warn!("SocksRedirector: SOCKS5 handshake with proxy failed: {}", e);
-                        // Fallback: connect direct
-                        self.connect_direct(&target_host, entry.orig_dst_port)
+            match TcpStream::connect((custom.host.as_str(), custom.port)).await {
+                Ok(mut conn) => {
+                    let u = custom.username.as_deref();
+                    let p = custom.password.as_deref();
+                    if let Err(e) = socks5_handshake_auth(&mut conn, u, p).await {
+                        warn!("SocksRedirector: custom SOCKS5 handshake failed: {}", e);
+                        self.fallback_or_direct(&target_host, entry.orig_dst_port, &custom)
                             .await?
                     } else if let Err(e) =
-                        socks5_connect(&mut proxy_conn, &target_host, entry.orig_dst_port).await
+                        socks5_connect(&mut conn, &target_host, entry.orig_dst_port).await
                     {
-                        warn!("SocksRedirector: SOCKS5 connect request failed: {}", e);
-                        // Fallback: connect direct
-                        self.connect_direct(&target_host, entry.orig_dst_port)
+                        warn!("SocksRedirector: custom SOCKS5 connect failed: {}", e);
+                        self.fallback_or_direct(&target_host, entry.orig_dst_port, &custom)
                             .await?
                     } else {
-                        proxy_conn
+                        conn
                     }
                 }
                 Err(e) => {
-                    warn!("SocksRedirector: failed to connect to proxy: {}. Trying direct connection.", e);
-                    self.connect_direct(&target_host, entry.orig_dst_port)
+                    warn!(
+                        "SocksRedirector: failed to connect to custom proxy: {}. Trying fallback.",
+                        e
+                    );
+                    self.fallback_or_direct(&target_host, entry.orig_dst_port, &custom)
                         .await?
                 }
             }
         } else {
-            warn!("SocksRedirector: no alive Opera SOCKS5 proxies found. Falling back to direct connection.");
-            self.connect_direct(&target_host, entry.orig_dst_port)
+            self.connect_via_opera(&target_host, entry.orig_dst_port)
                 .await?
         };
 
@@ -135,11 +133,109 @@ impl SocksRedirector {
         Ok(())
     }
 
+    async fn fallback_or_direct(
+        &self,
+        host: &str,
+        port: u16,
+        custom: &crate::config::CustomProxyConfig,
+    ) -> anyhow::Result<TcpStream> {
+        if custom.use_opera_fallback {
+            debug!("SocksRedirector: falling back to Opera SOCKS5 proxies");
+            self.connect_via_opera(host, port).await
+        } else {
+            debug!("SocksRedirector: no fallback configured, trying direct connection");
+            self.connect_direct(host, port).await
+        }
+    }
+
+    async fn connect_via_opera(&self, host: &str, port: u16) -> anyhow::Result<TcpStream> {
+        let proxy_opt = {
+            let provider = self.proxy_provider.lock().await;
+            let alive = provider.alive_proxies();
+            if !alive.is_empty() {
+                Some((alive[0].host.clone(), alive[0].port))
+            } else {
+                None
+            }
+        };
+
+        if let Some((proxy_host, proxy_port)) = proxy_opt {
+            debug!(
+                "SocksRedirector: routing connection to {}:{} via Opera SOCKS5 proxy {}:{}",
+                host, port, proxy_host, proxy_port
+            );
+
+            match TcpStream::connect((proxy_host.as_str(), proxy_port)).await {
+                Ok(mut proxy_conn) => {
+                    if let Err(e) = socks5_handshake_noauth(&mut proxy_conn).await {
+                        warn!("SocksRedirector: Opera SOCKS5 handshake failed: {}", e);
+                        self.connect_direct(host, port).await
+                    } else if let Err(e) = socks5_connect(&mut proxy_conn, host, port).await {
+                        warn!("SocksRedirector: Opera SOCKS5 connect failed: {}", e);
+                        self.connect_direct(host, port).await
+                    } else {
+                        Ok(proxy_conn)
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "SocksRedirector: failed to connect to Opera proxy: {}. Trying direct connection.",
+                        e
+                    );
+                    self.connect_direct(host, port).await
+                }
+            }
+        } else {
+            warn!("SocksRedirector: no alive Opera SOCKS5 proxies found. Falling back to direct connection.");
+            self.connect_direct(host, port).await
+        }
+    }
+
     async fn connect_direct(&self, host: &str, port: u16) -> anyhow::Result<TcpStream> {
         debug!("SocksRedirector: connecting directly to {}:{}", host, port);
         let stream = TcpStream::connect((host, port)).await?;
         Ok(stream)
     }
+}
+
+/// SOCKS5 handshake с поддержкой аутентификации (RFC 1928 / RFC 1929).
+async fn socks5_handshake_auth(
+    s: &mut TcpStream,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> anyhow::Result<()> {
+    if let (Some(u), Some(p)) = (username, password) {
+        // Отправляем greeting: версия 5, 2 метода: без аутентификации (0x00) и User/Pass (0x02)
+        s.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
+
+        let mut resp = [0u8; 2];
+        s.read_exact(&mut resp).await?;
+        if resp[0] != 0x05 {
+            anyhow::bail!("SOCKS5 handshake failed");
+        }
+
+        if resp[1] == 0x02 {
+            // Аутентификация User/Pass
+            let mut req = Vec::new();
+            req.push(0x01); // Версия субдоговора
+            req.push(u.len() as u8);
+            req.extend_from_slice(u.as_bytes());
+            req.push(p.len() as u8);
+            req.extend_from_slice(p.as_bytes());
+            s.write_all(&req).await?;
+
+            let mut auth_resp = [0u8; 2];
+            s.read_exact(&mut auth_resp).await?;
+            if auth_resp[0] != 0x01 || auth_resp[1] != 0x00 {
+                anyhow::bail!("SOCKS5 authentication failed");
+            }
+        } else if resp[1] != 0x00 {
+            anyhow::bail!("SOCKS5 proxy rejected authentication methods");
+        }
+    } else {
+        socks5_handshake_noauth(s).await?;
+    }
+    Ok(())
 }
 
 /// SOCKS5 handshake без аутентификации (RFC 1928, метод 0x00).
@@ -207,4 +303,69 @@ async fn socks5_connect(s: &mut TcpStream, host: &str, port: u16) -> anyhow::Res
     s.read_exact(&mut skip_buf).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_socks5_handshake_noauth() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Spawn mock server
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            socket.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 0x05); // Version 5
+            socket.write_all(&[0x05, 0x00]).await.unwrap(); // ChosenMethod NoAuth
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let res = socks5_handshake_auth(&mut client, None, None).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_socks5_handshake_auth_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Spawn mock server
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // greeting (Version, NumMethods, Method1, Method2)
+            let mut greeting = [0u8; 4];
+            socket.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 0x05);
+            socket.write_all(&[0x05, 0x02]).await.unwrap(); // ChosenMethod User/Pass (0x02)
+
+            // Auth request
+            let mut sub_ver = [0u8; 1];
+            socket.read_exact(&mut sub_ver).await.unwrap();
+            assert_eq!(sub_ver[0], 0x01);
+
+            let mut ulen = [0u8; 1];
+            socket.read_exact(&mut ulen).await.unwrap();
+            let mut uname = vec![0u8; ulen[0] as usize];
+            socket.read_exact(&mut uname).await.unwrap();
+            assert_eq!(uname, b"user");
+
+            let mut plen = [0u8; 1];
+            socket.read_exact(&mut plen).await.unwrap();
+            let mut pword = vec![0u8; plen[0] as usize];
+            socket.read_exact(&mut pword).await.unwrap();
+            assert_eq!(pword, b"pass");
+
+            // Write auth response (success)
+            socket.write_all(&[0x01, 0x00]).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let res = socks5_handshake_auth(&mut client, Some("user"), Some("pass")).await;
+        assert!(res.is_ok());
+    }
 }

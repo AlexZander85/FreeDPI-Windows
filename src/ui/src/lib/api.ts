@@ -84,6 +84,20 @@ export interface GeoblockState {
   static_count: number;
   user_domains: string[];
   probed_domains: string[];
+  custom_proxy_enabled: boolean;
+  custom_proxy_host: string;
+  custom_proxy_port: number;
+  custom_proxy_username?: string;
+  use_opera_fallback: boolean;
+}
+
+export interface CustomProxyConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  use_opera_fallback: boolean;
 }
 
 export async function getGeoblockState(port?: number) {
@@ -96,4 +110,8 @@ export async function addGeoblockDomain(domain: string, port?: number) {
 
 export async function removeGeoblockDomain(domain: string, port?: number) {
   return invoke<void>("remove_geoblock_domain", { domain, apiPort: port });
+}
+
+export async function saveGeoblockProxyConfig(cfg: CustomProxyConfig, port?: number) {
+  return invoke<void>("save_geoblock_proxy_config", { cfg, apiPort: port });
 }

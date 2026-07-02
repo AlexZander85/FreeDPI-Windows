@@ -4,6 +4,7 @@ import {
   getGeoblockState,
   addGeoblockDomain,
   removeGeoblockDomain,
+  saveGeoblockProxyConfig,
   GeoblockState,
 } from "@/lib/api";
 
@@ -29,6 +30,13 @@ export default function GeoPanel() {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<{ text: string; ok: boolean } | null>(null);
 
+  const [proxyEnabled, setProxyEnabled] = useState(false);
+  const [proxyHost, setProxyHost] = useState("");
+  const [proxyPort, setProxyPort] = useState(1080);
+  const [proxyUsername, setProxyUsername] = useState("");
+  const [proxyPassword, setProxyPassword] = useState("");
+  const [operaFallback, setOperaFallback] = useState(true);
+
   const load = useCallback(async () => {
     try {
       const gs = await getGeoblockState();
@@ -46,6 +54,32 @@ export default function GeoPanel() {
     const interval = setInterval(load, 3000);
     return () => clearInterval(interval);
   }, [load]);
+
+  useEffect(() => {
+    if (state) {
+      setProxyEnabled((prev) => (state.custom_proxy_enabled !== undefined ? state.custom_proxy_enabled : prev));
+      setProxyHost((prev) => state.custom_proxy_host || prev);
+      setProxyPort((prev) => state.custom_proxy_port || prev);
+      setProxyUsername((prev) => state.custom_proxy_username || prev);
+      setOperaFallback((prev) => (state.use_opera_fallback !== undefined ? state.use_opera_fallback : prev));
+    }
+  }, [state]);
+
+  const handleSaveProxy = async () => {
+    try {
+      await saveGeoblockProxyConfig({
+        enabled: proxyEnabled,
+        host: proxyHost,
+        port: proxyPort,
+        username: proxyUsername || undefined,
+        password: proxyPassword || undefined,
+        use_opera_fallback: operaFallback,
+      });
+      showMsg(t("settings.saved") || "Saved", true);
+    } catch (e) {
+      showMsg(String(e), false);
+    }
+  };
 
   const showMsg = (text: string, ok: boolean) => {
     setMessage({ text, ok });
@@ -139,6 +173,115 @@ export default function GeoPanel() {
             );
           })}
         </div>
+      </div>
+
+      {/* Custom SOCKS5 Proxy Settings */}
+      <div 
+        className="p-4 rounded-xl space-y-4"
+        style={{ 
+          background: "var(--bg-elevated)", 
+          border: "1px solid var(--border)",
+          boxShadow: "0 4px 6px rgba(0,0,0,0.02)"
+        }}
+      >
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-semibold uppercase tracking-wider" style={{ color: "var(--text-secondary)" }}>
+            {t("geo.proxy_title") || "Кастомный SOCKS5 Прокси"}
+          </h3>
+          <button 
+            onClick={handleSaveProxy}
+            className="px-4 py-1.5 text-xs font-semibold rounded-lg shadow-sm active:scale-95 transition-all"
+            style={{ background: "var(--accent)", color: "white" }}
+          >
+            {t("geo.save_proxy_btn") || "Сохранить"}
+          </button>
+        </div>
+
+        <div className="flex items-center justify-between pt-1">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input 
+              type="checkbox" 
+              checked={proxyEnabled} 
+              onChange={(e) => setProxyEnabled(e.target.checked)}
+              className="w-4 h-4 rounded accent-indigo-600"
+            />
+            <span className="text-xs font-medium">{t("geo.proxy_enable") || "Использовать кастомный прокси"}</span>
+          </label>
+        </div>
+
+        {proxyEnabled && (
+          <div className="space-y-3 pt-2">
+            <div className="grid grid-cols-3 gap-3">
+              <div className="col-span-2 space-y-1">
+                <label className="text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
+                  Host / IP
+                </label>
+                <input 
+                  type="text" 
+                  value={proxyHost}
+                  onChange={(e) => setProxyHost(e.target.value)}
+                  placeholder="127.0.0.1"
+                  className="w-full px-3 py-1.5 text-xs rounded-lg outline-none"
+                  style={{ background: "var(--bg-muted)", border: "1px solid var(--border)", color: "var(--text)" }}
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
+                  Port
+                </label>
+                <input 
+                  type="number" 
+                  value={proxyPort}
+                  onChange={(e) => setProxyPort(Number(e.target.value))}
+                  placeholder="1080"
+                  className="w-full px-3 py-1.5 text-xs rounded-lg outline-none"
+                  style={{ background: "var(--bg-muted)", border: "1px solid var(--border)", color: "var(--text)" }}
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label className="text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
+                  Username
+                </label>
+                <input 
+                  type="text" 
+                  value={proxyUsername}
+                  onChange={(e) => setProxyUsername(e.target.value)}
+                  placeholder="Optional"
+                  className="w-full px-3 py-1.5 text-xs rounded-lg outline-none"
+                  style={{ background: "var(--bg-muted)", border: "1px solid var(--border)", color: "var(--text)" }}
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
+                  Password
+                </label>
+                <input 
+                  type="password" 
+                  value={proxyPassword}
+                  onChange={(e) => setProxyPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full px-3 py-1.5 text-xs rounded-lg outline-none"
+                  style={{ background: "var(--bg-muted)", border: "1px solid var(--border)", color: "var(--text)" }}
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between pt-1">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input 
+                  type="checkbox" 
+                  checked={operaFallback} 
+                  onChange={(e) => setOperaFallback(e.target.checked)}
+                  className="w-4 h-4 rounded accent-indigo-600"
+                />
+                <span className="text-xs">{t("geo.opera_fallback") || "Использовать Opera Proxy как fallback"}</span>
+              </label>
+            </div>
+          </div>
+        )}
       </div>
 
       <hr style={{ borderColor: "var(--border)" }} />

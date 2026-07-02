@@ -48,3 +48,13 @@ proxy_domains_file = "blocked_domains.txt"
 auto_probe = true
 max_connections = 1000
 idle_timeout_secs = 300
+
+# Custom SOCKS5 Proxy Configuration
+[proxy.custom_proxy]
+enabled = false
+host = "127.0.0.1"
+port = 1080
+# Optional credentials
+# username = "user"
+# password = "password"
+use_opera_fallback = true

@@ -267,6 +267,7 @@ impl Config {
             desync: desync_config,
             techniques,
             strategies: self.strategies.clone(),
+            proxy_config: self.proxy.clone(),
         }
     }
 }
@@ -666,6 +667,22 @@ fake_ttl_offset = 1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CustomProxyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default = "default_true")]
+    pub use_opera_fallback: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
     /// Включить Opera SOCKS5 proxy routing вообще.
     #[serde(default)]
@@ -681,6 +698,9 @@ pub struct ProxyConfig {
     pub auto_probe: bool,
     pub max_connections: Option<usize>,
     pub idle_timeout_secs: Option<u64>,
+    /// Пользовательский кастомный прокси с авторизацией
+    #[serde(default)]
+    pub custom_proxy: CustomProxyConfig,
 }
 
 /// T60: Читает домены из файла, игнорируя пустые строки и комментарии (#...).

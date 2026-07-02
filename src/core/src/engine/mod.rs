@@ -110,6 +110,7 @@ pub struct ProcessingConfig {
     pub desync: DesyncConfig,
     pub techniques: Vec<DesyncTechnique>,
     pub strategies: Vec<crate::config::StrategyProfileConfig>,
+    pub proxy_config: crate::config::ProxyConfig,
 }
 
 impl Default for ProcessingConfig {
@@ -125,6 +126,7 @@ impl Default for ProcessingConfig {
             desync: DesyncConfig::default(),
             techniques: Vec::new(),
             strategies: Vec::new(),
+            proxy_config: crate::config::ProxyConfig::default(),
         }
     }
 }
@@ -150,6 +152,7 @@ pub struct ProcessingPipeline {
     /// Один пул на все workers (ArrayQueue — lock-free MPMC, безопасно для concurrent access).
     buf_pool: Arc<PacketBufferPool>,
     redirect_table: Arc<crate::desync::redirect_table::RedirectTable>,
+    socks_redirector: Arc<crate::socks::redirector::SocksRedirector>,
     /// Флаг наличия non-empty session ticket от сервера.
     /// Устанавливается после успешного TLS handshake, когда сервер
     /// прислал session ticket. Используется для 0-RTT resumption
@@ -294,9 +297,11 @@ impl ProcessingPipeline {
         // Запуск SOCKS5-редиректора в бэкграунде
         let redirector = Arc::new(crate::socks::redirector::SocksRedirector::new(
             redirect_table.clone(),
+            config.proxy_config.custom_proxy.clone(),
         ));
+        let redirector_clone = redirector.clone();
         tokio::spawn(async move {
-            if let Err(e) = redirector.run(17650).await {
+            if let Err(e) = redirector_clone.run(17650).await {
                 tracing::error!("Failed to start SocksRedirector: {}", e);
             }
         });
@@ -320,6 +325,7 @@ impl ProcessingPipeline {
             auto_tune: std::sync::Mutex::new(auto_tune),
             buf_pool,
             redirect_table,
+            socks_redirector: redirector,
             has_non_empty_session_ticket: false,
         })
     }
@@ -375,6 +381,10 @@ impl ProcessingPipeline {
         }
 
         let redirect_table = Arc::new(crate::desync::redirect_table::RedirectTable::new());
+        let redirector = Arc::new(crate::socks::redirector::SocksRedirector::new(
+            redirect_table.clone(),
+            config.proxy_config.custom_proxy.clone(),
+        ));
 
         Self {
             packet_engine,
@@ -395,9 +405,15 @@ impl ProcessingPipeline {
             auto_tune: std::sync::Mutex::new(auto_tune),
             buf_pool,
             redirect_table,
+            socks_redirector: redirector,
             has_non_empty_session_ticket: false,
         }
     }
+
+    pub fn socks_redirector(&self) -> &Arc<crate::socks::redirector::SocksRedirector> {
+        &self.socks_redirector
+    }
+
     pub fn profile_registry(&self) -> &Arc<StrategyProfileRegistry> {
         &self.profile_registry
     }

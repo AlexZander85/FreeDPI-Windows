@@ -93,7 +93,11 @@
     "add_btn": "Add",
     "no_custom_domains": "No custom geoblocked domains",
     "probed_title": "Dynamically Probed Domains",
-    "bad_routes": "Bad routes: {{count}}"
+    "bad_routes": "Bad routes: {{count}}",
+    "proxy_title": "Custom SOCKS5 Proxy",
+    "proxy_enable": "Use Custom SOCKS5 Proxy",
+    "opera_fallback": "Fallback to Opera free SOCKS5 proxies if custom proxy fails",
+    "save_proxy_btn": "Save"
   },
   "settings": {
     "title": "Settings",

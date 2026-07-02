@@ -94,10 +94,11 @@ struct ServiceEngine {
     probe_history: std::sync::Mutex<Vec<serde_json::Value>>,
     pub pipeline: std::sync::OnceLock<Arc<ProcessingPipeline>>,
     split_tunnel: std::sync::Mutex<SplitTunnel>,
+    config_path: std::path::PathBuf,
 }
 
 impl ServiceEngine {
-    fn new(config: &Config) -> Self {
+    fn new(config: &Config, config_path: std::path::PathBuf) -> Self {
         let split_mode = match config.split_mode {
             freedpi_core::config::SplitModeConfig::BlacklistOnly => SplitMode::BlacklistOnly,
             freedpi_core::config::SplitModeConfig::WhitelistOnly => SplitMode::WhitelistOnly,
@@ -112,6 +113,7 @@ impl ServiceEngine {
             probe_history: std::sync::Mutex::new(Vec::new()),
             pipeline: std::sync::OnceLock::new(),
             split_tunnel: std::sync::Mutex::new(SplitTunnel::new(split_mode)),
+            config_path,
         }
     }
 }
@@ -476,16 +478,32 @@ impl EngineHandle for ServiceEngine {
     fn geoblock_state(&self) -> serde_json::Value {
         if let Some(pipeline) = self.pipeline.get() {
             let geo = pipeline.geo_router();
+            let custom = pipeline
+                .socks_redirector()
+                .custom_proxy
+                .read()
+                .unwrap()
+                .clone();
             serde_json::json!({
                 "static_count": geo.eu_domains_count(),
                 "user_domains": geo.user_domains_snapshot(),
-                "probed_domains": []
+                "probed_domains": [],
+                "custom_proxy_enabled": custom.enabled,
+                "custom_proxy_host": custom.host,
+                "custom_proxy_port": custom.port,
+                "custom_proxy_username": custom.username,
+                "use_opera_fallback": custom.use_opera_fallback,
             })
         } else {
             serde_json::json!({
                 "static_count": 0,
                 "user_domains": [],
-                "probed_domains": []
+                "probed_domains": [],
+                "custom_proxy_enabled": false,
+                "custom_proxy_host": "",
+                "custom_proxy_port": 1080,
+                "custom_proxy_username": null,
+                "use_opera_fallback": true,
             })
         }
     }
@@ -506,6 +524,45 @@ impl EngineHandle for ServiceEngine {
             } else {
                 Err("Domain not found in geoblocked list".to_string())
             }
+        } else {
+            Err("WinDivert pipeline is not running".to_string())
+        }
+    }
+
+    fn geoblock_update_proxy(
+        &self,
+        enabled: bool,
+        host: &str,
+        port: u16,
+        username: Option<&str>,
+        password: Option<&str>,
+        use_opera_fallback: bool,
+    ) -> Result<(), String> {
+        if let Some(pipeline) = self.pipeline.get() {
+            let custom_cfg = freedpi_core::config::CustomProxyConfig {
+                enabled,
+                host: host.to_string(),
+                port,
+                username: username.map(|s| s.to_string()),
+                password: password.map(|s| s.to_string()),
+                use_opera_fallback,
+            };
+            pipeline
+                .socks_redirector()
+                .update_custom_proxy(custom_cfg.clone());
+
+            if let Ok(mut config) = Config::load(&self.config_path) {
+                config.proxy.custom_proxy = custom_cfg;
+                if let Err(e) = config.save(&self.config_path) {
+                    warn!("Failed to save updated proxy config to file: {}", e);
+                } else {
+                    info!(
+                        "Saved custom proxy config to {}",
+                        self.config_path.display()
+                    );
+                }
+            }
+            Ok(())
         } else {
             Err("WinDivert pipeline is not running".to_string())
         }
@@ -764,7 +821,10 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     };
 
     freedpi_core::engine::refresh_local_ips();
-    let engine = Arc::new(ServiceEngine::new(&config));
+    let engine = Arc::new(ServiceEngine::new(
+        &config,
+        std::path::PathBuf::from("config.toml"),
+    ));
 
     // Run in tokio runtime
     let rt = match tokio::runtime::Runtime::new() {
@@ -891,7 +951,7 @@ fn main() -> anyhow::Result<()> {
 
     let config = Config::load(&cli.config)?;
     freedpi_core::engine::refresh_local_ips();
-    let engine = Arc::new(ServiceEngine::new(&config));
+    let engine = Arc::new(ServiceEngine::new(&config, cli.config.clone()));
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_foreground(config, engine))

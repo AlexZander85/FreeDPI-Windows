@@ -450,6 +450,21 @@ pub struct GeoblockState {
     pub static_count: usize,
     pub user_domains: Vec<String>,
     pub probed_domains: Vec<String>,
+    pub custom_proxy_enabled: bool,
+    pub custom_proxy_host: String,
+    pub custom_proxy_port: u16,
+    pub custom_proxy_username: Option<String>,
+    pub use_opera_fallback: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoblockProxyConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub use_opera_fallback: bool,
 }
 
 #[tauri::command]
@@ -496,6 +511,29 @@ pub async fn remove_geoblock_domain(domain: String, api_port: Option<u16>) -> Re
     let resp = api_client()
         .post(&url)
         .json(&serde_json::json!({ "domain": domain }))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!("API error: {}", body))
+    }
+}
+
+#[tauri::command]
+pub async fn save_geoblock_proxy_config(
+    cfg: GeoblockProxyConfig,
+    api_port: Option<u16>,
+) -> Result<(), String> {
+    let port = api_port.unwrap_or(11337);
+    let url = format!("http://127.0.0.1:{}/api/v1/geoblock/proxy", port);
+
+    let resp = api_client()
+        .post(&url)
+        .json(&cfg)
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;

@@ -69,6 +69,15 @@ pub trait EngineHandle {
     fn geoblock_state(&self) -> serde_json::Value;
     fn geoblock_add(&self, domain: &str) -> Result<(), String>;
     fn geoblock_remove(&self, domain: &str) -> Result<(), String>;
+    fn geoblock_update_proxy(
+        &self,
+        enabled: bool,
+        host: &str,
+        port: u16,
+        username: Option<&str>,
+        password: Option<&str>,
+        use_opera_fallback: bool,
+    ) -> Result<(), String>;
 }
 
 // ─── Request/Response типы ─────────────────────────────────────────────────
@@ -169,6 +178,7 @@ pub async fn serve(engine: Arc<dyn EngineHandle + Send + Sync>, api_key: String,
         .route("/api/v1/geoblock", get(geoblock_state_handler))
         .route("/api/v1/geoblock/add", post(geoblock_add_handler))
         .route("/api/v1/geoblock/remove", post(geoblock_remove_handler))
+        .route("/api/v1/geoblock/proxy", post(geoblock_proxy_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -455,6 +465,38 @@ async fn geoblock_remove_handler(
         ),
     }
 }
+
+#[derive(Debug, Deserialize)]
+pub struct GeoblockProxyConfigRequest {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub use_opera_fallback: bool,
+}
+
+/// `POST /api/v1/geoblock/proxy` — обновление настроек кастомного прокси.
+async fn geoblock_proxy_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(params): Json<GeoblockProxyConfigRequest>,
+) -> impl IntoResponse {
+    match state.engine.geoblock_update_proxy(
+        params.enabled,
+        &params.host,
+        params.port,
+        params.username.as_deref(),
+        params.password.as_deref(),
+        params.use_opera_fallback,
+    ) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "updated": true }))),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,6 +606,17 @@ mod tests {
             Ok(())
         }
         fn geoblock_remove(&self, _domain: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn geoblock_update_proxy(
+            &self,
+            _enabled: bool,
+            _host: &str,
+            _port: u16,
+            _username: Option<&str>,
+            _password: Option<&str>,
+            _use_opera_fallback: bool,
+        ) -> Result<(), String> {
             Ok(())
         }
     }

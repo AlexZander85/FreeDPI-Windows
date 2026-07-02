@@ -93,7 +93,11 @@
     "add_btn": "Добавить",
     "no_custom_domains": "Нет пользовательских гео-блокировок",
     "probed_title": "Динамически проверенные домены",
-    "bad_routes": "Плохие маршруты: {{count}}"
+    "bad_routes": "Плохие маршруты: {{count}}",
+    "proxy_title": "Кастомный SOCKS5 Прокси",
+    "proxy_enable": "Использовать кастомный прокси",
+    "opera_fallback": "Использовать Opera Proxy как fallback при сбое кастомного",
+    "save_proxy_btn": "Сохранить"
   },
   "settings": {
     "title": "Настройки",

@@ -26,6 +26,7 @@ pub fn run() {
             commands::get_geoblock_state,
             commands::add_geoblock_domain,
             commands::remove_geoblock_domain,
+            commands::save_geoblock_proxy_config,
         ])
         .setup(|app| {
             tray::setup_tray(app.handle())?;
