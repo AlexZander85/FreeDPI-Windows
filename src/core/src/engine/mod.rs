@@ -269,6 +269,25 @@ impl ProcessingPipeline {
         // Каждый буфер 2048 байт → pool = 4 * 4 * 2048 = ~32 KB
         let buf_pool = Arc::new(PacketBufferPool::new(64));
 
+        let mut auto_tune = AutoTune::new();
+        for strategy_cfg in &config.strategies {
+            if strategy_cfg.enabled == Some(true) {
+                auto_tune.set_override(
+                    &strategy_cfg.name,
+                    crate::adaptive::auto_tune::TuneParams {
+                        split_size: strategy_cfg.split_size,
+                        split_count: strategy_cfg.split_count,
+                        fake_ttl_offset: strategy_cfg.fake_ttl_offset,
+                        max_seg_size: strategy_cfg.max_seg_size,
+                    },
+                );
+                tracing::info!(
+                    "Pre-activated custom profile '{}' from config",
+                    strategy_cfg.name
+                );
+            }
+        }
+
         Ok(Self {
             packet_engine,
             fake_ip,
@@ -285,7 +304,7 @@ impl ProcessingPipeline {
                 .max_capacity(100_000)
                 .time_to_live(Duration::from_secs(30))
                 .build(),
-            auto_tune: std::sync::Mutex::new(AutoTune::new()),
+            auto_tune: std::sync::Mutex::new(auto_tune),
             buf_pool,
             has_non_empty_session_ticket: false,
         })
@@ -322,6 +341,25 @@ impl ProcessingPipeline {
 
         let buf_pool = Arc::new(PacketBufferPool::new(64));
 
+        let mut auto_tune = AutoTune::new();
+        for strategy_cfg in &config.strategies {
+            if strategy_cfg.enabled == Some(true) {
+                auto_tune.set_override(
+                    &strategy_cfg.name,
+                    crate::adaptive::auto_tune::TuneParams {
+                        split_size: strategy_cfg.split_size,
+                        split_count: strategy_cfg.split_count,
+                        fake_ttl_offset: strategy_cfg.fake_ttl_offset,
+                        max_seg_size: strategy_cfg.max_seg_size,
+                    },
+                );
+                tracing::info!(
+                    "Pre-activated custom profile '{}' from config",
+                    strategy_cfg.name
+                );
+            }
+        }
+
         Self {
             packet_engine,
             fake_ip: Arc::new(FakeIpManager::new(1000)),
@@ -338,7 +376,7 @@ impl ProcessingPipeline {
                 .max_capacity(100_000)
                 .time_to_live(Duration::from_secs(30))
                 .build(),
-            auto_tune: std::sync::Mutex::new(AutoTune::new()),
+            auto_tune: std::sync::Mutex::new(auto_tune),
             buf_pool,
             has_non_empty_session_ticket: false,
         }
@@ -983,6 +1021,9 @@ impl ProcessingPipeline {
     /// Если активирован профиль "dns_doh":
     /// - Перехватываем UDP DNS запросы (dst_port == 53, protocol == 17 (UDP))
     /// - Дропаем UDP DNS — заставляем клиента fallback на DoH
+    ///
+    /// NOTE: TCP DNS запросы (TCP:53) намеренно не обрабатываются здесь.
+    /// Обход блокировок для TCP DNS ложится на стандартные правила TCP маршрутизации (SOCKS5/UserProxy).
     fn process_dns(
         &self,
         captured: &CapturedPacket,
@@ -1036,11 +1077,59 @@ impl ProcessingPipeline {
             return Ok(PacketDecision::Forward);
         }
 
-        // T57: Проверяем активированные профили
+        // T57: Проверяем активированные профили (window clamp приоритетнее, так как включает в себя и MSS)
         let mss_clamp_active = self.is_profile_activated("tcp_mss_clamp");
         let window_clamp_active = self.is_profile_activated("tcp_window_clamp");
 
-        if mss_clamp_active {
+        if window_clamp_active {
+            // Применяем window clamp + MSS clamp
+            let profile = self.profile_registry.get("tcp_window_clamp");
+            if let Some(profile) = profile {
+                let tune_start = Instant::now();
+                let auto_tune_override =
+                    self.auto_tune.lock().unwrap().recommend("tcp_window_clamp");
+                let tune_params = profile.merged_params(&auto_tune_override);
+
+                let result = self.apply_desync_sync(
+                    &profile.desync_group,
+                    captured.data.clone(),
+                    None,
+                    Some(tune_params),
+                    None,
+                    None,
+                );
+
+                let latency_us = tune_start.elapsed().as_micros() as u64;
+                let success = !result.inject.is_empty() || result.modified.is_some();
+                self.auto_tune
+                    .lock()
+                    .unwrap()
+                    .record("tcp_window_clamp", success, latency_us);
+
+                if result.drop {
+                    return Ok(PacketDecision::Drop);
+                }
+                if let Some(modified) = result.modified {
+                    if result.inject.is_empty() {
+                        return Ok(PacketDecision::Modify(modified));
+                    }
+                    return Ok(PacketDecision::Desync {
+                        inject: result.inject,
+                        modified: Some(modified),
+                        inject_protocol: InjectProtocol::Tcp,
+                        inter_delay_us: result.inter_delay_us,
+                    });
+                }
+                if !result.inject.is_empty() {
+                    return Ok(PacketDecision::Desync {
+                        inject: result.inject,
+                        modified: None,
+                        inject_protocol: InjectProtocol::Tcp,
+                        inter_delay_us: result.inter_delay_us,
+                    });
+                }
+            }
+        } else if mss_clamp_active {
             // Применяем MSS clamp + PktReorder
             let profile = self.profile_registry.get("tcp_mss_clamp");
             if let Some(profile) = profile {
@@ -1085,37 +1174,6 @@ impl ProcessingPipeline {
                         inject_protocol: InjectProtocol::Tcp,
                         inter_delay_us: result.inter_delay_us,
                     });
-                }
-            }
-        }
-
-        if window_clamp_active {
-            // Применяем window clamp + MSS clamp
-            let profile = self.profile_registry.get("tcp_window_clamp");
-            if let Some(profile) = profile {
-                let tune_start = Instant::now();
-                let auto_tune_override =
-                    self.auto_tune.lock().unwrap().recommend("tcp_window_clamp");
-                let tune_params = profile.merged_params(&auto_tune_override);
-
-                let result = self.apply_desync_sync(
-                    &profile.desync_group,
-                    captured.data.clone(),
-                    None,
-                    Some(tune_params),
-                    None,
-                    None,
-                );
-
-                let latency_us = tune_start.elapsed().as_micros() as u64;
-                let success = !result.inject.is_empty() || result.modified.is_some();
-                self.auto_tune
-                    .lock()
-                    .unwrap()
-                    .record("tcp_window_clamp", success, latency_us);
-
-                if let Some(modified) = result.modified {
-                    return Ok(PacketDecision::Modify(modified));
                 }
             }
         }
@@ -1526,5 +1584,23 @@ mod concurrency_tests {
             desync_count, 1,
             "десинк должен примениться ровно один раз из двух конкурентных проходов"
         );
+    }
+
+    #[test]
+    fn test_routing_only_enabled() {
+        let mut config = ProcessingConfig::default();
+        config.strategies = vec![crate::config::StrategyProfileConfig {
+            name: "socks5_fallback".into(),
+            protocol: "tcp".into(),
+            techniques: vec![],
+            split_size: None,
+            split_count: None,
+            fake_ttl_offset: None,
+            max_seg_size: None,
+            default: None,
+            enabled: Some(true),
+        }];
+        let pipeline = ProcessingPipeline::new_api_only(config);
+        assert!(pipeline.is_profile_activated("socks5_fallback"));
     }
 }

@@ -300,8 +300,16 @@ impl StrategyProfileRegistry {
         // Назначать strategy_id для пользовательских профилей начиная с 200
         // (дефолтные используют 1-100)
         let mut next_id = 200u32;
+        let mut seen_names = std::collections::HashSet::new();
 
         for user_cfg in user_profiles {
+            if !seen_names.insert(&user_cfg.name) {
+                tracing::warn!(
+                    "Duplicate strategy profile name '{}' found in config.toml [[strategies]]. The last one will override the former ones.",
+                    user_cfg.name
+                );
+            }
+
             // Если профиль с таким именем уже существует — заменяем
             let id = if let Some(existing) = registry.get(&user_cfg.name) {
                 existing.strategy_id
@@ -325,6 +333,11 @@ impl StrategyProfileRegistry {
                         "User-defined profile from config.toml",
                         id,
                     );
+
+                    // Если пользователь пометил профиль как default/active, обновляем дефолт категории
+                    if user_cfg.default == Some(true) {
+                        registry.category_defaults.insert(category, name.clone());
+                    }
 
                     tracing::info!(
                         "Registered user strategy profile '{}' (id={}, category={:?})",
@@ -527,6 +540,8 @@ mod tests {
             split_count: Some(5),
             fake_ttl_offset: Some(2),
             max_seg_size: None,
+            default: None,
+            enabled: None,
         }];
         let registry =
             StrategyProfileRegistry::from_config(&DesyncConfig::default(), &user_profiles, &[]);
@@ -549,6 +564,8 @@ mod tests {
             split_count: Some(4),
             fake_ttl_offset: Some(2),
             max_seg_size: None,
+            default: None,
+            enabled: None,
         }];
         let registry =
             StrategyProfileRegistry::from_config(&DesyncConfig::default(), &user_profiles, &[]);
@@ -558,5 +575,26 @@ mod tests {
         // Но техники заменены
         assert_eq!(profile.techniques[0], DesyncTechnique::MultiSplit);
         assert_eq!(profile.default_params.split_size, Some(2));
+    }
+
+    #[test]
+    fn test_registry_from_config_default_override() {
+        let user_profiles = vec![crate::config::StrategyProfileConfig {
+            name: "outbound_tls_custom_default".into(),
+            protocol: "tls".into(),
+            techniques: vec!["FakeSni".into()],
+            split_size: Some(1),
+            split_count: Some(2),
+            fake_ttl_offset: Some(1),
+            max_seg_size: None,
+            default: Some(true),
+            enabled: None,
+        }];
+        let registry =
+            StrategyProfileRegistry::from_config(&DesyncConfig::default(), &user_profiles, &[]);
+        let default_tls = registry
+            .get_default_for_category(StrategyCategory::Tls)
+            .unwrap();
+        assert_eq!(default_tls.name, "outbound_tls_custom_default");
     }
 }

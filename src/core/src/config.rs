@@ -358,6 +358,12 @@ pub struct StrategyProfileConfig {
     pub fake_ttl_offset: Option<u8>,
     #[serde(default)]
     pub max_seg_size: Option<usize>,
+    /// Устанавливает данный профиль как дефолтный для категории.
+    #[serde(default)]
+    pub default: Option<bool>,
+    /// Предварительно активирует профиль при запуске.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// T57: Парсит строку в DesyncTechnique.
@@ -585,6 +591,8 @@ queue_length = 4096
             split_count: Some(3),
             fake_ttl_offset: Some(1),
             max_seg_size: None,
+            default: None,
+            enabled: None,
         };
         let profile = profile_config_to_profile(&cfg, 200).unwrap();
         assert_eq!(profile.name, "custom_tls");
@@ -609,6 +617,8 @@ queue_length = 4096
             split_count: None,
             fake_ttl_offset: None,
             max_seg_size: None,
+            default: None,
+            enabled: None,
         };
         assert!(profile_config_to_profile(&cfg, 200).is_err());
     }
@@ -623,6 +633,8 @@ queue_length = 4096
             split_count: None,
             fake_ttl_offset: None,
             max_seg_size: None,
+            default: None,
+            enabled: None,
         };
         assert!(profile_config_to_profile(&cfg, 200).is_err());
     }
