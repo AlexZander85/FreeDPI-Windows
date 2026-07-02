@@ -24,7 +24,7 @@
 *   ⚡ **Экстремальная скорость**: Пропускная способность **5-10 Gbps** благодаря zero-copy конвейеру (подсчет ссылок `bytes::Bytes`), lock-free очередям `crossbeam::ArrayQueue` и выделенному пулу native OS воркеров.
 *   🧠 **Автотюнинг стратегий (AutoTune)**: Движок автоматически оценивает эффективность техник обхода на основе обратной связи от соединений (успех/таймаут/джиттер), используя алгоритм **Thompson Sampling** для динамического выбора наиболее стабильного профиля.
 *   🔍 **7-фазный DPI Probe**: Превентивное зондирование хостов (DNS Integrity → TCP Connect → TLS Handshake → HTTP Application → JA4 Fingerprinting → QUIC scan → Data-Volume), классификатор временных аномалий на базе машинного обучения (17 признаков, логистическая регрессия) и дискриминатор направления блокировки (Server-active vs Path-active).
-*   🛡️ **PRNG-Hardening (ChaCha12Rng)**: Полная защита от выявления паттернов desync-инжектов со стороны DPI за счет использования криптографически стойкого генератора `ChaCha12Rng` для всех wire-visible полей и GREASE-последовательностей.
+*   🛡️ **Dual-RNG архитектура**: Два независимых генератора: **ChaCha12Rng** (CSPRNG, 12 раундов, reseed каждые 8192 вызова) для всех wire-visible полей и GREASE; **Xoshiro256++** (BigCrush, ~2x быстрее) для невидимых DPI вычислений — TTL jitter, padding length, nonce. DPI видит только CSPRNG-выходы.
 *   🔒 **Loop Prevention (Moka Cache)**: Надежное предотвращение петель перехвата и повторного анализа инжектов через сверхбыстрый кэш `injected_seqs` по 5-tuple + TCP Sequence.
 *   🌐 **Интеграция DNS & Fallback-маршрутизации**:
     *   **UDP DNS drop**: Автоматический сброс незащищенного DNS на порт 53 для форсирования перехода клиента на DoH (DNS-over-HTTPS).
@@ -34,8 +34,11 @@
 *   💿 **Один файл — всё включено**: WinDivert статически слинкован в `freedpi-service.exe` — отдельный `WinDivert.dll` не требуется. Размер бинарника всего **~4.9 MB** (снижение на **38.5%**) благодаря LTO, strip и panic=abort.
 *   🧩 **Split Tunnel с CIDR и IPv6**: Фильтрация трафика по CIDR-диапазонам (`10.0.0.0/8`) и полная поддержка IPv6-адресов наряду с точными IP и доменами.
 *   📦 **Готовый установщик**: `FreeDPI-Setup.exe` (C# .NET 8, single-file publish) копирует файлы, устанавливает драйвер WinDivert и регистрирует службу Windows за один шаг.
-
----
+*   🎯 **SeqSpoof — флагманская техника**: out-of-window SEQ number spoofing — инжект пакетов с SEQ-номерами за пределами окна приёма, которые DPI считывает раньше легитимных, а целевой сервер игнорирует. Технология, принципиально отсутствующая в GoodbyeDPI/zapret/ByeDPI.
+*   🔗 **Connection Tracking 5-tuple**: Полноценный conntrack на `DashMap` с автоматической сборкой мусора (GC по истечении таймаута) — каждый поток идентифицируется по 5-tuple (src_ip, dst_ip, proto, src_port, dst_port). Основа работы всех desync-инжектов и loop prevention.
+*   🧩 **Split Tunnel 3-режима**: Blacklist (обходить всё, кроме указанного), Whitelist (обходить только указанное), Auto (авто-детект DPI-блокировок через Probe Module) — с CIDR-диапазонами и IPv6.
+*   🔄 **Hot-reload конфига**: TOML-конфиг и секция `[[strategies]]` обновляются на лету через `ArcSwap` без перезапуска службы.
+*   🌐 **REST API + AI-agent интеграция**: Полноценный HTTP API (Axum) на порту 8080 — управление стратегиями, probe, тюнинг, routing overrides, чтение логов. Готов для интеграции с AI-агентами.
 
 ## 🇬🇧 About
 
@@ -46,7 +49,7 @@
 *   ⚡ **Extreme Performance**: Throughput of **5-10 Gbps** powered by a zero-copy pipeline (`bytes::Bytes` ref-counting), lock-free queues (`crossbeam::ArrayQueue`), and a dedicated pool of native OS workers.
 *   🧠 **Auto-Tuning Engine (AutoTune)**: Automatically evaluates desync profile performance based on connection feedback (success/timeout/jitter), leveraging **Thompson Sampling** to select the most stable strategy dynamically.
 *   🔍 **7-Phase DPI Probe**: Preventive host scanning (DNS Integrity → TCP Connect → TLS Handshake → HTTP Application → JA4 Fingerprinting → QUIC scan → Data-Volume), ML-based temporal anomaly classification (logistic regression on 17 features), and direction discriminator (Server-active vs Path-active).
-*   🛡️ **PRNG-Hardening (ChaCha12Rng)**: Prevents DPI from fingerprinting desync packet patterns by employing the cryptographically secure `ChaCha12Rng` generator for all wire-visible header fields and GREASE sets.
+*   🛡️ **Dual-RNG Architecture**: Two independent generators — **ChaCha12Rng** (CSPRNG, 12 rounds, reseed every 8192 calls) for all wire-visible fields and GREASE; **Xoshiro256++** (BigCrush, ~2x faster) for DPI-invisible internals — TTL jitter, padding length, nonce generation. DPI sees only CSPRNG outputs.
 *   🔒 **Loop Prevention (Moka Cache)**: Avoids packet loop cascades via a high-speed `injected_seqs` lookup cache mapping 5-tuple and TCP Sequence keys.
 *   🌐 **DNS & Fallback Egress Routing**:
     *   **UDP DNS drop**: Drops unencrypted UDP/53 queries to force client fallback to DoH (DNS-over-HTTPS).
@@ -56,8 +59,11 @@
 *   💿 **Single-file deployment**: WinDivert is statically linked into `freedpi-service.exe` — no separate `WinDivert.dll` required. Binary size only **~4.9 MB** (**38.5% reduction**) thanks to LTO, stripping, and `panic=abort`.
 *   🧩 **CIDR + IPv6 Split Tunnel**: Filter traffic by network ranges (`10.0.0.0/8`) with full IPv6 address support alongside exact IPs and domain names.
 *   📦 **Ready-to-run installer**: `FreeDPI-Setup.exe` (C# .NET 8, single-file publish) copies files, installs the WinDivert kernel driver, and registers the Windows service in a single step.
-
----
+*   🎯 **SeqSpoof — flagship technique**: Out-of-window SEQ number spoofing — injects packets with SEQ numbers beyond the receiver window, so DPI reads them before legitimate packets while the target server ignores them. A technique fundamentally absent in GoodbyeDPI/zapret/ByeDPI.
+*   🔗 **5-tuple Connection Tracking**: Full conntrack on `DashMap` with automatic GC (timeout-based eviction) — every flow identified by 5-tuple (src_ip, dst_ip, proto, src_port, dst_port). Foundation of all desync injection and loop prevention.
+*   🧩 **Split Tunnel 3-mode**: Blacklist (bypass everything except listed), Whitelist (bypass only listed), Auto (auto-detect DPI blocks via Probe Module) — with CIDR ranges and IPv6.
+*   🔄 **Hot-reload config**: TOML config and `[[strategies]]` section update at runtime via `ArcSwap` — no service restart required.
+*   🌐 **REST API + AI-agent integration**: Full HTTP API (Axum) on port 8080 — strategy management, probe, tuning, routing overrides, log streaming. Ready for AI-agent integration.
 
 ## 🏗️ Architecture
 

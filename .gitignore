@@ -1,3 +1,6 @@
+# === Old vendor/ (use src/vendor/windivert/ instead) ===
+vendor/
+
 # === Rust build artifacts ===
 /target/
 src/target/
