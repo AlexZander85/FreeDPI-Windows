@@ -32,12 +32,18 @@ impl StrategyProfile {
     /// Объединяет `default_params` с override.
     pub fn merged_params(&self, override_params: &TuneParams) -> TuneParams {
         TuneParams {
-            split_size: override_params.split_size.or(self.default_params.split_size),
-            split_count: override_params.split_count.or(self.default_params.split_count),
+            split_size: override_params
+                .split_size
+                .or(self.default_params.split_size),
+            split_count: override_params
+                .split_count
+                .or(self.default_params.split_count),
             fake_ttl_offset: override_params
                 .fake_ttl_offset
                 .or(self.default_params.fake_ttl_offset),
-            max_seg_size: override_params.max_seg_size.or(self.default_params.max_seg_size),
+            max_seg_size: override_params
+                .max_seg_size
+                .or(self.default_params.max_seg_size),
         }
     }
 }
@@ -79,7 +85,9 @@ impl StrategyProfileRegistry {
             "TLS ClientHello desync: default (config.techniques если задан, иначе FakeSni+BadChecksum)",
             1,
         );
-        registry.category_defaults.insert(StrategyCategory::Tls, "outbound_tls".into());
+        registry
+            .category_defaults
+            .insert(StrategyCategory::Tls, "outbound_tls".into());
 
         // === 2: outbound_tls_split ===
         registry.register(
@@ -150,7 +158,10 @@ impl StrategyProfileRegistry {
             base_config,
             "outbound_http",
             StrategyCategory::Http,
-            vec![DesyncTechnique::HttpCaseMix, DesyncTechnique::ChunkObfuscation],
+            vec![
+                DesyncTechnique::HttpCaseMix,
+                DesyncTechnique::ChunkObfuscation,
+            ],
             TuneParams {
                 split_size: Some(1),
                 split_count: Some(2),
@@ -160,7 +171,9 @@ impl StrategyProfileRegistry {
             "HTTP desync: HttpCaseMix + ChunkObfuscation",
             20,
         );
-        registry.category_defaults.insert(StrategyCategory::Http, "outbound_http".into());
+        registry
+            .category_defaults
+            .insert(StrategyCategory::Http, "outbound_http".into());
 
         // === 7: outbound_quic ===
         registry.register(
@@ -177,7 +190,9 @@ impl StrategyProfileRegistry {
             "QUIC desync: QuicBlocking",
             30,
         );
-        registry.category_defaults.insert(StrategyCategory::Quic, "outbound_quic".into());
+        registry
+            .category_defaults
+            .insert(StrategyCategory::Quic, "outbound_quic".into());
 
         // === 8: outbound_quic_downgrade ===
         registry.register(
@@ -264,11 +279,70 @@ impl StrategyProfileRegistry {
             "TLS SEQ Spoof: fake ClientHello with out-of-window SEQ + dynamic TTL",
             6,
         );
-
         debug!(
             "StrategyProfileRegistry initialized with {} profiles",
             registry.profiles.len()
         );
+        registry
+    }
+
+    /// T57: Создаёт реестр из TOML-конфига, если заданы пользовательские профили.
+    /// Если `user_profiles` пуст — использует 13 дефолтных профилей.
+    /// Если не пуст — начинает с дефолтных, затем заменяет/добавляет пользовательские.
+    pub fn from_config(
+        base_config: &DesyncConfig,
+        user_profiles: &[crate::config::StrategyProfileConfig],
+        user_techniques: &[DesyncTechnique],
+    ) -> Self {
+        // Начать с дефолтных профилей
+        let mut registry = Self::with_defaults(base_config, user_techniques);
+
+        // Назначать strategy_id для пользовательских профилей начиная с 200
+        // (дефолтные используют 1-100)
+        let mut next_id = 200u32;
+
+        for user_cfg in user_profiles {
+            // Если профиль с таким именем уже существует — заменяем
+            let id = if let Some(existing) = registry.get(&user_cfg.name) {
+                existing.strategy_id
+            } else {
+                let id = next_id;
+                next_id += 1;
+                id
+            };
+
+            match crate::config::profile_config_to_profile(user_cfg, id) {
+                Ok(temp_profile) => {
+                    let name = temp_profile.name.clone();
+                    let category = temp_profile.category;
+
+                    registry.register(
+                        base_config,
+                        &name,
+                        category,
+                        temp_profile.techniques,
+                        temp_profile.default_params,
+                        "User-defined profile from config.toml",
+                        id,
+                    );
+
+                    tracing::info!(
+                        "Registered user strategy profile '{}' (id={}, category={:?})",
+                        name,
+                        id,
+                        category
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to parse strategy profile '{}': {}",
+                        user_cfg.name,
+                        e
+                    );
+                }
+            }
+        }
+
         registry
     }
 
@@ -330,7 +404,9 @@ impl StrategyProfileRegistry {
     }
 
     pub fn get_by_id(&self, strategy_id: u32) -> Option<&StrategyProfile> {
-        self.id_map.get(&strategy_id).and_then(|name| self.profiles.get(name))
+        self.id_map
+            .get(&strategy_id)
+            .and_then(|name| self.profiles.get(name))
     }
 
     pub fn len(&self) -> usize {
@@ -362,18 +438,29 @@ mod tests {
     fn test_category_defaults() {
         let registry = StrategyProfileRegistry::default();
         assert_eq!(
-            registry.get_default_for_category(StrategyCategory::Tls).unwrap().name,
+            registry
+                .get_default_for_category(StrategyCategory::Tls)
+                .unwrap()
+                .name,
             "outbound_tls"
         );
         assert_eq!(
-            registry.get_default_for_category(StrategyCategory::Http).unwrap().name,
+            registry
+                .get_default_for_category(StrategyCategory::Http)
+                .unwrap()
+                .name,
             "outbound_http"
         );
         assert_eq!(
-            registry.get_default_for_category(StrategyCategory::Quic).unwrap().name,
+            registry
+                .get_default_for_category(StrategyCategory::Quic)
+                .unwrap()
+                .name,
             "outbound_quic"
         );
-        assert!(registry.get_default_for_category(StrategyCategory::Dns).is_none());
+        assert!(registry
+            .get_default_for_category(StrategyCategory::Dns)
+            .is_none());
     }
 
     #[test]
@@ -428,5 +515,48 @@ mod tests {
         let merged = profile.merged_params(&override_params);
         assert_eq!(merged.split_size, Some(1));
         assert_eq!(merged.split_count, Some(5));
+    }
+
+    #[test]
+    fn test_registry_from_config_user_profiles() {
+        let user_profiles = vec![crate::config::StrategyProfileConfig {
+            name: "custom_tls_aggressive".into(),
+            protocol: "tls".into(),
+            techniques: vec!["TlsRecordFrag".into(), "BadChecksum".into()],
+            split_size: Some(3),
+            split_count: Some(5),
+            fake_ttl_offset: Some(2),
+            max_seg_size: None,
+        }];
+        let registry =
+            StrategyProfileRegistry::from_config(&DesyncConfig::default(), &user_profiles, &[]);
+        // Дефолтные + пользовательский
+        assert!(registry.len() >= 14);
+        assert!(registry.get("custom_tls_aggressive").is_some());
+        assert_eq!(
+            registry.get("custom_tls_aggressive").unwrap().strategy_id,
+            200
+        );
+    }
+
+    #[test]
+    fn test_registry_from_config_replace_existing() {
+        let user_profiles = vec![crate::config::StrategyProfileConfig {
+            name: "outbound_tls".into(), // replace default
+            protocol: "tls".into(),
+            techniques: vec!["MultiSplit".into(), "BadChecksum".into()],
+            split_size: Some(2),
+            split_count: Some(4),
+            fake_ttl_offset: Some(2),
+            max_seg_size: None,
+        }];
+        let registry =
+            StrategyProfileRegistry::from_config(&DesyncConfig::default(), &user_profiles, &[]);
+        let profile = registry.get("outbound_tls").unwrap();
+        // Сохраняет original strategy_id (1)
+        assert_eq!(profile.strategy_id, 1);
+        // Но техники заменены
+        assert_eq!(profile.techniques[0], DesyncTechnique::MultiSplit);
+        assert_eq!(profile.default_params.split_size, Some(2));
     }
 }

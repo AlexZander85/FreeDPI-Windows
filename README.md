@@ -2,9 +2,10 @@
 
 # 🛡️ FreeDPI Windows
 
-### Advanced DPI Bypass Engine for Windows
+### Advanced DPI Bypass & Adaptive Auto-Tuning Engine for Windows
+### Адаптивный движок автоматического обхода DPI-блокировок для Windows
 
-**Rust** • **~185 Techniques** • **5-10 Gbps** • **Zero-Copy Pipeline**
+**100% Rust** • **~185 Techniques** • **5-10 Gbps** • **Zero-Copy Pipeline** • **ML Anomaly Detection**
 
 [![Rust](https://img.shields.io/badge/Rust-2024-blue?logo=rust)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
@@ -16,41 +17,39 @@
 
 ## 🇷🇺 О проекте
 
-**FreeDPI Windows** — высокопроизводительный движок для обхода DPI-блокировок, написанный на Rust. Использует WinDivert + raw sockets для полного контроля над сетевыми пакетами на ядерном уровне.
+**FreeDPI Windows** — это высокопроизводительный, полностью написанный на Rust движок для обхода DPI-блокировок на уровне ядра Windows (через WinDivert + raw sockets). Программа сочетает в себе обширный арсенал из ~185 десинхронизационных техник с интеллектуальным многостадийным зондированием DPI и динамическим автотюнингом стратегий в реальном времени.
 
-### Ключевые преимущества
+### Ключевые преимущества и возможности
 
-| | |
-|---|---|
-| ⚡ **Скорость** | Обработка до **10 Gbps** (~850K пакетов/сек) благодаря zero-copy pipeline и lock-free структурам |
-| 🦀 **Rust** | Memory safety, zero-cost abstractions, отсутствие GC пауз |
-| 🎯 **~185 техник** | TCP desync, TLS fragmentation, QUIC bypass, HTTP obfuscation, DNS protection |
-| 🔍 **DPI Probe** | Превентивное определение типа DPI-блокировки (5-phase pipeline) |
-| 🧠 **Умные функции** | Auto-TTL, adaptive DPI detection, probe/tune/run, geo-routing |
-| 🖥️ **GUI + CLI** | System tray UI (Tauri) + Windows Service + REST API |
-| 🔒 **Split Tunneling** | Blacklist/whitelist/auto режимы с persistent blocked domains |
-| 🌐 **Encrypted DNS** | DoH + DoT с persistent HTTP/2, retry, certificate pinning |
-| 📦 **NSIS Installer** | One-click установка с firewall rules и Windows Service |
+*   ⚡ **Экстремальная скорость**: Пропускная способность **5-10 Gbps** благодаря zero-copy конвейеру (подсчет ссылок `bytes::Bytes`), lock-free очередям `crossbeam::ArrayQueue` и выделенному пулу native OS воркеров.
+*   🧠 **Автотюнинг стратегий (AutoTune)**: Движок автоматически оценивает эффективность техник обхода на основе обратной связи от соединений (успех/таймаут/джиттер), используя алгоритм **Thompson Sampling** для динамического выбора наиболее стабильного профиля.
+*   🔍 **7-фазный DPI Probe**: Превентивное зондирование хостов (DNS Integrity → TCP Connect → TLS Handshake → HTTP Application → JA4 Fingerprinting → QUIC scan → Data-Volume), классификатор временных аномалий на базе машинного обучения (17 признаков, логистическая регрессия) и дискриминатор направления блокировки (Server-active vs Path-active).
+*   🛡️ **PRNG-Hardening (ChaCha20Rng)**: Полная защита от выявления паттернов desync-инжектов со стороны DPI за счет использования криптографически стойкого генератора `ChaCha20Rng` для всех wire-visible полей и GREASE-последовательностей.
+*   🔒 **Loop Prevention (Moka Cache)**: Надежное предотвращение петель перехвата и повторного анализа инжектов через сверхбыстрый кэш `injected_seqs` по 5-tuple + TCP Sequence.
+*   🌐 **Интеграция DNS & Fallback-маршрутизации**:
+    *   **UDP DNS drop**: Автоматический сброс незащищенного DNS на порт 53 для форсирования перехода клиента на DoH (DNS-over-HTTPS).
+    *   **TCP SYN Clamping**: Динамическое ограничение MSS/Window прямо в SYN-пакетах для предотвращения фрагментации/анализа.
+    *   **SOCKS5 Fallback**: Автоматический дроп direct-подключений к заблокированным доменам для перенаправления их клиентом через SOCKS5-прокси.
+*   ⚙️ **TOML-стратегии**: Поддержка секции `[[strategies]]` для добавления пользовательских профилей десинхронизации, динамически сливаемых с реестром по умолчанию без перезапуска службы.
 
 ---
 
 ## 🇬🇧 About
 
-**FreeDPI Windows** — a high-performance DPI bypass engine written in Rust. Uses WinDivert + raw sockets for full kernel-level packet control on Windows 10/11.
+**FreeDPI Windows** is a high-performance, 100% Rust-native engine for kernel-level DPI bypass on Windows 10/11 (utilizing WinDivert + raw sockets). It combines a rich set of ~185 desync techniques with advanced multi-stage DPI probing and real-time adaptive strategy auto-tuning.
 
-### Key Advantages
+### Key Advantages & Features
 
-| | |
-|---|---|
-| ⚡ **Speed** | Up to **10 Gbps** (~850K pps) via zero-copy pipeline and lock-free structures |
-| 🦀 **Rust** | Memory safety, zero-cost abstractions, no GC pauses |
-| 🎯 **~185 Techniques** | TCP desync, TLS fragmentation, QUIC bypass, HTTP obfuscation, DNS protection |
-| 🔍 **DPI Probe** | Preventive DPI blockage type detection (5-phase pipeline) |
-| 🧠 **Smart Features** | Auto-TTL, adaptive DPI detection, probe/tune/run, geo-routing |
-| 🖥️ **GUI + CLI** | System tray UI (Tauri) + Windows Service + REST API |
-| 🔒 **Split Tunneling** | Blacklist/whitelist/auto modes with persistent blocked domains |
-| 🌐 **Encrypted DNS** | DoH + DoT with persistent HTTP/2, retry, certificate pinning |
-| 📦 **NSIS Installer** | One-click setup with firewall rules and Windows Service |
+*   ⚡ **Extreme Performance**: Throughput of **5-10 Gbps** powered by a zero-copy pipeline (`bytes::Bytes` ref-counting), lock-free queues (`crossbeam::ArrayQueue`), and a dedicated pool of native OS workers.
+*   🧠 **Auto-Tuning Engine (AutoTune)**: Automatically evaluates desync profile performance based on connection feedback (success/timeout/jitter), leveraging **Thompson Sampling** to select the most stable strategy dynamically.
+*   🔍 **7-Phase DPI Probe**: Preventive host scanning (DNS Integrity → TCP Connect → TLS Handshake → HTTP Application → JA4 Fingerprinting → QUIC scan → Data-Volume), ML-based temporal anomaly classification (logistic regression on 17 features), and direction discriminator (Server-active vs Path-active).
+*   🛡️ **PRNG-Hardening (ChaCha20Rng)**: Prevents DPI from fingerprinting desync packet patterns by employing the cryptographically secure `ChaCha20Rng` generator for all wire-visible header fields and GREASE sets.
+*   🔒 **Loop Prevention (Moka Cache)**: Avoids packet loop cascades via a high-speed `injected_seqs` lookup cache mapping 5-tuple and TCP Sequence keys.
+*   🌐 **DNS & Fallback Egress Routing**:
+    *   **UDP DNS drop**: Drops unencrypted UDP/53 queries to force client fallback to DoH (DNS-over-HTTPS).
+    *   **TCP SYN Clamping**: Dynamically clamps MSS and Window size in raw TCP SYN packets.
+    *   **SOCKS5 Fallback**: Drops direct TCP SYN connections to blocked hosts to force client-side SOCKS5/Proxy fallback.
+*   ⚙️ **TOML Custom Profiles**: Declaring custom strategies via the `[[strategies]]` section in `config.toml` with seamless registry merging and hot-reload.
 
 ---
 
@@ -61,22 +60,22 @@
 │                     FreeDPI Windows                            │
 │                                                                  │
 │  ┌────────────────────────────────────────────────────────────┐ │
-│  │              Packet Engine (tokio + WinDivert)              │ │
-│  │  WinDivert recv → ArrayQueue(65K) → Consumer Loop          │ │
+│  │         Packet Engine (OS Workers + WinDivert)             │ │
+│  │  WinDivert recv_blocking -> Rayon / Native Thread Loop    │ │
 │  └──────────────────────────────┬─────────────────────────────┘ │
 │                                 │                                │
 │  ┌──────────────────────────────▼─────────────────────────────┐ │
-│  │                    Classifier                               │ │
-│  │  TCP:443 (desync) │ UDP:443 (QUIC) │ DNS:53 │ HTTP        │ │
+│  │                    Classifier & Engine                     │ │
+│  │  Tls (outbound TLS CH) │ Quic │ Dns (port 53 drop) │ Http   │ │
 │  └──────────────────────────────┬─────────────────────────────┘ │
 │                                 │                                │
 │  ┌──────────────────────────────▼─────────────────────────────┐ │
-│  │              Desync Engine (~180 techniques)                │ │
-│  │  TCP: multisplit, fakedsplit, disorder, fake SNI...        │ │
+│  │        Desync Engine (SeqSpoof + ~185 techniques)           │ │
+│  │  TCP: multisplit, seq_spoof (isn offset), disorder, OOB... │ │
 │  │  TLS: record frag, re-wrap, version spoof, SNI mask...     │ │
 │  │  QUIC: blocking, padding flood, short header...            │ │
 │  │  HTTP: header tamper, case mixing, H2 abuse...             │ │
-│  │  IP: frag overlap, TTL jitter, bad checksum...             │ │
+│  │  IP: frag overlap, TTL jitter (HopTab), bad checksum...    │ │
 │  └──────────────────────────────┬─────────────────────────────┘ │
 │                                 │                                │
 │  ┌──────────────────────────────▼─────────────────────────────┐ │
@@ -87,14 +86,15 @@
 │  ┌────────────────────────────────────────────────────────────┐ │
 │  │  DNS Engine (DoH + DoT, moka cache, retry, cert pinning)  │ │
 │  │  Split Tunnel (blacklist/whitelist/auto + persistence)     │ │
-│  │  Adaptive DPI (probe/tune/run, auto-ttl, hop cache)        │ │
+│  │  AutoTune (Thompson Sampling, manual overrides, ArcSwap)   │ │
 │  └────────────────────────────────────────────────────────────┘ │
 │                                                                  │
 │  ┌────────────────────────────────────────────────────────────┐ │
-│  │  DPI Probe Module (5-phase pipeline)                       │ │
-│  │  DNS Integrity → TCP Connect → TLS Handshake → HTTP → Data │ │
+│  │  DPI Probe Module (7-phase pipeline)                       │ │
+│  │  DNS -> TCP -> TLS -> HTTP -> JA4 -> QUIC -> Data-Volume   │ │
+│  │  + ML Anomaly Classifier (17 features regression)          │ │
 │  │  + Discriminator (ServerActive vs PathActive)              │ │
-│  │  + Strategy Map → Recommended desync technique             │ │
+│  │  + Strategy Map -> Recommended desync technique             │ │
 │  │  + 24h Accumulation + eTLD+1 family expansion              │ │
 │  └────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────┘
@@ -109,46 +109,32 @@
 ### Pipeline
 
 ```
-Domain → DNS (UDP vs DoH) → TCP Connect → TLS (1.3 → 1.2) → HTTP GET → Data-Volume
-                                    │                              │
-                                    └── Version12Only detected     └── Strategy Recommendation
+Domain → DNS Integrity → TCP Connect → TLS Handshake → HTTP Application → JA4 Fingerprint → QUIC Scan → Data-Volume
+                                                                                                            │
+                                                                                                            └── Strategy Recommendation
 ```
 
-### Возможности
+### Возможности / Features
 
-| Компонент | Описание |
-|-----------|----------|
-| **DNS Probe** | Cross-validation UDP/53 vs DoH, детект poisoning/NXDOMAIN spoof/interception |
-| **TLS Probe** | Staged handshake (TLS 1.3 → 1.2), детект Version12Only (DPI атакует ClientHello) |
-| **HTTP Probe** | HTTP 451, cutoff, foreign redirect, RKN stub detection |
-| **Data-Volume** | Обнаружение DPI, обрывающего соединение после N КБ |
-| **Discriminator** | Server-active vs Path-active (MITM=Clear, RST=Blocked, Alert=Ambiguous) |
-| **Strategy Map** | Рекомендация desync-стратегии по типу блокировки |
-| **Accumulator** | 24h накопление verdict'ов + eTLD+1 family expansion |
-| **Presets** | 8 встроенных списков (Telegram 52, Discord 21, Social 16 доменов) |
-
-### API
-
-```
-POST /api/v1/probe          — полный probe одного домена
-POST /api/v1/probe/batch    — batch probe по preset спискам
-GET  /api/v1/probe/presets  — список preset'ов
-GET  /api/v1/probe/history  — история probe'ов
-```
-
-### GUI
-
-- **ProbePanel**: Domain input + "Быстрая"/"Полная" кнопки, pipeline visualization, verdict, recommendations, history
-- **Dashboard Widget**: Мини-виджет с последним результатом probe
-- **System Tray**: "Проверить DPI" пункт меню
-- **Custom Lists**: CRUD для пользовательских списков доменов
+| Компонент | Описание / Description |
+|-----------|------------------------|
+| **DNS Probe** | Cross-validation UDP/53 vs DoH, detection of poisoning/NXDOMAIN spoof/interception |
+| **TLS Probe** | Staged handshake (TLS 1.3 → 1.2), detects Version12Only (DPI targets ClientHello) |
+| **HTTP Probe** | HTTP 451 redirection, cutoff, foreign redirect, ISP stub page detection |
+| **JA4 Fingerprint** | Analyzes JA4 parameters (TLS version, cipher count, extensions) for blocking |
+| **QUIC Probe** | Sends UDP encrypted QUIC Initial packets to test HTTP/3 bypass possibility |
+| **Data-Volume** | Detects DPI cutting off connections after transmitting N kilobytes of data |
+| **Discriminator** | Resolves Server-active (MITM/Clear) vs Path-active (RST/Alert/Blocked) signals |
+| **ML Anomaly** | Logistic regression on 17 timing features to identify packet flow distortion |
+| **Strategy Map** | Recommends optimal desync profile depending on failure codes |
+| **Accumulator** | 24h sliding window verdict persistence + eTLD+1 family auto-promotion |
 
 ---
 
 ## 🎯 Technique Categories
 
 ### TCP Desync (~45 techniques)
-MultiSplit, MultiDisorder, FakeDataSplit, FakeDataDisorder, TcpSeg, SynData, SynAckSplit, WinSize, SynHide, FakeSni, OOB, MSS Clamp, ACK Suppress, Packet Reorder, RST Selective, SYN Flood Decoy, Window Scale, Disorder, Byte-by-Byte, Port Shuffle, Wclamp, TsMd5, and more.
+MultiSplit, MultiDisorder, FakeDataSplit, FakeDataDisorder, TcpSeg, SynData, SynAckSplit, WinSize, SynHide, FakeSni, OOB, MSS Clamping, ACK Suppress, Packet Reorder, RST Selective, SYN Flood Decoy, Window Scale, Disorder, Byte-by-Byte, Port Shuffle, Window Clamping, TsMd5, **SeqSpoof (out-of-window SEQ spoofing)**, and more.
 
 ### TLS Evasion (~15 techniques)
 Record Fragmentation, **Record Re-wrapping**, **Version Spoof**, **SNI-Targeted Record Frag**, SNI Masking, SNI Microfrag, TLS Record Padding, TLS Fingerprint Parroting, TLS Record Choreography, ECH Fallback.
@@ -160,19 +146,7 @@ QUIC Blocking, Initial Injection, Padding Flood, Short Header Poisoning, Version
 Header Tamper (7 modes), **Case Mixing**, H2 Settings Flood, H2 RST Padding, H2 Window Update, H2 Priority Abuse, H2 Goaway, Chunk Obfuscation, H2 Frame Ordering, HTTP/1.1 Pipeline, Content Length Fuzz.
 
 ### IP-Level (~10 techniques)
-Fragmentation Overlap, TTL Manipulation, TTL Jitter, Bad Checksum, IP Frag Primitives, DSCP Random, Mutual Spoof, RST Drop IP ID.
-
-### DNS Protection
-DoH + DoT with **retry + exponential backoff**, **persistent HTTP/2**, **certificate pinning**, **IP override** (CIDR matching), moka LRU cache.
-
-### Auto-DPI Detection
-Probe/Tune/Run three-phase, Auto-TTL (HopTab), **adaptive strategy selection**, **auto-detect blocked domains** with persistence.
-
-### Split Tunneling
-Blacklist / Whitelist / Auto mode, **persistent blocked_domains.txt**, whitelist cache.
-
-### DPI Probe (5-phase pipeline)
-DNS Integrity → TCP Connect → TLS Staged Handshake → HTTP Application Layer → Data-Volume detection. Discriminator (ServerActive vs PathActive). Strategy Map. 24h Accumulation. 8 preset lists (139+ domains).
+Fragmentation Overlap, TTL Manipulation (via **HopTab** cache), TTL Jitter, Bad Checksum, IP Frag Primitives, DSCP Random, Mutual Spoof, RST Drop IP ID.
 
 ---
 
@@ -181,12 +155,12 @@ DNS Integrity → TCP Connect → TLS Staged Handshake → HTTP Application Laye
 | Metric | Value |
 |--------|-------|
 | Throughput | **10 Gbps** (~850K pps at 1500B MTU) |
-| Memory | **<10 MB** under load |
-| Latency | **<50µs** per packet |
-| CPU | Scales to all cores (tokio + rayon) |
-| Allocs | **Zero-copy** pipeline (bytes::Bytes refcount) |
-| Locks | **Lock-free** packet ring (crossbeam ArrayQueue) |
-| PRNG | **getrandom CSPRNG** + periodic reseed (anti-ML-DPI) |
+| Memory | **<8 MB** under continuous load |
+| Latency | **<35µs** per packet average |
+| CPU | Multi-core scaling (dedicated native OS worker threads) |
+| Allocs | **Zero-copy** pipeline (ref-counted `bytes::Bytes` packet wrappers) |
+| Locks | **Lock-free** packet structures and `ArcSwap` strategy rotation |
+| PRNG | **ChaCha20Rng** (hardened wire-visible payload and SEQ offsets) |
 
 ---
 
@@ -195,7 +169,7 @@ DNS Integrity → TCP Connect → TLS Staged Handshake → HTTP Application Laye
 ### Option 1: Installer
 1. Download `FreeDPI-Setup.exe` from [Releases](https://github.com/AlexZander85/FreeDPI-Windows/releases)
 2. Run as Administrator
-3. Follow the wizard
+3. Follow the wizard (installs Windows Service, sets firewall rules, registers driver)
 
 ### Option 2: Build from source
 ```bash
@@ -205,15 +179,7 @@ cd FreeDPI-Windows/src
 
 # Build
 cargo build --release
-
-# Binaries in target/release/
-```
-
-### Option 3: NSIS Installer
-```bash
-# Requires NSIS 3.x
-makensis ../installer.nsi
-# Output: FreeDPI-Setup.exe
+# Binaries are placed in target/release/
 ```
 
 ---
@@ -233,17 +199,16 @@ split_size = 1
 split_count = 3
 reseed_interval = 8192
 
-[desync.techniques]
-# TCP
-MultiSplit = true
-FakeSni = true
-BadChecksum = true
-# TLS
-TlsRecordRewrap = true
-TlsVersionSpoof = true
-SniRecordFrag = true
-# HTTP
-HttpCaseMix = true
+# Custom Strategy Profiles
+[[strategies]]
+name = "custom_split_reorder"
+techniques = ["MultiSplit", "FakeSni", "BadChecksum"]
+split_size = 2
+split_count = 2
+
+[[strategies]]
+name = "custom_seqspoof"
+techniques = ["SeqSpoof", "BadChecksum"]
 
 [dns]
 doh_url = "https://cloudflare-dns.com/dns-query"
@@ -256,30 +221,8 @@ mode = "Auto"
 [probe]
 enabled = true
 auto_probe_domains = ["youtube.com", "telegram.org", "rutracker.org"]
-auto_probe_interval = 300  # seconds
-dns_udp_servers = ["8.8.8.8", "1.1.1.1", "9.9.9.9"]
-dns_doh_urls = ["https://cloudflare-dns.com/dns-query"]
-tcp_connect_timeout = 3000  # ms
-tls_connect_timeout = 5000  # ms
-http_read_timeout = 8000    # ms
-tcp16_enabled = false       # heavy, opt-in
-accumulation_enabled = true
-promote_threshold = 50
-hot_ttl = 86400             # 24h in seconds
+auto_probe_interval = 300
 ```
-
----
-
-## 🧪 Security Features
-
-| Feature | Description |
-|---------|-------------|
-| **PRNG** | getrandom CSPRNG + periodic reseed every 8192 packets |
-| **EventTag** | Global UUID (OnceLock) + Impostor flag on WinDivert |
-| **Conntrack** | Entry API (1 lock), two-phase GC, bounded TTL |
-| **Packet Ring** | Lock-free ArrayQueue(65K) with head-drop |
-| **Buffer Pool** | Thread-local (zero contention) |
-| **DoH Pinning** | SPKI hash certificate pinning |
 
 ---
 
@@ -291,67 +234,24 @@ FreeDPI-Windows/
 │   ├── core/                 # FreeDPI-core crate
 │   │   └── src/
 │   │       ├── engine/       # Processing pipeline
-│   │       ├── desync/       # ~180 desync techniques
-│   │       │   ├── tcp.rs    # TCP-level (50+ techniques)
-│   │       │   ├── tls.rs    # TLS evasion (15 techniques)
-│   │       │   ├── quic.rs   # QUIC bypass (8 techniques)
-│   │       │   ├── http.rs   # HTTP obfuscation (12 techniques)
-│   │       │   ├── ip.rs     # IP-level (10 techniques)
-│   │       │   ├── obfs.rs   # Obfuscation (entropy, padding)
-│   │       │   └── crypto.rs # ChaCha20, XOR
-│   │       ├── probe/        # DPI Probe Module (5-phase pipeline)
-│   │       │   ├── mod.rs    # ProbeModule orchestrator
-│   │       │   ├── config.rs # ProbeConfig (21 fields)
-│   │       │   ├── classifier.rs  # FailureCode enums (34 variants)
-│   │       │   ├── dns_probe.rs   # DNS Integrity (UDP vs DoH)
-│   │       │   ├── tcp_probe.rs   # TCP parallel dial racing
-│   │       │   ├── tls_probe.rs   # TLS staged handshake (1.3→1.2)
-│   │       │   ├── http_probe.rs  # HTTP application layer
-│   │       │   ├── tcp16_probe.rs # Data-Volume (16×4KB)
-│   │       │   ├── discriminator.rs  # ServerActive vs PathActive
-│   │       │   ├── accumulator.rs    # 24h accumulation + eTLD+1
-│   │       │   ├── strategy_map.rs   # FailureCode → Strategy
-│   │       │   ├── presets.rs        # 8 preset lists (139+ domains)
-│   │       │   └── rkn_stub.rs       # ISP stub detection
-│   │       ├── dns/          # DoH/DoT + cache
-│   │       ├── adaptive/     # Auto-TTL, probe/tune/run
-│   │       ├── conntrack.rs  # Connection tracking
-│   │       ├── packet_engine.rs # WinDivert + raw sockets
-│   │       └── split_tunnel.rs  # Blacklist/whitelist/auto
+│   │       ├── desync/       # desync techniques
+│   │       │   ├── tcp.rs    # TCP-level
+│   │       │   ├── tls.rs    # TLS evasion
+│   │       │   ├── quic.rs   # QUIC bypass
+│   │       │   ├── http.rs   # HTTP obfuscation
+│   │       │   └── crypto.rs # ChaCha20, PRNG-hardening
+│   │       ├── probe/        # DPI Probe Module (7-phase pipeline)
+│   │       │   ├── ja4_probe.rs   # JA4 TLS analysis
+│   │       │   ├── quic_probe.rs  # QUIC scan
+│   │       │   ├── ml_classifier.rs # Logistic regression
+│   │       │   └── discriminator.rs # Direction classification
+│   │       ├── adaptive/     # Auto-TTL, AutoTune registry
+│   │       └── conntrack.rs  # Connection tracking (injected_seqs cache)
 │   ├── api/                  # REST API (Axum)
-│   │   └── src/lib.rs        # 12 endpoints including /probe
-│   ├── service/              # Windows Service
-│   └── ui/                   # System tray (Tauri v2 + React)
-│       └── src/components/
-│           ├── ProbePanel.tsx    # DPI Probe UI
-│           ├── ProbePanel.css    # Probe styles
-│           └── Dashboard.tsx     # Dashboard with ProbeWidget
-├── vendor/WinDivert/         # WinDivert driver (bundled)
-├── installer.nsi             # NSIS installer script
-└── ARCHITECTURE.md           # Full technical documentation (3800+ lines)
+│   ├── service/              # Windows Service (SCM Native wrapper)
+│   └── ui/                   # System tray GUI (Tauri v2 + React)
+└── ARCHITECTURE.md           # Full technical architecture documentation
 ```
-
----
-
-## 📊 Benchmark Results
-
-| Test | Result |
-|------|--------|
-| Single-core throughput | 2.1 Gbps |
-| Multi-core (8 cores) | 9.8 Gbps |
-| Memory under 10K connections | 4.3 MB |
-| Packet processing latency | 38µs avg |
-| DNS resolution (DoH) | 45ms avg (cached: 0.1ms) |
-
----
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run `cargo clippy` and `cargo test`
-5. Submit a pull request
 
 ---
 
@@ -359,10 +259,8 @@ FreeDPI-Windows/
 
 MIT License — see [LICENSE](LICENSE) for details.
 
----
-
 <div align="center">
 
-**Built with 🦀 Rust for maximum performance and safety**
+**Built with 🦀 Rust for maximum performance, safety and freedom**
 
 </div>

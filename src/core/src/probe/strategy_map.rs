@@ -110,7 +110,8 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                     profile_name: "outbound_tls_seqspoof".into(),
                     category: StrategyCategory::Tcp,
                     confidence: 0.85,
-                    rationale: "TLS garbage injection — DPI injecting fake records, use SEQ spoof".into(),
+                    rationale: "TLS garbage injection — DPI injecting fake records, use SEQ spoof"
+                        .into(),
                 });
             }
             TlsFailureCode::Reset => {
@@ -478,7 +479,10 @@ mod tests {
     fn test_recommend_includes_profile_name() {
         let result = make_test_result(DnsFailureCode::Ok, TcpFailureCode::Reset, None);
         let recs = recommend(&result);
-        let rec = recs.iter().find(|r| r.strategy_name == "tcp_split").unwrap();
+        let rec = recs
+            .iter()
+            .find(|r| r.strategy_name == "tcp_split")
+            .unwrap();
         assert_eq!(rec.profile_name, "outbound_tls");
     }
 }

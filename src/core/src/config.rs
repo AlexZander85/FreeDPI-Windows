@@ -107,7 +107,7 @@ fn default_filter() -> String {
         or udp.DstPort == 53 \
         or udp.DstPort == 443 \
     )"
-        .to_string()
+    .to_string()
 }
 fn default_queue_len() -> u32 {
     8192
@@ -143,6 +143,9 @@ pub struct Config {
     /// Desync настройки (техники, параметры)
     #[serde(default)]
     pub desync: DesyncSection,
+    /// T57: Пользовательские профили стратегий из TOML [[strategies]] секции
+    #[serde(default)]
+    pub strategies: Vec<StrategyProfileConfig>,
 }
 
 /// Desync секция конфигурации.
@@ -219,6 +222,7 @@ impl Default for Config {
             data_dir: default_data_dir(),
             cpu_threads: 0,
             desync: DesyncSection::default(),
+            strategies: Vec::new(),
         }
     }
 }
@@ -258,39 +262,13 @@ impl Config {
             stats_print_interval: std::time::Duration::from_secs(60),
             desync: desync_config,
             techniques,
+            strategies: self.strategies.clone(),
         }
     }
 }
 
-/// Парсит имя техники в DesyncTechnique.
 fn parse_technique(name: &str) -> Option<crate::desync::DesyncTechnique> {
-    use crate::desync::DesyncTechnique::*;
-    match name {
-        "MultiSplit" => Some(MultiSplit),
-        "MultiDisorder" => Some(MultiDisorder),
-        "FakeDataSplit" => Some(FakeDataSplit),
-        "FakeSni" => Some(FakeSni),
-        "OobInjection" => Some(OobInjection),
-        "BadChecksum" => Some(BadChecksum),
-        "TtlManipulation" => Some(TtlManipulation),
-        "FragOverlap" => Some(FragOverlap),
-        "TlsRecordFrag" => Some(TlsRecordFrag),
-        "TlsRecordPad" => Some(TlsRecordPad),
-        "Disorder" => Some(Disorder),
-        "SynData" => Some(SynData),
-        "MssClamp" => Some(MssClamp),
-        "AckSuppress" => Some(AckSuppress),
-        "PktReorder" => Some(PktReorder),
-        "RstSelective" => Some(RstSelective),
-        "WinScaleManip" => Some(WinScaleManip),
-        "H2SettingsFlood" => Some(H2SettingsFlood),
-        "H2RstPadding" => Some(H2RstPadding),
-        "QuicBlocking" => Some(QuicBlocking),
-        "QuicVersionDowngrade" => Some(QuicVersionDowngrade),
-        "ChaCha20" => Some(ChaCha20),
-        "XorFirst" => Some(XorFirst),
-        _ => None,
-    }
+    parse_technique_name(name)
 }
 
 impl Default for DnsConfig {
@@ -360,6 +338,162 @@ impl Config {
     }
 }
 
+/// T57: Пользовательский профиль стратегии из TOML [[strategies]] секции.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyProfileConfig {
+    /// Имя профиля (уникальное).
+    pub name: String,
+    /// Протокол: "tls", "http", "quic", "dns", "tcp".
+    pub protocol: String,
+    /// Список техник по имени (строка → DesyncTechnique).
+    /// Пустой список = routing-only профиль (dns_doh, socks5_fallback).
+    #[serde(default)]
+    pub techniques: Vec<String>,
+    /// Параметры по умолчанию.
+    #[serde(default)]
+    pub split_size: Option<usize>,
+    #[serde(default)]
+    pub split_count: Option<usize>,
+    #[serde(default)]
+    pub fake_ttl_offset: Option<u8>,
+    #[serde(default)]
+    pub max_seg_size: Option<usize>,
+}
+
+/// T57: Парсит строку в DesyncTechnique.
+/// Возвращает None если имя не распознано.
+#[allow(deprecated)]
+pub fn parse_technique_name(name: &str) -> Option<crate::desync::DesyncTechnique> {
+    let upper = name.to_lowercase().replace('_', "");
+    match upper.as_str() {
+        "multisplit" => Some(crate::desync::DesyncTechnique::MultiSplit),
+        "multidisorder" => Some(crate::desync::DesyncTechnique::MultiDisorder),
+        "hostfakesplit" => Some(crate::desync::DesyncTechnique::HostFakeSplit),
+        "fakedatasplit" => Some(crate::desync::DesyncTechnique::FakeDataSplit),
+        "fakedatadisorder" => Some(crate::desync::DesyncTechnique::FakeDataDisorder),
+        "tcpseg" => Some(crate::desync::DesyncTechnique::TcpSeg),
+        "syndata" => Some(crate::desync::DesyncTechnique::SynData),
+        "synacksplit" => Some(crate::desync::DesyncTechnique::SynAckSplit),
+        "winsize" => Some(crate::desync::DesyncTechnique::WinSize),
+        "synhide" => Some(crate::desync::DesyncTechnique::SynHide),
+        "fakesni" => Some(crate::desync::DesyncTechnique::FakeSni),
+        "oobinjection" => Some(crate::desync::DesyncTechnique::OobInjection),
+        "tcppreopen" => Some(crate::desync::DesyncTechnique::TcpPreopen),
+        "mssclamp" => Some(crate::desync::DesyncTechnique::MssClamp),
+        "acksuppress" => Some(crate::desync::DesyncTechnique::AckSuppress),
+        "pktreorder" => Some(crate::desync::DesyncTechnique::PktReorder),
+        "rstselective" => Some(crate::desync::DesyncTechnique::RstSelective),
+        "synflooddecoy" => Some(crate::desync::DesyncTechnique::SynFloodDecoy),
+        "winscalemanip" => Some(crate::desync::DesyncTechnique::WinScaleManip),
+        "disorder" => Some(crate::desync::DesyncTechnique::Disorder),
+        "multidisordernew" => Some(crate::desync::DesyncTechnique::MultidisorderNew),
+        "disoob" => Some(crate::desync::DesyncTechnique::Disoob),
+        "hostfake" => Some(crate::desync::DesyncTechnique::HostFake),
+        "fakerst" => Some(crate::desync::DesyncTechnique::FakeRst),
+        "bytebybyte" => Some(crate::desync::DesyncTechnique::ByteByByte),
+        "unidirfrag" => Some(crate::desync::DesyncTechnique::UnidirFrag),
+        "portshuffle" => Some(crate::desync::DesyncTechnique::PortShuffle),
+        "wclamp" => Some(crate::desync::DesyncTechnique::Wclamp),
+        "tsmd5" => Some(crate::desync::DesyncTechnique::TsMd5),
+        "seqspoof" => Some(crate::desync::DesyncTechnique::SeqSpoof),
+        "fragoverlap" => Some(crate::desync::DesyncTechnique::FragOverlap),
+        "badchecksum" => Some(crate::desync::DesyncTechnique::BadChecksum),
+        "ttlmanipulation" => Some(crate::desync::DesyncTechnique::TtlManipulation),
+        "ipfragprimitives" => Some(crate::desync::DesyncTechnique::IpFragPrimitives),
+        "rstdropipid" => Some(crate::desync::DesyncTechnique::RstDropIpId),
+        "dscprandom" => Some(crate::desync::DesyncTechnique::DscpRandom),
+        "mutualspoof" => Some(crate::desync::DesyncTechnique::MutualSpoof),
+        "tlsrecordfrag" => Some(crate::desync::DesyncTechnique::TlsRecordFrag),
+        "tlsrecordpad" => Some(crate::desync::DesyncTechnique::TlsRecordPad),
+        "snimasking" => Some(crate::desync::DesyncTechnique::SniMasking),
+        "snimicrofrag" => Some(crate::desync::DesyncTechnique::SniMicrofrag),
+        "tlsrecordrewrap" => Some(crate::desync::DesyncTechnique::TlsRecordRewrap),
+        "tlsversionspoof" => Some(crate::desync::DesyncTechnique::TlsVersionSpoof),
+        "snirecordfrag" => Some(crate::desync::DesyncTechnique::SniRecordFrag),
+        "h2settingsflood" => Some(crate::desync::DesyncTechnique::H2SettingsFlood),
+        "h2rstpadding" => Some(crate::desync::DesyncTechnique::H2RstPadding),
+        "h2windowupdateflood" => Some(crate::desync::DesyncTechnique::H2WindowUpdateFlood),
+        "h2priorityabuse" => Some(crate::desync::DesyncTechnique::H2PriorityAbuse),
+        "h2goaway" => Some(crate::desync::DesyncTechnique::H2Goaway),
+        "chunkobfuscation" => Some(crate::desync::DesyncTechnique::ChunkObfuscation),
+        "h2frameordering" => Some(crate::desync::DesyncTechnique::H2FrameOrdering),
+        "http11pipeline" => Some(crate::desync::DesyncTechnique::Http11Pipeline),
+        "contentlengthfuzz" => Some(crate::desync::DesyncTechnique::ContentLengthFuzz),
+        "httpupgradeabuse" => Some(crate::desync::DesyncTechnique::HttpUpgradeAbuse),
+        "httpcasemix" => Some(crate::desync::DesyncTechnique::HttpCaseMix),
+        "quicblocking" => Some(crate::desync::DesyncTechnique::QuicBlocking),
+        "quicversiondowngrade" => Some(crate::desync::DesyncTechnique::QuicVersionDowngrade),
+        "quicretryinject" => Some(crate::desync::DesyncTechnique::QuicRetryInject),
+        "quicconnectionclose" => Some(crate::desync::DesyncTechnique::QuicConnectionClose),
+        "quicstreamreset" => Some(crate::desync::DesyncTechnique::QuicStreamReset),
+        "quicmaxstreams" => Some(crate::desync::DesyncTechnique::QuicMaxStreams),
+        "udp2icmp" => Some(crate::desync::DesyncTechnique::Udp2Icmp),
+        "xorfirst" => Some(crate::desync::DesyncTechnique::XorFirst),
+        "wgobfs" => Some(crate::desync::DesyncTechnique::WgObfs),
+        "chacha20" => Some(crate::desync::DesyncTechnique::ChaCha20),
+        "reversefragmentorder" => Some(crate::desync::DesyncTechnique::ReverseFragmentOrder),
+        _ => None,
+    }
+}
+
+/// T57: Преобразует StrategyProfileConfig → StrategyProfile.
+/// Валидирует имена техник, возвращает Err при нераспознанном имени.
+pub fn profile_config_to_profile(
+    config: &StrategyProfileConfig,
+    strategy_id: u32,
+) -> Result<crate::adaptive::strategy_profile::StrategyProfile, String> {
+    use crate::adaptive::auto_tune::TuneParams;
+    use crate::adaptive::strategy::StrategyCategory;
+    use crate::adaptive::strategy_profile::StrategyProfile;
+    use crate::desync::group::DesyncGroup;
+    use crate::desync::DesyncConfig;
+
+    let category = match config.protocol.to_lowercase().as_str() {
+        "tls" => StrategyCategory::Tls,
+        "http" => StrategyCategory::Http,
+        "quic" => StrategyCategory::Quic,
+        "dns" => StrategyCategory::Dns,
+        "tcp" => StrategyCategory::Tcp,
+        "ip" => StrategyCategory::Ip,
+        "obfs" => StrategyCategory::Obfs,
+        "general" => StrategyCategory::General,
+        other => {
+            return Err(format!(
+                "Unknown protocol '{}' in strategy '{}'",
+                other, config.name
+            ))
+        }
+    };
+
+    let mut techniques = Vec::new();
+    for tech_name in &config.techniques {
+        match parse_technique_name(tech_name) {
+            Some(t) => techniques.push(t),
+            None => {
+                return Err(format!(
+                    "Unknown technique '{}' in strategy '{}'",
+                    tech_name, config.name
+                ))
+            }
+        }
+    }
+
+    Ok(StrategyProfile {
+        name: config.name.clone(),
+        category,
+        techniques,
+        default_params: TuneParams {
+            split_size: config.split_size,
+            split_count: config.split_count,
+            fake_ttl_offset: config.fake_ttl_offset,
+            max_seg_size: config.max_seg_size,
+        },
+        description: "User-defined profile from config.toml".to_string(),
+        strategy_id,
+        desync_group: std::sync::Arc::new(DesyncGroup::new(DesyncConfig::default())),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +539,112 @@ queue_length = 4096
         let config2 = Config::default();
         // Each instance generates a unique key
         assert_ne!(config1.api.api_key, config2.api.api_key);
+    }
+
+    #[test]
+    fn test_parse_technique_name_known() {
+        assert_eq!(
+            parse_technique_name("FakeSni"),
+            Some(crate::desync::DesyncTechnique::FakeSni)
+        );
+        assert_eq!(
+            parse_technique_name("fakesni"),
+            Some(crate::desync::DesyncTechnique::FakeSni)
+        );
+        assert_eq!(
+            parse_technique_name("fake_sni"),
+            Some(crate::desync::DesyncTechnique::FakeSni)
+        );
+        assert_eq!(
+            parse_technique_name("MultiSplit"),
+            Some(crate::desync::DesyncTechnique::MultiSplit)
+        );
+        assert_eq!(
+            parse_technique_name("SeqSpoof"),
+            Some(crate::desync::DesyncTechnique::SeqSpoof)
+        );
+        assert_eq!(
+            parse_technique_name("QuicBlocking"),
+            Some(crate::desync::DesyncTechnique::QuicBlocking)
+        );
+    }
+
+    #[test]
+    fn test_parse_technique_name_unknown() {
+        assert_eq!(parse_technique_name("Nonexistent"), None);
+        assert_eq!(parse_technique_name(""), None);
+    }
+
+    #[test]
+    fn test_profile_config_to_profile_valid() {
+        let cfg = StrategyProfileConfig {
+            name: "custom_tls".into(),
+            protocol: "tls".into(),
+            techniques: vec!["FakeSni".into(), "BadChecksum".into()],
+            split_size: Some(1),
+            split_count: Some(3),
+            fake_ttl_offset: Some(1),
+            max_seg_size: None,
+        };
+        let profile = profile_config_to_profile(&cfg, 200).unwrap();
+        assert_eq!(profile.name, "custom_tls");
+        assert_eq!(
+            profile.category,
+            crate::adaptive::strategy::StrategyCategory::Tls
+        );
+        assert_eq!(profile.techniques.len(), 2);
+        assert_eq!(
+            profile.techniques[0],
+            crate::desync::DesyncTechnique::FakeSni
+        );
+    }
+
+    #[test]
+    fn test_profile_config_unknown_technique() {
+        let cfg = StrategyProfileConfig {
+            name: "bad".into(),
+            protocol: "tls".into(),
+            techniques: vec!["NonexistentTechnique".into()],
+            split_size: None,
+            split_count: None,
+            fake_ttl_offset: None,
+            max_seg_size: None,
+        };
+        assert!(profile_config_to_profile(&cfg, 200).is_err());
+    }
+
+    #[test]
+    fn test_profile_config_unknown_protocol() {
+        let cfg = StrategyProfileConfig {
+            name: "bad".into(),
+            protocol: "icmp".into(),
+            techniques: vec![],
+            split_size: None,
+            split_count: None,
+            fake_ttl_offset: None,
+            max_seg_size: None,
+        };
+        assert!(profile_config_to_profile(&cfg, 200).is_err());
+    }
+
+    #[test]
+    fn test_toml_parsing_strategies_section() {
+        let toml_str = r#"
+mode = "service"
+[[strategies]]
+name = "test_profile"
+protocol = "tls"
+techniques = ["FakeSni", "BadChecksum"]
+split_size = 1
+split_count = 3
+fake_ttl_offset = 1
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.strategies.len(), 1);
+        assert_eq!(config.strategies[0].name, "test_profile");
+        assert_eq!(
+            config.strategies[0].techniques,
+            vec!["FakeSni", "BadChecksum"]
+        );
     }
 }

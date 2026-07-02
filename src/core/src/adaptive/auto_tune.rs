@@ -87,7 +87,8 @@ impl AutoTune {
     }
 
     pub fn set_override(&mut self, strategy_name: &str, params: TuneParams) {
-        self.manual_overrides.insert(strategy_name.to_string(), params);
+        self.manual_overrides
+            .insert(strategy_name.to_string(), params);
     }
 
     pub fn clear_override(&mut self, strategy_name: &str) {
@@ -228,6 +229,22 @@ impl AutoTune {
         let m = &self.metrics[idx];
         let f = m.fail_count.load(Ordering::Relaxed);
         m.success_rate() < 0.2 && f >= 5
+    }
+
+    /// T57: Проверяет наличие manual override для стратегии.
+    pub fn has_manual_override(&self, strategy_name: &str) -> bool {
+        self.manual_overrides.contains_key(strategy_name)
+    }
+
+    /// T57: Проверяет, активна ли стратегия (через manual override или success_count > 0).
+    pub fn is_strategy_active(&self, strategy_name: &str) -> bool {
+        if self.has_manual_override(strategy_name) {
+            return true;
+        }
+        if let Some(&idx) = self.strategy_indices.get(strategy_name) {
+            return self.metrics[idx].success_count.load(Ordering::Relaxed) > 0;
+        }
+        false
     }
 
     /// Gets recommended params for a strategy.
@@ -377,5 +394,25 @@ mod tests {
         tune.record("B", false, 0);
         let sampled = tune.thompson_sample();
         assert!(sampled.is_some());
+    }
+
+    #[test]
+    fn test_is_strategy_active_and_manual_override() {
+        let mut tune = AutoTune::new();
+        // inactive by default
+        assert!(!tune.is_strategy_active("Test"));
+        assert!(!tune.has_manual_override("Test"));
+
+        // active after manual override
+        tune.manual_overrides
+            .insert("Test".to_string(), TuneParams::default());
+        assert!(tune.has_manual_override("Test"));
+        assert!(tune.is_strategy_active("Test"));
+
+        // active after success
+        let mut tune2 = AutoTune::new();
+        tune2.record("Test", true, 100);
+        assert!(!tune2.has_manual_override("Test"));
+        assert!(tune2.is_strategy_active("Test"));
     }
 }

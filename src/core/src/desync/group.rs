@@ -4,11 +4,11 @@
 //! **Pipeline**: каждая техника видит modified packet предыдущей.
 //! Concurrent mode удалён (был гонкой с потерей данных).
 
-use std::sync::Arc;
 use crate::adaptive::auto_tune::TuneParams;
 use crate::desync::{http, ip, obfs, quic, tcp, tls};
 use crate::desync::{DesyncConfig, DesyncResult, DesyncTechnique, TechniqueEffect};
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 /// Override параметры для одного вызова apply() — из AutoTune.
 #[derive(Debug, Clone, Copy, Default)]
@@ -718,12 +718,16 @@ impl DesyncGroup {
         let dst_ip = ip.dst();
 
         // Get client_isn from conntrack
-        let conn_key = crate::conntrack::ConnKey::new(src_ip, dst_ip, tcp.src_port, tcp.dst_port, 6);
+        let conn_key =
+            crate::conntrack::ConnKey::new(src_ip, dst_ip, tcp.src_port, tcp.dst_port, 6);
         let client_isn = match conntrack.get(&conn_key) {
             Some(entry) => entry.client_isn,
             None => {
-                tracing::debug!("SeqSpoof: no conntrack entry for {:?}, using tcp.sequence", conn_key);
-                tcp.sequence  // fallback
+                tracing::debug!(
+                    "SeqSpoof: no conntrack entry for {:?}, using tcp.sequence",
+                    conn_key
+                );
+                tcp.sequence // fallback
             }
         };
 
@@ -840,7 +844,9 @@ impl DesyncGroup {
                 DesyncResult::passthrough()
             }
             DesyncTechnique::SeqSpoof => {
-                tracing::warn!("SeqSpoof requires full apply_pipeline context — returning passthrough");
+                tracing::warn!(
+                    "SeqSpoof requires full apply_pipeline context — returning passthrough"
+                );
                 DesyncResult::passthrough()
             }
             _ => DesyncResult::passthrough(),
@@ -988,7 +994,10 @@ mod tests {
         conntrack.insert(key, entry);
 
         // Insert HopTab entry (12 hops to destination)
-        hop_tab.insert(HopTab::ip_to_u32(&std::net::IpAddr::V4(Ipv4Addr::new(142, 250, 185, 46))), 12);
+        hop_tab.insert(
+            HopTab::ip_to_u32(&std::net::IpAddr::V4(Ipv4Addr::new(142, 250, 185, 46))),
+            12,
+        );
 
         (conntrack, hop_tab)
     }
@@ -997,8 +1006,8 @@ mod tests {
         // Minimal IP + TCP + TLS ClientHello packet
         let pkt = vec![
             0x45, 0x00, 0x00, 0x40, // IP header
-            0x00, 0x01, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00,
-            0xc0, 0xa8, 0x01, 0x02, // src: 192.168.1.2
+            0x00, 0x01, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0xc0, 0xa8, 0x01,
+            0x02, // src: 192.168.1.2
             0x8e, 0xfa, 0xb9, 0x2e, // dst: 142.250.185.46
             // TCP header
             0xd4, 0x31, // src port: 54321
@@ -1031,33 +1040,42 @@ mod tests {
         );
         let profile = registry.get("outbound_tls_seqspoof").unwrap();
         let group = (*profile.desync_group).clone();
-        assert!(group.validate().is_ok(), "SeqSpoof + BadChecksum should be valid");
+        assert!(
+            group.validate().is_ok(),
+            "SeqSpoof + BadChecksum should be valid"
+        );
     }
 
     #[test]
     fn test_seq_spoof_plus_split_invalid() {
         let mut group = DesyncGroup::new(DesyncConfig::default());
-        group.add(DesyncTechnique::SeqSpoof);     // InvalidatesSeq
-        group.add(DesyncTechnique::MultiSplit);    // Split
-        assert!(group.validate().is_err(), "SeqSpoof + MultiSplit should be invalid");
+        group.add(DesyncTechnique::SeqSpoof); // InvalidatesSeq
+        group.add(DesyncTechnique::MultiSplit); // Split
+        assert!(
+            group.validate().is_err(),
+            "SeqSpoof + MultiSplit should be invalid"
+        );
     }
 
     #[test]
     fn test_seq_spoof_applies_with_context() {
         let (conntrack, hop_tab) = setup_conntrack_with_isn();
-        let mut group = DesyncGroup::with_context(
-            DesyncConfig::default(),
-            hop_tab,
-            conntrack,
-        );
+        let mut group = DesyncGroup::with_context(DesyncConfig::default(), hop_tab, conntrack);
         group.add(DesyncTechnique::SeqSpoof);
 
         let packet = build_test_tls_packet();
         let result = group.apply(&packet, None, None, None);
 
         // SeqSpoof должен создать inject (fake CH с out-of-window SEQ)
-        assert!(!result.inject.is_empty(), "SeqSpoof should produce inject packets");
-        assert_eq!(result.inject.len(), 1, "SeqSpoof should produce exactly 1 inject");
+        assert!(
+            !result.inject.is_empty(),
+            "SeqSpoof should produce inject packets"
+        );
+        assert_eq!(
+            result.inject.len(),
+            1,
+            "SeqSpoof should produce exactly 1 inject"
+        );
     }
 
     #[test]
@@ -1069,6 +1087,9 @@ mod tests {
         let result = group.apply(&packet, None, None, None);
 
         // Без HopTab/Conntrack — passthrough (no inject)
-        assert!(result.inject.is_empty(), "SeqSpoof without context should produce no injects");
+        assert!(
+            result.inject.is_empty(),
+            "SeqSpoof without context should produce no injects"
+        );
     }
 }

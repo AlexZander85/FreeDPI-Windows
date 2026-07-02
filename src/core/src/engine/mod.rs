@@ -109,6 +109,7 @@ pub struct ProcessingConfig {
     pub stats_print_interval: Duration,
     pub desync: DesyncConfig,
     pub techniques: Vec<DesyncTechnique>,
+    pub strategies: Vec<crate::config::StrategyProfileConfig>,
 }
 
 impl Default for ProcessingConfig {
@@ -123,6 +124,7 @@ impl Default for ProcessingConfig {
             stats_print_interval: Duration::from_secs(60),
             desync: DesyncConfig::default(),
             techniques: Vec::new(),
+            strategies: Vec::new(),
         }
     }
 }
@@ -236,8 +238,9 @@ impl ProcessingPipeline {
     ) -> Result<Self, anyhow::Error> {
         let packet_engine = Arc::new(PacketEngine::new(filter)?);
         let conntrack = Arc::new(Conntrack::new(Duration::from_secs(120)));
-        let profile_registry = Arc::new(StrategyProfileRegistry::with_defaults(
+        let profile_registry = Arc::new(StrategyProfileRegistry::from_config(
             &config.desync,
+            &config.strategies,
             &config.techniques,
         ));
         let active_profile_tls = ArcSwap::from_pointee(
@@ -290,8 +293,9 @@ impl ProcessingPipeline {
 
     pub fn new_api_only(config: ProcessingConfig) -> Self {
         let packet_engine = Arc::new(PacketEngine::new_api_only());
-        let profile_registry = Arc::new(StrategyProfileRegistry::with_defaults(
+        let profile_registry = Arc::new(StrategyProfileRegistry::from_config(
             &config.desync,
+            &config.strategies,
             &config.techniques,
         ));
         let active_profile_tls = ArcSwap::from_pointee(
@@ -353,22 +357,33 @@ impl ProcessingPipeline {
                 other
             ),
         };
-        self.profile_registry.get(active_name.as_str()).unwrap_or_else(|| {
-            self.profile_registry
-                .get("outbound_tls")
-                .expect("outbound_tls всегда зарегистрирован")
-        })
+        self.profile_registry
+            .get(active_name.as_str())
+            .unwrap_or_else(|| {
+                self.profile_registry
+                    .get("outbound_tls")
+                    .expect("outbound_tls всегда зарегистрирован")
+            })
     }
 
     pub fn apply_strategy_tune(&self, strategy_id: u32, params: TuneParams) {
         let Some(profile) = self.profile_registry.get_by_id(strategy_id) else {
-            warn!("apply_strategy_tune: неизвестный strategy_id={}", strategy_id);
+            warn!(
+                "apply_strategy_tune: неизвестный strategy_id={}",
+                strategy_id
+            );
             return;
         };
         match profile.category {
-            StrategyCategory::Tls => self.active_profile_tls.store(Arc::new(profile.name.clone())),
-            StrategyCategory::Quic => self.active_profile_quic.store(Arc::new(profile.name.clone())),
-            StrategyCategory::Http => self.active_profile_http.store(Arc::new(profile.name.clone())),
+            StrategyCategory::Tls => self
+                .active_profile_tls
+                .store(Arc::new(profile.name.clone())),
+            StrategyCategory::Quic => self
+                .active_profile_quic
+                .store(Arc::new(profile.name.clone())),
+            StrategyCategory::Http => self
+                .active_profile_http
+                .store(Arc::new(profile.name.clone())),
             _ => {
                 tracing::info!(
                     "apply_strategy_tune: id={} (профиль='{}', категория={:?}) — только числовой override",
@@ -376,34 +391,48 @@ impl ProcessingPipeline {
                 );
             }
         }
-        self.auto_tune.lock().unwrap().set_override(&profile.name, params);
+        self.auto_tune
+            .lock()
+            .unwrap()
+            .set_override(&profile.name, params);
         tracing::info!(
             "apply_strategy_tune: id={} → активный профиль для {:?} = '{}'",
-            strategy_id, profile.category, profile.name
+            strategy_id,
+            profile.category,
+            profile.name
         );
     }
 
     pub fn clear_strategy_tune(&self, strategy_id: u32) {
         let Some(profile) = self.profile_registry.get_by_id(strategy_id) else {
-            warn!("clear_strategy_tune: неизвестный strategy_id={}", strategy_id);
+            warn!(
+                "clear_strategy_tune: неизвестный strategy_id={}",
+                strategy_id
+            );
             return;
         };
-        if let Some(default_profile) = self.profile_registry.get_default_for_category(profile.category) {
+        if let Some(default_profile) = self
+            .profile_registry
+            .get_default_for_category(profile.category)
+        {
             match profile.category {
-                StrategyCategory::Tls => {
-                    self.active_profile_tls.store(Arc::new(default_profile.name.clone()))
-                }
-                StrategyCategory::Quic => {
-                    self.active_profile_quic.store(Arc::new(default_profile.name.clone()))
-                }
-                StrategyCategory::Http => {
-                    self.active_profile_http.store(Arc::new(default_profile.name.clone()))
-                }
+                StrategyCategory::Tls => self
+                    .active_profile_tls
+                    .store(Arc::new(default_profile.name.clone())),
+                StrategyCategory::Quic => self
+                    .active_profile_quic
+                    .store(Arc::new(default_profile.name.clone())),
+                StrategyCategory::Http => self
+                    .active_profile_http
+                    .store(Arc::new(default_profile.name.clone())),
                 _ => {}
             }
         }
         self.auto_tune.lock().unwrap().clear_override(&profile.name);
-        tracing::info!("clear_strategy_tune: id={} — сброшен к default профилю категории", strategy_id);
+        tracing::info!(
+            "clear_strategy_tune: id={} — сброшен к default профилю категории",
+            strategy_id
+        );
     }
 
     pub async fn run(self: Arc<Self>, shutdown: tokio::sync::broadcast::Receiver<()>) {
@@ -551,7 +580,9 @@ impl ProcessingPipeline {
                 );
 
                 let mut should_desync = false;
-                if Classifier::is_client_hello(&captured.data[cp.payload_offset..]) && captured.data.len() - cp.payload_offset >= 50 {
+                if Classifier::is_client_hello(&captured.data[cp.payload_offset..])
+                    && captured.data.len() - cp.payload_offset >= 50
+                {
                     should_desync = self.conntrack.check_and_apply_desync(conn_key, || {
                         ip_to_u64(cp.src_ip)
                             ^ (ip_to_u64(cp.dst_ip) << 32)
@@ -572,12 +603,18 @@ impl ProcessingPipeline {
                 }
                 self.process_quic_sync(captured, &cp)
             }
-            Classification::Dns(_) => Ok(PacketDecision::Forward),
+            Classification::Dns(cp) => self.process_dns(captured, &cp),
             Classification::Http(cp) => {
                 if self.config.only_outbound && !is_outbound_cached(cp.src_ip) {
                     return Ok(PacketDecision::Forward);
                 }
                 self.process_http_sync(captured, &cp)
+            }
+            Classification::Other(cp) => {
+                if self.config.only_outbound && !is_outbound_cached(cp.src_ip) {
+                    return Ok(PacketDecision::Forward);
+                }
+                self.process_generic_tcp(captured, &cp)
             }
             _ => Ok(PacketDecision::Forward),
         }
@@ -743,7 +780,6 @@ impl ProcessingPipeline {
             }
         }
 
-
         if result.inject.is_empty() && result.modified.is_none() && !result.drop {
             return Ok(PacketDecision::Forward);
         }
@@ -847,7 +883,10 @@ impl ProcessingPipeline {
             let mut tune = self.auto_tune.lock().unwrap();
             tune.record(&profile.name, success, latency_us);
             if tune.should_escalate(&profile.name) {
-                warn!("AutoTune: '{}' strategy degrading (latency={}us)", profile.name, latency_us);
+                warn!(
+                    "AutoTune: '{}' strategy degrading (latency={}us)",
+                    profile.name, latency_us
+                );
             }
         }
         if result.inject.is_empty() && result.modified.is_none() && !result.drop {
@@ -907,7 +946,10 @@ impl ProcessingPipeline {
             let mut tune = self.auto_tune.lock().unwrap();
             tune.record(&profile.name, success, latency_us);
             if tune.should_escalate(&profile.name) {
-                warn!("AutoTune: '{}' strategy degrading (latency={}us)", profile.name, latency_us);
+                warn!(
+                    "AutoTune: '{}' strategy degrading (latency={}us)",
+                    profile.name, latency_us
+                );
             }
         }
         if result.inject.is_empty() && result.modified.is_none() && !result.drop {
@@ -934,6 +976,201 @@ impl ProcessingPipeline {
             inject_protocol: InjectProtocol::Tcp,
             inter_delay_us: inter_delay,
         })
+    }
+
+    /// T57: Обработка DNS пакетов.
+    ///
+    /// Если активирован профиль "dns_doh":
+    /// - Перехватываем UDP DNS запросы (dst_port == 53, protocol == 17 (UDP))
+    /// - Дропаем UDP DNS — заставляем клиента fallback на DoH
+    fn process_dns(
+        &self,
+        captured: &CapturedPacket,
+        cp: &ClassifiedPacket,
+    ) -> Result<PacketDecision, anyhow::Error> {
+        let dns_profile_active =
+            self.profile_registry.get("dns_doh").is_some() && self.is_profile_activated("dns_doh");
+
+        if dns_profile_active && cp.dst_port == 53 && cp.protocol == 17 {
+            tracing::debug!(
+                "DNS: dropping UDP DNS query to {}:{} (dns_doh profile active)",
+                cp.dst_ip,
+                cp.dst_port
+            );
+            self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(PacketDecision::Drop);
+        }
+
+        Ok(PacketDecision::Forward)
+    }
+
+    /// T57: Обработка generic TCP (non-443, non-80).
+    ///
+    /// Проверяет на data-volume cutoff patterns.
+    /// Если активирован профиль "tcp_mss_clamp" — применяет MSS clamp к SYN пакетам.
+    /// Если активирован профиль "tcp_window_clamp" — применяет window clamp.
+    fn process_generic_tcp(
+        &self,
+        captured: &CapturedPacket,
+        cp: &ClassifiedPacket,
+    ) -> Result<PacketDecision, anyhow::Error> {
+        // T57.5: Сначала проверяем SOCKS5 fallback — применяется к ЛЮБОМУ TCP трафику
+        let socks5_decision = self.process_socks5_fallback(captured, cp)?;
+        if matches!(socks5_decision, PacketDecision::Drop) {
+            return Ok(socks5_decision);
+        }
+
+        // Проверяем — это TCP SYN? (MSS clamp и window clamp работают на SYN)
+        let is_syn = if let Some(ip) = crate::desync::parse_ip_header(&captured.data) {
+            let tcp_data = &captured.data[ip.header_len()..];
+            if let Some(tcp) = crate::desync::parse_tcp_packet(tcp_data) {
+                (tcp.flags & 0x02) != 0 // SYN = 0x02
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !is_syn {
+            return Ok(PacketDecision::Forward);
+        }
+
+        // T57: Проверяем активированные профили
+        let mss_clamp_active = self.is_profile_activated("tcp_mss_clamp");
+        let window_clamp_active = self.is_profile_activated("tcp_window_clamp");
+
+        if mss_clamp_active {
+            // Применяем MSS clamp + PktReorder
+            let profile = self.profile_registry.get("tcp_mss_clamp");
+            if let Some(profile) = profile {
+                let tune_start = Instant::now();
+                let auto_tune_override = self.auto_tune.lock().unwrap().recommend("tcp_mss_clamp");
+                let tune_params = profile.merged_params(&auto_tune_override);
+
+                let result = self.apply_desync_sync(
+                    &profile.desync_group,
+                    captured.data.clone(),
+                    None,
+                    Some(tune_params),
+                    None,
+                    None,
+                );
+
+                let latency_us = tune_start.elapsed().as_micros() as u64;
+                let success = !result.inject.is_empty() || result.modified.is_some();
+                self.auto_tune
+                    .lock()
+                    .unwrap()
+                    .record("tcp_mss_clamp", success, latency_us);
+
+                if result.drop {
+                    return Ok(PacketDecision::Drop);
+                }
+                if let Some(modified) = result.modified {
+                    if result.inject.is_empty() {
+                        return Ok(PacketDecision::Modify(modified));
+                    }
+                    return Ok(PacketDecision::Desync {
+                        inject: result.inject,
+                        modified: Some(modified),
+                        inject_protocol: InjectProtocol::Tcp,
+                        inter_delay_us: result.inter_delay_us,
+                    });
+                }
+                if !result.inject.is_empty() {
+                    return Ok(PacketDecision::Desync {
+                        inject: result.inject,
+                        modified: None,
+                        inject_protocol: InjectProtocol::Tcp,
+                        inter_delay_us: result.inter_delay_us,
+                    });
+                }
+            }
+        }
+
+        if window_clamp_active {
+            // Применяем window clamp + MSS clamp
+            let profile = self.profile_registry.get("tcp_window_clamp");
+            if let Some(profile) = profile {
+                let tune_start = Instant::now();
+                let auto_tune_override =
+                    self.auto_tune.lock().unwrap().recommend("tcp_window_clamp");
+                let tune_params = profile.merged_params(&auto_tune_override);
+
+                let result = self.apply_desync_sync(
+                    &profile.desync_group,
+                    captured.data.clone(),
+                    None,
+                    Some(tune_params),
+                    None,
+                    None,
+                );
+
+                let latency_us = tune_start.elapsed().as_micros() as u64;
+                let success = !result.inject.is_empty() || result.modified.is_some();
+                self.auto_tune
+                    .lock()
+                    .unwrap()
+                    .record("tcp_window_clamp", success, latency_us);
+
+                if let Some(modified) = result.modified {
+                    return Ok(PacketDecision::Modify(modified));
+                }
+            }
+        }
+
+        Ok(PacketDecision::Forward)
+    }
+
+    /// T57: Проверяет — активирован ли профиль (через probe recommendation или manual override).
+    fn is_profile_activated(&self, profile_name: &str) -> bool {
+        self.auto_tune
+            .lock()
+            .unwrap()
+            .is_strategy_active(profile_name)
+    }
+
+    /// T57: Проверяет — нужно ли перенаправить пакет через SOCKS5 proxy.
+    ///
+    /// Если профиль "socks5_fallback" активирован и целевой домен/IP направляется через SOCKS5
+    /// (определяется через GeoRouter), пакет дропается (клиент должен использовать proxy).
+    fn process_socks5_fallback(
+        &self,
+        _captured: &CapturedPacket,
+        cp: &ClassifiedPacket,
+    ) -> Result<PacketDecision, anyhow::Error> {
+        let socks5_active = self.is_profile_activated("socks5_fallback");
+
+        if !socks5_active {
+            return Ok(PacketDecision::Forward);
+        }
+
+        // Проверяем — домен/IP направляется через SOCKS5/UserProxy/OperaVpn?
+        let domain = self.fake_ip.lookup(&cp.dst_ip);
+        let decision = self
+            .geo_router
+            .resolve(domain.as_deref().unwrap_or("unknown"), Some(cp.dst_ip));
+
+        let should_tunnel = decision.egress_chain.iter().any(|hop| {
+            matches!(
+                hop.egress,
+                crate::routing::Egress::Socks5 { .. }
+                    | crate::routing::Egress::UserProxy
+                    | crate::routing::Egress::OperaVpn
+            )
+        });
+
+        if should_tunnel {
+            tracing::debug!(
+                "SOCKS5 Fallback: dropping direct TCP connection to {}:{} (domain={:?}) to force SOCKS5 fallback",
+                cp.dst_ip, cp.dst_port, domain
+            );
+            self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(PacketDecision::Drop);
+        }
+
+        Ok(PacketDecision::Forward)
     }
 
     /// Execute a PacketDecision synchronously from a worker thread.
@@ -1024,7 +1261,6 @@ struct CapturedPacket {
     data: bytes::Bytes,
     addr: WinDivertAddress<NetworkLayer>,
 }
-
 
 /// Cached list of local IP addresses, populated once at startup.
 static LOCAL_IPS: OnceLock<Arc<Vec<IpAddr>>> = OnceLock::new();
@@ -1232,13 +1468,13 @@ mod concurrency_tests {
             0x45, 0x00, 0x00, 0x00, // Version, IHL, Total Length
             0x00, 0x00, 0x00, 0x00, // Id, Flags, Frag Offset
             0x40, 0x06, 0x00, 0x00, // TTL(64), Protocol(6), Checksum
-            127, 0, 0, 1,           // Src IP (127.0.0.1)
-            127, 0, 0, 1,           // Dst IP (127.0.0.1)
+            127, 0, 0, 1, // Src IP (127.0.0.1)
+            127, 0, 0, 1, // Dst IP (127.0.0.1)
         ]);
         // TCP Header (20 bytes)
         pkt.extend_from_slice(&[
-            0x30, 0x39,             // Src Port (12345)
-            0x01, 0xBB,             // Dst Port (443)
+            0x30, 0x39, // Src Port (12345)
+            0x01, 0xBB, // Dst Port (443)
             0x00, 0x00, 0x00, 0x01, // Seq
             0x00, 0x00, 0x00, 0x00, // Ack
             0x50, 0x18, 0xFF, 0xFF, // Data offset (5 * 4 = 20), Flags (PSH | ACK)
@@ -1246,9 +1482,9 @@ mod concurrency_tests {
         ]);
         // TLS ClientHello (min 6 bytes for classification)
         pkt.extend_from_slice(&[
-            0x16, 0x03, 0x01,       // Record layer: Handshake, TLS 1.0
-            0x00, 0x36,             // Record length
-            0x01,                   // ClientHello
+            0x16, 0x03, 0x01, // Record layer: Handshake, TLS 1.0
+            0x00, 0x36, // Record length
+            0x01, // ClientHello
         ]);
         // Rest of the ClientHello payload
         pkt.extend_from_slice(&[0; 50]);
@@ -1286,6 +1522,9 @@ mod concurrency_tests {
             .iter()
             .filter(|d| !matches!(d, PacketDecision::Forward))
             .count();
-        assert_eq!(desync_count, 1, "десинк должен примениться ровно один раз из двух конкурентных проходов");
+        assert_eq!(
+            desync_count, 1,
+            "десинк должен примениться ровно один раз из двух конкурентных проходов"
+        );
     }
 }

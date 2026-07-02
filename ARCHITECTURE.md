@@ -218,8 +218,11 @@ pub struct PacketEngine {
 impl PacketEngine {
     pub fn new(filter: &str) -> Result<Self> { /* ... */ }
 
-    /// Блокирующий перехват — возвращает bytes::Bytes (zero-copy)
-    pub fn recv_blocking(&self, buffer: &mut [u8]) -> Result<(bytes::Bytes, WinDivertAddress<NetworkLayer>)>;
+    /// Блокирующий перехват — возвращает bytes::Bytes (zero-copy) из пула буферов
+    pub fn recv_blocking(
+        &self,
+        pool: &Arc<PacketBufferPool>,
+    ) -> Result<(bytes::Bytes, WinDivertAddress<NetworkLayer>)>;
 
     /// TCP injection — через WinDivert с Impostor flag (MR-31)
     pub fn inject_via_divert(&self, packet: &[u8], addr: &WinDivertAddress) -> Result<()> {
@@ -230,32 +233,6 @@ impl PacketEngine {
 
     /// UDP injection — через raw socket
     pub fn inject_raw_udp(&self, packet: &[u8]) -> Result<()>;
-}
-```
-
-    /// Перехват пакета (non-blocking)
-    pub async fn recv(&self) -> Result<(Vec<u8>, WinDivertAddress)> {
-        self.divert.recv().await
-    }
-
-    /// Инъекция модифицированного пакета
-    pub fn send(&self, packet: &[u8], addr: &WinDivertAddress) -> Result<()> {
-        self.divert.send(packet, addr)
-    }
-
-    /// Инъекция нового пакета через raw socket (не WinDivert)
-    pub fn inject_raw(&self, packet: &[u8]) -> Result<()> {
-        self.raw_tx.send(packet)
-    }
-
-    /// Дроп пакета — просто не вызываем send()
-    
-    /// Динамическое обновление фильтра при изменении blacklist
-    pub fn update_filter(&mut self, tunnel: &SplitTunnel) -> Result<()> {
-        let filter = tunnel.build_win_divert_filter();
-        self.divert = WinDivert::new(&filter, Network, 0, 0)?;
-        Ok(())
-    }
 }
 ```
 
@@ -308,23 +285,14 @@ impl SplitTunnel {
         // Cache miss → DashMap lookup → cache result
     }
 
-    /// Построение WinDivert фильтра (эффективное)
+    /// Построение селективного WinDivert фильтра (захватывает исключительно исходящий TLS ClientHello)
     pub fn build_win_divert_filter(&self) -> String {
-        // Оптимизация: если blacklist пуст — простой фильтр
-        // Если не пуст — добавляем исключения
+        // Базовый фильтр захватывает исходящие TCP-пакеты на порт 443,
+        // содержащие TLS ClientHello (0x16 0x03 на смещении нагрузки),
+        // а также UDP DNS (порт 53) и UDP QUIC (порт 443).
+        // Пример фильтра: "(ip or ipv6) && ((outbound && tcp.DstPort == 443 && tcp.PayloadLength > 5 && tcp.Payload[0] == 0x16 && tcp.Payload[1] == 0x03 && tcp.Payload[5] == 0x01) or udp.DstPort == 53 or udp.DstPort == 443)"
         
-        let base = "ip && (tcp.DstPort == 443 or tcp.SrcPort == 443 \
-                     or udp.DstPort == 53 or udp.DstPort == 443)";
-        
-        match self.mode {
-            SplitMode::BlacklistOnly if !self.blacklist_ips.is_empty() => {
-                let exclusions: Vec<String> = self.blacklist_ips.iter()
-                    .map(|ip| format!("ip.DstAddr != {}", ip))
-                    .collect();
-                format!("({}) && !({})", base, exclusions.join(" || "))
-            }
-            _ => base.to_string(),
-        }
+        // При наличии blacklist-исключений фильтр дополняется отрицаниями по IP
     }
 }
 
@@ -420,6 +388,15 @@ impl Conntrack {
             .collect();
         for key in to_remove { self.map.remove(&key); }
     }
+}
+
+#### 3.4.1 Loop Prevention & Duplicate Suppression
+
+Для предотвращения петель маршрутизации (looping) и игнорирования повторно перехваченных инжектированных пакетов в hot path используется кэш инжектов `injected_seqs`:
+- Реализован на базе `moka::sync::Cache` с временем жизни (TTL) 30 секунд и максимальной емкостью 100,000 записей.
+- Ключом является 5-tuple сетевого соединения и TCP sequence: `(src_ip, dst_ip, src_port, dst_port, seq)`.
+- При захвате пакета в `process_one_sync` проверяется наличие его ключа в `injected_seqs`. При попадании (cache hit) пакет немедленно форвардится (`PacketDecision::Forward`) без повторного DPI-анализа и применения техник обхода.
+
 
     /// SEQ update — delta < 2^30, dup_ack_count reset (MR-16)
     pub fn update_seq_monotonic(&self, key: &ConnKey, seq: u32, ack: u32) {
@@ -437,46 +414,49 @@ impl Conntrack {
 }
 ```
 
-### 3.5 Thread Pool Model
+### 3.5 Thread Pool & Concurrency Model
 
-```rust
-use rayon::ThreadPoolBuilder;
-use tokio::runtime::Builder;
+Ядро использует гибридную модель параллелизма для обеспечения высокой пропускной способности (10+ Gbps) на многоядерных системах:
 
-// Модель: 1 tokio runtime + 1 rayon pool
-// tokio — для I/O (WinDivert recv, DNS, proxy)
-// rayon — для CPU-bound (desync, TLS, frag, checksum)
+1. **Native OS Blocking Workers (WinDivert I/O):**
+   - Вместо асинхронного цикла обработки `tokio`, создающего оверхед на планирование тасок, мы запускаем пул из `N` нативных потоков ОС (`std::thread::spawn`), где `N` равен количеству логических процессоров системы (минимум 2).
+   - Каждый воркер в цикле выполняет блокирующий вызов `engine.recv_blocking(&pool)` напрямую к дескриптору WinDivert, обрабатывает захваченный пакет через `process_one_sync` и немедленно отправляет результат.
+   - Это гарантирует нулевое время простоя (zero busy-spin) и отсутствие межпоточного contention на очередях пакетов.
 
-pub struct Runtime {
-    /// tokio runtime: async I/O
-    pub io: tokio::runtime::Runtime,
-    /// rayon pool: parallel packet processing
-    pub cpu: rayon::ThreadPool,
-}
+2. **Tokio Runtime (Async Services & API):**
+   - Используется для асинхронных сетевых операций, не критичных к hot path: HTTP API сервер (Axum), фоновые задачи DNS резолва (DoH/DoT) и асинхронное превентивное зондирование хостов (`AutoProber`).
 
-impl Runtime {
-    pub fn new() -> Self {
-        let io = Builder::new_multi_thread()
-            .worker_threads(num_cpus::get() / 2)  // половина ядер на I/O
-            .enable_io()
-            .enable_time()
-            .build()
-            .unwrap();
-        
-        let cpu = ThreadPoolBuilder::new()
-            .num_threads(num_cpus::get().max(2))  // остальные на CPU
-            .build()
-            .unwrap();
-        
-        Self { io, cpu }
-    }
-}
-
-// Использование:
-// let rt = Runtime::new();
-// rt.cpu.spawn(|| process_tcp_segment(packet));
-// rt.io.spawn(async { resolve_dns(domain).await });
+3. **Rayon Thread Pool (CPU-bound / Probes):**
+   - Используется для фоновых параллельных операций и CPU-bound задач.
 ```
+
+### 3.6 Реестр стратегий обхода и движок автотюнинга (StrategyProfileRegistry + AutoTune)
+
+Для гибкого переключения между различными десинхронизационными профилями и автоматической адаптации к изменениям DPI-фильтрации внедрена подсистема автотюнинга:
+
+1. **Реестр профилей (StrategyProfileRegistry):**
+   - Регистрирует наборы техник обхода, их параметры по умолчанию (размер сплита, TTL фейков, максимальный размер сегмента) и ассоциирует их с уникальными именами профилей (всего 13 дефолтных профилей, включая `"outbound_tls"`, `"outbound_tls_disorder"`, `"outbound_tls_seqspoof"`, `"dns_doh"`, `"socks5_fallback"`).
+   - Поддерживает динамическое слияние с пользовательскими TOML-профилями из секции `[[strategies]]` файла `config.toml` через метод `StrategyProfileRegistry::from_config`.
+
+2. **Горячая ротация профилей (ArcSwap):**
+   - Хранение и атомарная ротация активных стратегий во время выполнения (`hot reload` при изменении параметров из API) реализованы через lock-free атомарные указатели `ArcSwap<String>` отдельно для категорий TLS, HTTP и QUIC.
+
+3. **Автоматическая адаптация (AutoTune):**
+   - Отслеживает обратную связь от соединений (метрики `success_count`, `fail_count` и джиттер задержки), используя алгоритм **Thompson Sampling** для постепенного выбора наиболее стабильной стратегии.
+   - Метод `is_strategy_active` осуществляет потокобезопасную проверку активности профилей (через ручные переопределения `manual_overrides` или наличие успешных сессий `success_count > 0`), возвращая примитивный тип `bool` для предотвращения блокировок и утечек времени жизни (`lifetime`) под Mutex-гардом.
+
+---
+
+### 3.7 Конвейер обработки пакетов (ProcessingPipeline)
+
+Оркестрация обработки всего проходящего трафика выполняется классом `ProcessingPipeline` в блокирующем режиме. Метод `process_one_sync` классифицирует каждый перехваченный пакет и выполняет следующие действия:
+
+*   **Классификация пакета (`Classifier::classify`):**
+    *   **TLS (`Classification::Tls`):** Если пакет является outbound ClientHello, с помощью `conntrack` регистрируется сессия, из реестра извлекается активный TLS-профиль, опрашивается `HopTab` для расчета динамического TTL фейка, и через `apply_desync_sync` выполняется отправка фейкового пакета с последующей передачей оригинального TLS-сообщения.
+    *   **QUIC (`Classification::Quic`):** Применяет шифрованный desync Initial-пакетов по профилям категории QUIC.
+    *   **HTTP (`Classification::Http`):** Выполняет разбор заголовков и мутацию HTTP-запросов (сплит заголовков, case-mixing, тасовка полей).
+    *   **DNS (`Classification::Dns`):** При активном профиле `dns_doh` перехватывает и отбрасывает (`Drop`) традиционные UDP DNS-запросы на порт 53, принудительно заставляя сетевой клиент выполнить fallback-переход на безопасный шифрованный DoH (DoT).
+    *   **Generic TCP (`Classification::Other`):** Любой другой TCP-трафик (например, SSH или VPN) анализируется в методе `process_generic_tcp`. Здесь к SYN-пакетам применяются техники clamping (`tcp_mss_clamp` или `tcp_window_clamp`) для принудительного изменения размера кадра в соединении. Также на этом этапе работает механизм `socks5_fallback` — если целевой домен входит в blocklist согласно `GeoRouter`, SYN-пакет дропается, что форсирует fallback-перенаправление трафика со стороны браузера через настроенный SOCKS5-прокси.
 
 ---
 
@@ -2451,16 +2431,16 @@ example.com → **.com (false)
 
 #### `POST /api/v1/strategies/tune`
 
-Агент может изменить параметры стратегии на лету (без перезапуска):
+Позволяет агенту динамически изменить параметры любой стратегии обхода в `StrategyProfileRegistry` на лету (без перезапуска). Переданный `strategy_id` сопоставляется с соответствующим зарегистрированным профилем (например, TLS, HTTP, QUIC, clamping или DNS), и новые параметры тюнинга передаются в `AutoTune` как переопределение (`manual_override`):
 
 ```json
 {
   "strategy_id": 42,
   "params": {
-    "frag_size": 256,
-    "delay_us": 500,
-    "seq_overlap_bytes": 20,
-    "window_manip_mode": "oscillate"
+    "split_size": 256,
+    "split_count": 5,
+    "fake_ttl_offset": 2,
+    "max_seg_size": 536
   },
   "persist": true
 }
@@ -3526,7 +3506,7 @@ WinDivert recv ──→ ArrayQueue<CapturedPacket>(65536) ──→ consumer lo
 
 **Преимущества:** Lock-free MPMC, zero contention, head-drop сохраняет свежие пакеты. `try_send` не блокирует WinDivert recv thread.
 
-### 23.3 PRNG Security (Xorshift128** + reseed)
+### 23.3 PRNG Security & Hardening (Xorshift128** + ChaCha20Rng)
 
 ```
 getrandom (CSPRNG) ──→ splitmix64 ──→ PerConnRng state[2]
@@ -3535,7 +3515,11 @@ getrandom (CSPRNG) ──→ splitmix64 ──→ PerConnRng state[2]
                              (getrandom → XOR с текущим state)
 ```
 
-**Защита от ML-DPI:** Даже если DPI восстановил state, reseed разрывает корреляцию. Стоимость: ~0.12ns/packet.
+**Защита от ML-DPI:**
+- Даже если DPI восстановил state, reseed разрывает корреляцию. Стоимость: ~0.12ns/packet.
+- **PRNG Hardening:** Для генерации всех полей пакетов, видимых в сети (wire-visible: GREASE-значения, фейковые последовательности TCP SEQ, случайные байты полезной нагрузки), используется криптографически стойкий `ChaCha20Rng` (вместо облегченного `ChaCha8Rng`). Это исключает возможность математического восстановления внутреннего состояния генератора на стороне DPI.
+- **GREASE-оптимизация:** Генерация GREASE-полей оптимизирована: вместо четырех последовательных обращений к генератору выполняется один 64-битный запрос (draw), нарезаемый на необходимые значения, что полностью нивелирует накладные расходы на вызов `ChaCha20Rng` в hot path.
+
 
 ### 23.4 Zero-Copy Pipeline
 

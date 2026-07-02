@@ -126,7 +126,11 @@ impl Conntrack {
     /// Проверяет и устанавливает флаг desync_applied атомарно.
     /// Возвращает true, если флаг был успешно установлен с false на true (или создана новая запись с true).
     /// Возвращает false, если флаг уже был true.
-    pub fn check_and_apply_desync(&self, key: ConnKey, conn_id_generator: impl FnOnce() -> u64) -> bool {
+    pub fn check_and_apply_desync(
+        &self,
+        key: ConnKey,
+        conn_id_generator: impl FnOnce() -> u64,
+    ) -> bool {
         use dashmap::mapref::entry::Entry;
         match self.inner.map.entry(key) {
             Entry::Occupied(mut e) => {
