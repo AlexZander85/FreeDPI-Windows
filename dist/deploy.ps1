@@ -1,5 +1,5 @@
 #Requires -RunAsAdministrator
-# deploy.ps1 — Deployment script for FreeDPI Windows Service
+# deploy.ps1 — Deployment script for FreeDPI Windows Service + UI
 # Install / Uninstall / Status
 
 param(
@@ -17,6 +17,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $ServiceExe = Join-Path $ScriptDir "freedpi-service.exe"
 $WinDivertSys = Join-Path $ScriptDir "WinDivert64.sys"
+$UiExe = Join-Path $ScriptDir "ByeByeDPI.exe"
 # WinDivert.dll statically linked into freedpi-service.exe — no separate DLL needed.
 
 # ---------------------------------------------------------------------------
@@ -31,9 +32,10 @@ function Test-Artifacts {
     $missing = @()
     if (-not (Test-Path $ServiceExe))   { $missing += "freedpi-service.exe" }
     if (-not (Test-Path $WinDivertSys)) { $missing += "WinDivert64.sys" }
+    if (-not (Test-Path $UiExe))        { $missing += "ByeByeDPI.exe" }
     if ($missing.Count -gt 0) {
         Write-Error "Missing artifacts in $ScriptDir : $($missing -join ', ')"
-        Write-Info "Run 'cargo build --release -p freedpi-service' first, then copy artifacts."
+        Write-Info "Run builds first, then copy artifacts to dist/."
         exit 1
     }
 }
@@ -66,8 +68,8 @@ function Install-FreeDPI {
     Write-Info "Copying artifacts..."
     Copy-Item -Path $ServiceExe   -Destination $InstallDir -Force
     Copy-Item -Path $WinDivertSys -Destination $InstallDir -Force
+    Copy-Item -Path $UiExe        -Destination $InstallDir -Force
     Write-Ok "Artifacts copied."
-    Write-Info "Note: WinDivert.dll is statically linked into freedpi-service.exe."
 
     # 3. Create a sample config if not present
     $ConfigPath = Join-Path $InstallDir "config.toml"
@@ -82,7 +84,7 @@ queue_length = 4096
 
 [api]
 enabled = true
-port = 8080
+port = 11337
 api_key = ""
 
 [general]
@@ -92,7 +94,31 @@ conntrack_ttl = 30
         Write-Ok "Default config created: $ConfigPath"
     }
 
-    # 4. Register the Windows service with SCM
+    # 4. Create shortcuts
+    Write-Info "Creating shortcuts..."
+    $desktop = [Environment]::GetFolderPath("Desktop")
+    $startMenu = Join-Path ([Environment]::GetFolderPath("StartMenu")) "Programs\FreeDPI"
+    $null = New-Item -ItemType Directory -Path $startMenu -Force
+
+    $shell = New-Object -ComObject WScript.Shell
+    # Desktop shortcut for UI
+    $lnk = $shell.CreateShortcut("$desktop\FreeDPI.lnk")
+    $lnk.TargetPath = Join-Path $InstallDir "ByeByeDPI.exe"
+    $lnk.WorkingDirectory = $InstallDir
+    $lnk.Save()
+    # Start Menu shortcut for UI
+    $lnk = $shell.CreateShortcut("$startMenu\FreeDPI.lnk")
+    $lnk.TargetPath = Join-Path $InstallDir "ByeByeDPI.exe"
+    $lnk.WorkingDirectory = $InstallDir
+    $lnk.Save()
+    # Start Menu — Stop service shortcut
+    $lnk = $shell.CreateShortcut("$startMenu\Stop FreeDPI Service.lnk")
+    $lnk.TargetPath = "net"
+    $lnk.Arguments = "stop FreeDPI"
+    $lnk.Save()
+    Write-Ok "Shortcuts created."
+
+    # 5. Register the Windows service with SCM
     $ServiceBin = Join-Path $InstallDir "freedpi-service.exe"
     Write-Info "Registering FreeDPI service with SCM..."
     & $ServiceBin --install 2>&1 | ForEach-Object { Write-Host $_ }
@@ -102,23 +128,25 @@ conntrack_ttl = 30
     }
     Write-Ok "Service 'FreeDPI' registered (auto-start)."
 
-    # 5. Start the service
+    # 6. Start the service
     Write-Info "Starting FreeDPI service..."
     Start-Service -Name "FreeDPI" -ErrorAction Stop
     Write-Ok "Service started."
 
-    # 6. Verify
+    # 7. Verify
     Start-Sleep -Seconds 2
     $status = Get-ServiceStatus
     if ($status -eq "Running") {
         Write-Ok "FreeDPI is RUNNING. Installation complete."
-        Write-Info "API endpoint: http://127.0.0.1:8080"
+        Write-Info "API endpoint: http://127.0.0.1:11337"
+        Write-Info "UI:          $InstallDir\ByeByeDPI.exe"
         Write-Info ""
         Write-Info "Next steps:"
-        Write-Info "  1. Edit config:    notepad '$ConfigPath'"
-        Write-Info "  2. Restart:        Restart-Service -Name FreeDPI"
-        Write-Info "  3. Check logs:     Get-Content '$InstallDir\freedpi.log' -Tail 50"
-        Write-Info "  4. Uninstall:      .\deploy.ps1 uninstall"
+        Write-Info "  1. Launch FreeDPI from Desktop/Start Menu"
+        Write-Info "  2. Edit config:    notepad '$ConfigPath'"
+        Write-Info "  3. Restart:        Restart-Service -Name FreeDPI"
+        Write-Info "  4. Check logs:     Get-Content '$InstallDir\freedpi.log' -Tail 50"
+        Write-Info "  5. Uninstall:      .\deploy.ps1 uninstall"
     } else {
         Write-Error "Service status: $status. Check logs."
     }
@@ -150,7 +178,6 @@ function Uninstall-FreeDPI {
     # 3. Remove files
     if (Test-Path $InstallDir) {
         Write-Info "Removing $InstallDir..."
-        # Give SCM time to release file handles
         Start-Sleep -Seconds 2
         Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
         if (Test-Path $InstallDir) {
@@ -159,6 +186,12 @@ function Uninstall-FreeDPI {
             Write-Ok "Installation directory removed."
         }
     }
+
+    # 4. Remove shortcuts
+    $desktop = Join-Path ([Environment]::GetFolderPath("Desktop")) "FreeDPI.lnk"
+    $startMenu = Join-Path ([Environment]::GetFolderPath("StartMenu")) "Programs\FreeDPI"
+    Remove-Item -Path $desktop -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $startMenu -Recurse -Force -ErrorAction SilentlyContinue
 
     Write-Ok "FreeDPI uninstalled successfully."
 }

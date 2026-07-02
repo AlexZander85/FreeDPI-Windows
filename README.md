@@ -187,9 +187,10 @@ FreeDPI-Setup.exe
 ```
 
 The installer will:
-1. Copy `freedpi-service.exe` + `WinDivert64.sys` to `C:\Program Files\FreeDPI\`
+1. Copy `freedpi-service.exe` + `WinDivert64.sys` + `ByeByeDPI.exe` to `C:\Program Files\FreeDPI\`
 2. Register the Windows service via SCM (`--install`)
 3. Start the FreeDPI service
+4. Create Desktop and Start Menu shortcuts for the Tauri UI (`ByeByeDPI.exe`)
 
 After installation, the service starts automatically at every boot.
 
@@ -312,8 +313,8 @@ sc query FreeDPI
 # View logs
 Get-Content "$env:ProgramFiles\FreeDPI\freedpi.log" -Tail 50
 
-# Test API
-curl -s http://127.0.0.1:8080/api/v1/status
+# Test API (port 11337, requires X-API-Key from config)
+curl -s -H "X-API-Key: $(Select-String 'api_key' "$env:ProgramFiles\FreeDPI\config.toml" | %{($_ -split '"')[1]})" http://127.0.0.1:11337/api/v1/status
 ```
 
 ---

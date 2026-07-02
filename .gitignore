@@ -21,6 +21,7 @@ src/ui/dist/
 # === Installed binaries (large, regenerate via build) ===
 dist/*.exe
 dist/*.sys
+dist/*.msi
 
 # === Tauri build ===
 src/ui/src-tauri/target/

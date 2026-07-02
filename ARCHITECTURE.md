@@ -36,6 +36,7 @@
 - Многопроцессорная обработка (все ядра CPU)
 - Минимальное потребление памяти (<10 MB под нагрузкой)
 - Rust — memory safety + zero-cost abstractions
+- **Архитектура: 2 процесса** — `freedpi-service` (Windows Service, WinDivert, engine) + `ByeByeDPI.exe` (Tauri UI, tray, React dashboard, REST API на 127.0.0.1:11337)
 
 ---
 
@@ -139,10 +140,19 @@
 │  │  │ IpAddr (IPv4+IPv6) • u128 TL-cache • WinDivert CIDR filter   │   │
 │  └──────────────────────────────────────────────────────────────────┘   │
 │                                                                          │
-│  ┌──────────────────────────────────────────────────────────────────┐   │
-│  │  UI (system tray) / Windows Service                               │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────┘
+│       ╔══════════════════════════════════════════════════════╗           │
+│       ║     ByeByeDPI.exe  —  Tauri Desktop App (UI)       ║           │
+│       ║  ┌─────────────┐  ┌──────────────────────────────┐ ║           │
+│       ║  │ System tray  │  │  React Dashboard (Vite)     │ ║           │
+│       ║  │  • show/hide │  │  • Status, Probe, Settings  │ ║           │
+│       ║  │  • check DPI │  │  • Conntrack, Strategy      │ ║           │
+│       ║  │  • quit      │  │  • Custom domain lists      │ ║           │
+│       ║  └──────┬───────┘  └──────────┬───────────────────┘ ║           │
+│       ║         │ REST API (localhost) │                    ║           │
+│       ║         └──────────┬───────────┘                    ║           │
+│       ╚════════════════════╪════════════════════════════════╝           │
+│                            │  port 11337, X-API-Key                     │
+└────────────────────────────┼────────────────────────────────────────────┘
 ```
 
 ---
@@ -197,8 +207,17 @@ FreeDPI-win/
 │   ├── Cargo.toml                # Windows Service binary
 │   └── src/main.rs
 ├── ui/
-│   ├── Cargo.toml                # System tray binary
-│   └── src/main.rs
+│   ├── package.json              # React + TypeScript (Vite)
+│   ├── src/                      # Frontend (Dashboard, Probe, Settings)
+│   ├── dist/                     # Built frontend assets
+│   └── src-tauri/
+│       ├── Cargo.toml            # freedpi-ui crate (Tauri v2)
+│       ├── tauri.conf.json       # Window config, tray, CSP
+│       └── src/
+│           ├── main.rs           # Tauri entry point
+│           ├── lib.rs            # Plugin + handler setup
+│           ├── commands/mod.rs   # REST API calls to service (port 11337)
+│           └── tray.rs           # System tray menu
 └── vendor/
     └── windivert/              # WinDivert driver (bundled)
         ├── WinDivert64.sys     # Kernel-mode driver

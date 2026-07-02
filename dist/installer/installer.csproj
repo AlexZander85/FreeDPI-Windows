@@ -15,5 +15,6 @@
   <ItemGroup>
     <EmbeddedResource Include="..\freedpi-service.exe" />
     <EmbeddedResource Include="..\WinDivert64.sys" />
+    <EmbeddedResource Include="..\ByeByeDPI.exe" />
   </ItemGroup>
 </Project>

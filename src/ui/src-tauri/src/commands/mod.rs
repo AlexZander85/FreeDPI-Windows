@@ -1,5 +1,63 @@
 use serde::{Deserialize, Serialize};
 
+// ─── API helper: читает api_key из config.toml ──────────────────────────
+
+/// Пытается загрузить API-ключ из конфига сервиса.
+/// Сначала ищет в Program Files\FreeDPI, потом в %APPDATA%\FreeDPI.
+fn load_api_key() -> String {
+    let candidates = [
+        // Установочная директория сервиса
+        std::path::Path::new("C:\\Program Files\\FreeDPI\\config.toml").to_path_buf(),
+        // Пользовательская директория
+        dirs::config_dir()
+            .unwrap_or_default()
+            .join("FreeDPI")
+            .join("config.toml"),
+    ];
+
+    for path in &candidates {
+        if !path.exists() {
+            continue;
+        }
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            _ => continue,
+        };
+        // Ищем строку api_key = "..." в TOML (грубо, без парсинга всего файла)
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some(val) = trimmed.strip_prefix("api_key = \"") {
+                if let Some(end) = val.find('"') {
+                    return val[..end].to_string();
+                }
+            }
+            if let Some(val) = trimmed.strip_prefix("api_key = '") {
+                if let Some(end) = val.find('\'') {
+                    return val[..end].to_string();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Создаёт reqwest::Client с заголовком X-API-Key (если ключ найден).
+fn api_client() -> reqwest::Client {
+    let key = load_api_key();
+    let mut headers = reqwest::header::HeaderMap::new();
+    if !key.is_empty() {
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(&key) {
+            headers.insert("X-API-Key", val);
+        }
+    }
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_default()
+}
+
+// ─── Response types ─────────────────────────────────────────────────────
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub status: String,
@@ -52,12 +110,16 @@ pub struct PresetList {
     pub domain_count: usize,
 }
 
+// ─── API commands ───────────────────────────────────────────────────────
+
 #[tauri::command]
 pub async fn get_status(api_port: Option<u16>) -> Result<StatusResponse, String> {
     let port = api_port.unwrap_or(11337);
     let url = format!("http://127.0.0.1:{}/api/v1/status", port);
 
-    let resp = reqwest::get(&url)
+    let resp = api_client()
+        .get(&url)
+        .send()
         .await
         .map_err(|e| format!("Connection failed: {}", e))?;
 
@@ -71,7 +133,9 @@ pub async fn get_health(api_port: Option<u16>) -> Result<HealthResponse, String>
     let port = api_port.unwrap_or(11337);
     let url = format!("http://127.0.0.1:{}/api/v1/health", port);
 
-    let resp = reqwest::get(&url)
+    let resp = api_client()
+        .get(&url)
+        .send()
         .await
         .map_err(|e| format!("Connection failed: {}", e))?;
 
@@ -85,7 +149,9 @@ pub async fn get_conntrack(api_port: Option<u16>) -> Result<serde_json::Value, S
     let port = api_port.unwrap_or(11337);
     let url = format!("http://127.0.0.1:{}/api/v1/conntrack", port);
 
-    let resp = reqwest::get(&url)
+    let resp = api_client()
+        .get(&url)
+        .send()
         .await
         .map_err(|e| format!("Connection failed: {}", e))?;
 
@@ -108,7 +174,6 @@ pub async fn get_config() -> Result<serde_json::Value, String> {
     let content = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("Read error: {}", e))?;
 
-    // Simple TOML to JSON conversion for the UI
     Ok(serde_json::json!({ "raw": content }))
 }
 
@@ -133,8 +198,7 @@ pub async fn run_probe(domain: String, full: bool, api_port: Option<u16>) -> Res
     let port = api_port.unwrap_or(11337);
     let url = format!("http://127.0.0.1:{}/api/v1/probe", port);
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = api_client()
         .post(&url)
         .json(&serde_json::json!({ "domain": domain, "full": full }))
         .timeout(std::time::Duration::from_secs(30))
@@ -152,7 +216,9 @@ pub async fn get_probe_presets(api_port: Option<u16>) -> Result<Vec<PresetList>,
     let port = api_port.unwrap_or(11337);
     let url = format!("http://127.0.0.1:{}/api/v1/probe/presets", port);
 
-    let resp = reqwest::get(&url)
+    let resp = api_client()
+        .get(&url)
+        .send()
         .await
         .map_err(|e| format!("Connection failed: {}", e))?;
 
@@ -166,7 +232,9 @@ pub async fn get_probe_history(api_port: Option<u16>) -> Result<Vec<ProbeRespons
     let port = api_port.unwrap_or(11337);
     let url = format!("http://127.0.0.1:{}/api/v1/probe/history", port);
 
-    let resp = reqwest::get(&url)
+    let resp = api_client()
+        .get(&url)
+        .send()
         .await
         .map_err(|e| format!("Connection failed: {}", e))?;
 
@@ -184,8 +252,7 @@ pub async fn run_batch_probe(
     let port = api_port.unwrap_or(11337);
     let url = format!("http://127.0.0.1:{}/api/v1/probe/batch", port);
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = api_client()
         .post(&url)
         .json(&serde_json::json!({ "preset_ids": preset_ids, "full": full }))
         .timeout(std::time::Duration::from_secs(120))

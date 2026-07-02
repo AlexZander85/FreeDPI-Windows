@@ -1,15 +1,16 @@
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.InteropServices;
 
 const string ServiceName = "FreeDPI";
 const string TargetDir = "C:\\Program Files\\FreeDPI";
 const string ExeName = "freedpi-service.exe";
 const string SysName = "WinDivert64.sys";
+const string UiName = "ByeByeDPI.exe";
 
 // ---- Elevation check ----
 if (!IsAdministrator())
 {
-    // Self-elevate
     var exePath = Environment.ProcessPath!;
     var psi = new ProcessStartInfo
     {
@@ -35,19 +36,20 @@ Console.WriteLine("============================================");
 Console.WriteLine();
 
 // ---- Step 1: Create directory ----
-Console.Write("[1/4] Creating installation directory... ");
+Console.Write("[1/5] Creating installation directory... ");
 Directory.CreateDirectory(TargetDir);
 Console.WriteLine("OK");
 
-// ---- Step 2: Extract embedded resources ----
-Console.Write("[2/4] Extracting files... ");
+// ---- Step 2: Extract files ----
+Console.Write("[2/5] Extracting files... ");
 var asm = Assembly.GetExecutingAssembly();
 ExtractResource(asm, ExeName, Path.Combine(TargetDir, ExeName));
 ExtractResource(asm, SysName, Path.Combine(TargetDir, SysName));
+ExtractResource(asm, UiName, Path.Combine(TargetDir, UiName));
 Console.WriteLine("OK");
 
 // ---- Step 3: Register service ----
-Console.Write("[3/4] Registering FreeDPI service... ");
+Console.Write("[3/5] Registering FreeDPI service... ");
 var result = RunProcess(Path.Combine(TargetDir, ExeName), "--install");
 if (result.ExitCode != 0)
 {
@@ -58,13 +60,11 @@ if (result.ExitCode != 0)
 Console.WriteLine("OK");
 
 // ---- Step 4: Start service ----
-Console.Write("[4/4] Starting service... ");
+Console.Write("[4/5] Starting service... ");
 result = RunProcess("sc", $"start {ServiceName}");
 if (result.ExitCode == 0)
 {
     Console.WriteLine("OK");
-    Console.WriteLine();
-    Console.WriteLine("SUCCESS: FreeDPI is now running.");
 }
 else if (result.ExitCode == 1056) // SERVICE_ALREADY_RUNNING
 {
@@ -76,15 +76,58 @@ else
     Console.WriteLine("Try: net start FreeDPI");
 }
 
+// ---- Step 5: Create shortcuts ----
+Console.Write("[5/5] Creating shortcuts... ");
+try
+{
+    var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+    var startMenu = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.StartMenu),
+        "Programs", "FreeDPI");
+
+    Directory.CreateDirectory(startMenu);
+
+    // Desktop shortcut
+    CreateShortcut(
+        Path.Combine(desktop, "FreeDPI.lnk"),
+        Path.Combine(TargetDir, UiName),
+        TargetDir);
+
+    // Start Menu shortcut
+    CreateShortcut(
+        Path.Combine(startMenu, "FreeDPI.lnk"),
+        Path.Combine(TargetDir, UiName),
+        TargetDir);
+
+    // Start Menu — Service Manager shortcut
+    CreateShortcut(
+        Path.Combine(startMenu, "Stop FreeDPI Service.lnk"),
+        "net",
+        null,
+        "stop FreeDPI");
+
+    Console.WriteLine("OK");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"WARNING: Could not create shortcuts ({ex.Message})");
+}
+
+Console.WriteLine();
+Console.WriteLine("============================================");
+Console.WriteLine(" SUCCESS: FreeDPI is installed!");
+Console.WriteLine("============================================");
 Console.WriteLine();
 Console.WriteLine("  Service:  FreeDPI");
-Console.WriteLine("  API:      http://127.0.0.1:8080");
+Console.WriteLine("  API:      http://127.0.0.1:11337");
 Console.WriteLine("  Config:   " + Path.Combine(TargetDir, "config.toml"));
+Console.WriteLine("  UI:       " + Path.Combine(TargetDir, UiName));
 Console.WriteLine();
 Console.WriteLine("Press any key to exit...");
 Console.ReadKey();
 
-// ---- Helper methods ----
+// ─── Helper methods ─────────────────────────────────────────────────────
+
 static bool IsAdministrator()
 {
     using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
@@ -117,10 +160,32 @@ static (int ExitCode, string Stdout, string Stderr) RunProcess(string file, stri
         CreateNoWindow = true,
     };
     var proc = Process.Start(psi) ?? throw new InvalidOperationException($"Cannot start '{file}'.");
-    proc.WaitForExit(60000); // 60s timeout
+    proc.WaitForExit(60000);
     var stdout = proc.StandardOutput.ReadToEnd();
     var stderr = proc.StandardError.ReadToEnd();
     return (proc.ExitCode, stdout, stderr);
+}
+
+static void CreateShortcut(string shortcutPath, string targetPath, string? workingDir, string? arguments = null)
+{
+    var shellType = Type.GetTypeFromCLSID(new Guid("72C24DD5-D70A-438B-8A42-98424B88AFB8"));
+    if (shellType == null) throw new InvalidOperationException("Cannot create WScript.Shell COM object.");
+
+    dynamic? shell = Activator.CreateInstance(shellType);
+    if (shell == null) throw new InvalidOperationException("Cannot create WScript.Shell COM object.");
+
+    try
+    {
+        var shortcut = shell.CreateShortcut(shortcutPath);
+        shortcut.TargetPath = targetPath;
+        shortcut.WorkingDirectory = workingDir ?? "";
+        if (arguments != null) shortcut.Arguments = arguments;
+        shortcut.Save();
+    }
+    finally
+    {
+        Marshal.ReleaseComObject(shell);
+    }
 }
 
 static void WaitAndExit(int code)
