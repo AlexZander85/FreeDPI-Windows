@@ -4,10 +4,20 @@ src/target/
 **/target/
 **/*.rs.bk
 
-# === Node.js ===
+# === .NET build artifacts (installer) ===
+dist/installer/bin/
+dist/installer/obj/
+**/*.deps.json
+**/*.runtimeconfig.json
+
+# === Node.js / Tauri UI ===
 node_modules/
-dist/
 .vite/
+src/ui/dist/
+
+# === Installed binaries (large, regenerate via build) ===
+dist/*.exe
+dist/*.sys
 
 # === Tauri build ===
 src/ui/src-tauri/target/
