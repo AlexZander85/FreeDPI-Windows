@@ -37,3 +37,14 @@ tcp16_enabled = false
 accumulation_enabled = true
 promote_threshold = 50
 hot_ttl_seconds = 86400
+
+[proxy]
+enabled = true
+# Small inline list override
+proxy_domains = []
+# External file list (one domain per line, supports hot-reload on modify)
+proxy_domains_file = "blocked_domains.txt"
+# Detect geoblocked sites dynamically via background probe
+auto_probe = true
+max_connections = 1000
+idle_timeout_secs = 300

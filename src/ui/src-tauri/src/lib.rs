@@ -23,6 +23,9 @@ pub fn run() {
             commands::set_split_tunnel_mode,
             commands::add_split_tunnel_entry,
             commands::remove_split_tunnel_entry,
+            commands::get_geoblock_state,
+            commands::add_geoblock_domain,
+            commands::remove_geoblock_domain,
         ])
         .setup(|app| {
             tray::setup_tray(app.handle())?;

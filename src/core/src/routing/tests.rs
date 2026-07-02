@@ -248,6 +248,20 @@ fn test_geo_router_add_domains() {
     assert_eq!(router.classify("custom.ru", None), GeoRegion::Russia);
 }
 
+#[test]
+fn test_geo_router_user_domains() {
+    let router = geo::GeoRouter::new(Default::default());
+    assert_eq!(router.classify("myblock.com", None), GeoRegion::Global);
+    router.add_user_domain("myblock.com");
+    assert_eq!(router.classify("myblock.com", None), GeoRegion::Europe);
+    assert_eq!(
+        router.user_domains_snapshot(),
+        vec!["myblock.com".to_string()]
+    );
+    assert!(router.remove_user_domain("myblock.com"));
+    assert_eq!(router.classify("myblock.com", None), GeoRegion::Global);
+}
+
 // ==================== GeoBlockDetector ====================
 
 #[test]

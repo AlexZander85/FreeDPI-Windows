@@ -514,7 +514,7 @@ impl Conntrack {
     *   **QUIC (`Classification::Quic`):** Применяет шифрованный desync Initial-пакетов по профилям категории QUIC.
     *   **HTTP (`Classification::Http`):** Выполняет разбор заголовков и мутацию HTTP-запросов (сплит заголовков, case-mixing, тасовка полей).
     *   **DNS (`Classification::Dns`):** При активном профиле `dns_doh` перехватывает и отбрасывает (`Drop`) традиционные UDP DNS-запросы на порт 53, принудительно заставляя сетевой клиент выполнить fallback-переход на безопасный шифрованный DoH (DoT).
-    *   **Generic TCP (`Classification::Other`):** Любой другой TCP-трафик (например, SSH или VPN) анализируется в методе `process_generic_tcp`. Здесь к SYN-пакетам применяются техники clamping (`tcp_mss_clamp` или `tcp_window_clamp`) для принудительного изменения размера кадра в соединении. Также на этом этапе работает механизм `socks5_fallback` — если целевой домен входит в blocklist согласно `GeoRouter`, SYN-пакет дропается, что форсирует fallback-перенаправление трафика со стороны браузера через настроенный SOCKS5-прокси.
+    *   **Generic TCP (`Classification::Other`):** Любой другой TCP-трафик (например, SSH или VPN) анализируется в методе `process_generic_tcp`. Здесь к SYN-пакетам применяются техники clamping (`tcp_mss_clamp` или `tcp_window_clamp`) для принудительного изменения размера кадра в соединении. Также на этом этапе работает механизм `socks5_redirect` — если целевой домен входит в список гео-блокировки согласно `GeoRouter`, исходящий SYN-пакет перехватывается, оригинальный адрес назначения сохраняется в `RedirectTable`, а сам пакет перенаправляется на локальный TCP-порт редиректора `17650` (`rewrite_dst_addr`). Локальный редиректор `SocksRedirector` принимает соединение, выполняет SOCKS5-CONNECT по оригинальному доменному имени к выбранному живому Opera SOCKS5-прокси и связывает трафик. Ответные пакеты редиректора на обратном пути переписываются (`rewrite_src_addr`) обратно под адрес оригинального хоста. При падении прокси применяется концепция Fail-Open — трафик пускается напрямую, исключая сбой доступа к сети.
 
 ---
 
@@ -1558,7 +1558,7 @@ impl GeoRouter {
                 Egress::Socks5 { host: "127.0.0.1", port: 1370 }, // фолбэк
             ]),
             GeoRegion::Europe => EgressChain::new(vec![
-                Egress::Socks5 { host: "127.0.0.1", port: 1371 }, // Opera VPN
+                Egress::Socks5 { host: "127.0.0.1", port: 17650 }, // Local transparent SocksRedirector (Opera Proxy)
                 Egress::Direct { desync: true },    // fallback
             ]),
             GeoRegion::UnitedStates => EgressChain::new(vec![
@@ -1625,6 +1625,18 @@ pub fn detect_geo_block(response: &[u8]) -> bool {
     false
 }
 ```
+
+### 13.6 Прозрачный редирект (SocksRedirector)
+
+Для регионов, требующих обхода гео-блокировок (таких как `GeoRegion::Europe`), используется гибридная схема **WinDivert Address-Rewrite + Local loopback listener**:
+
+1. **Direct Path (исходящий)**: При перехвате SYN-пакета к заблокированному домену/IP, `process_socks5_redirect` регистрирует соответствие `client_src_port -> original_target` в `RedirectTable` и перезаписывает `dst_ip:dst_port` в пакете на `127.0.0.1:17650` (`rewrite_dst_addr`).
+2. **Local Listener**: На порту `17650` запущен TCP-сервер `SocksRedirector`, который принимает соединение, извлекает оригинальный целевой адрес из `RedirectTable`, выбирает живой Opera SOCKS5-прокси, выполняет SOCKS5-хэндшейк и CONNECT по оригинальному доменному имени (для исключения утечки DNS) и связывает сокеты через `copy_bidirectional`.
+3. **Return Path (входящий)**: Ответные пакеты от редиректора к клиенту перехватываются WinDivert по фильтру `tcp.SrcPort == 17650` и перезаписываются обратно (`rewrite_src_addr`) с подменой источника на адрес оригинального целевого хоста.
+4. **Loop Prevention & Fail-Open**:
+   - Переход по портам (из `443` в `17650` на direct path и из `17650` в `443` на return path) выводит пакеты за рамки фильтра WinDivert, предотвращая бесконечные циклы захвата.
+   - Значения TTL/Hop Limit декрементируются на 1 при перезаписи.
+   - В случае отказа всех прокси соединение автоматически сбрасывается на прямое (Fail-Open), сохраняя доступ к сайту.
 
 ---
 

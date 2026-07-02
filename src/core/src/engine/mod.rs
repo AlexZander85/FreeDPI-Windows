@@ -149,6 +149,7 @@ pub struct ProcessingPipeline {
     /// Buffer pool для zero-alloc steady-state.
     /// Один пул на все workers (ArrayQueue — lock-free MPMC, безопасно для concurrent access).
     buf_pool: Arc<PacketBufferPool>,
+    redirect_table: Arc<crate::desync::redirect_table::RedirectTable>,
     /// Флаг наличия non-empty session ticket от сервера.
     /// Устанавливается после успешного TLS handshake, когда сервер
     /// прислал session ticket. Используется для 0-RTT resumption
@@ -288,6 +289,18 @@ impl ProcessingPipeline {
             }
         }
 
+        let redirect_table = Arc::new(crate::desync::redirect_table::RedirectTable::new());
+
+        // Запуск SOCKS5-редиректора в бэкграунде
+        let redirector = Arc::new(crate::socks::redirector::SocksRedirector::new(
+            redirect_table.clone(),
+        ));
+        tokio::spawn(async move {
+            if let Err(e) = redirector.run(17650).await {
+                tracing::error!("Failed to start SocksRedirector: {}", e);
+            }
+        });
+
         Ok(Self {
             packet_engine,
             fake_ip,
@@ -306,6 +319,7 @@ impl ProcessingPipeline {
                 .build(),
             auto_tune: std::sync::Mutex::new(auto_tune),
             buf_pool,
+            redirect_table,
             has_non_empty_session_ticket: false,
         })
     }
@@ -360,6 +374,8 @@ impl ProcessingPipeline {
             }
         }
 
+        let redirect_table = Arc::new(crate::desync::redirect_table::RedirectTable::new());
+
         Self {
             packet_engine,
             fake_ip: Arc::new(FakeIpManager::new(1000)),
@@ -378,11 +394,16 @@ impl ProcessingPipeline {
                 .build(),
             auto_tune: std::sync::Mutex::new(auto_tune),
             buf_pool,
+            redirect_table,
             has_non_empty_session_ticket: false,
         }
     }
     pub fn profile_registry(&self) -> &Arc<StrategyProfileRegistry> {
         &self.profile_registry
+    }
+
+    pub fn geo_router(&self) -> &Arc<GeoRouter> {
+        &self.geo_router
     }
 
     fn resolve_active_profile(&self, category: StrategyCategory) -> &StrategyProfile {
@@ -602,6 +623,25 @@ impl ProcessingPipeline {
     /// Sync version: process_one (calls sync sub-methods directly).
     fn process_one_sync(&self, captured: &CapturedPacket) -> Result<PacketDecision, anyhow::Error> {
         let classification = Classifier::classify(&captured.data);
+
+        // T59: Перехватываем пакеты обратного пути от локального редиректора (src_port == 17650)
+        if let Classification::Other(ref cp) = classification {
+            if cp.src_port == 17650 {
+                if let Some(entry) = self.redirect_table.get(cp.dst_port) {
+                    tracing::debug!(
+                        "SocksRedirector return path: rewriting src 127.0.0.1:17650 -> {}:{}",
+                        entry.orig_dst_ip,
+                        entry.orig_dst_port
+                    );
+                    let modified = crate::desync::rewrite_src_addr(
+                        &captured.data,
+                        entry.orig_dst_ip,
+                        entry.orig_dst_port,
+                    )?;
+                    return Ok(PacketDecision::Modify(modified));
+                }
+            }
+        }
 
         match classification {
             Classification::Tls(cp) if cp.dst_port == self.config.desync_port => {
@@ -1056,8 +1096,8 @@ impl ProcessingPipeline {
         cp: &ClassifiedPacket,
     ) -> Result<PacketDecision, anyhow::Error> {
         // T57.5: Сначала проверяем SOCKS5 fallback — применяется к ЛЮБОМУ TCP трафику
-        let socks5_decision = self.process_socks5_fallback(captured, cp)?;
-        if matches!(socks5_decision, PacketDecision::Drop) {
+        let socks5_decision = self.process_socks5_redirect(captured, cp)?;
+        if !matches!(socks5_decision, PacketDecision::Forward) {
             return Ok(socks5_decision);
         }
 
@@ -1193,9 +1233,9 @@ impl ProcessingPipeline {
     ///
     /// Если профиль "socks5_fallback" активирован и целевой домен/IP направляется через SOCKS5
     /// (определяется через GeoRouter), пакет дропается (клиент должен использовать proxy).
-    fn process_socks5_fallback(
+    fn process_socks5_redirect(
         &self,
-        _captured: &CapturedPacket,
+        captured: &CapturedPacket,
         cp: &ClassifiedPacket,
     ) -> Result<PacketDecision, anyhow::Error> {
         let socks5_active = self.is_profile_activated("socks5_fallback");
@@ -1221,11 +1261,31 @@ impl ProcessingPipeline {
 
         if should_tunnel {
             tracing::debug!(
-                "SOCKS5 Fallback: dropping direct TCP connection to {}:{} (domain={:?}) to force SOCKS5 fallback",
+                "SOCKS5 Redirect: redirecting connection to {}:{} (domain={:?}) to local SocksRedirector",
                 cp.dst_ip, cp.dst_port, domain
             );
+
+            // Записываем оригинальный адрес перед перенаправлением
+            self.redirect_table.insert(
+                cp.src_port,
+                crate::desync::redirect_table::RedirectEntry {
+                    orig_dst_ip: cp.dst_ip,
+                    orig_dst_port: cp.dst_port,
+                    domain,
+                    created_at: std::time::Instant::now(),
+                },
+            );
+
+            // Переписываем dst в самом пакете на Localhost:REDIRECTOR_PORT
+            let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            let modified = crate::desync::rewrite_dst_addr(
+                &captured.data,
+                localhost,
+                17650, // REDIRECTOR_PORT
+            )?;
+
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            return Ok(PacketDecision::Drop);
+            return Ok(PacketDecision::Modify(modified));
         }
 
         Ok(PacketDecision::Forward)

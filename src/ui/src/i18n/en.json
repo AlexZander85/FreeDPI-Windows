@@ -88,6 +88,11 @@
     "global": "Global",
     "excluded": "Excluded",
     "domains": "{{count}} domains",
+    "custom_title": "Custom Geoblocked Domains (via SOCKS5)",
+    "add_placeholder": "Enter domain (e.g. netflix.com)",
+    "add_btn": "Add",
+    "no_custom_domains": "No custom geoblocked domains",
+    "probed_title": "Dynamically Probed Domains",
     "bad_routes": "Bad routes: {{count}}"
   },
   "settings": {

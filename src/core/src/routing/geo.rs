@@ -72,6 +72,8 @@ pub struct GeoRouter {
     eu_domains: DashSet<String>,
     /// Американские домены
     us_domains: DashSet<String>,
+    /// Пользовательские заблокированные домены (T60)
+    user_domains: DashSet<String>,
     /// Исключённые домены (банки, госуслуги)
     exclude_domains: DashSet<String>,
     /// Российские CIDR диапазоны
@@ -98,6 +100,7 @@ impl GeoRouter {
             ru_domains: DashSet::new(),
             eu_domains: DashSet::new(),
             us_domains: DashSet::new(),
+            user_domains: DashSet::new(),
             exclude_domains: DashSet::new(),
             ru_cidrs: Vec::new(),
             eu_cidrs: Vec::new(),
@@ -457,6 +460,12 @@ impl GeoRouter {
         // Проверка по домену (exact match + subdomain match)
         let lower = domain.to_lowercase();
 
+        // 0. Пользовательские заблокированные домены (Custom User geoblock) имеют высший приоритет
+        if self.user_domains.contains(&lower) || self.matches_subdomain(&lower, &self.user_domains)
+        {
+            return GeoRegion::Europe;
+        }
+
         if self.ru_domains.contains(&lower) || self.matches_subdomain(&lower, &self.ru_domains) {
             return GeoRegion::Russia;
         }
@@ -470,6 +479,37 @@ impl GeoRouter {
         }
 
         GeoRegion::Global
+    }
+
+    /// Добавляет пользовательский домен в список гео-блокировки.
+    pub fn add_user_domain(&self, domain: &str) {
+        let domain_lower = domain.to_lowercase();
+        self.user_domains.insert(domain_lower);
+        self.clear_cache();
+    }
+
+    /// Удаляет пользовательский домен из списка гео-блокировки.
+    pub fn remove_user_domain(&self, domain: &str) -> bool {
+        let domain_lower = domain.to_lowercase();
+        let removed = self.user_domains.remove(&domain_lower).is_some();
+        if removed {
+            self.clear_cache();
+        }
+        removed
+    }
+
+    /// Возвращает снипшот пользовательских доменов.
+    pub fn user_domains_snapshot(&self) -> Vec<String> {
+        self.user_domains.iter().map(|d| d.clone()).collect()
+    }
+
+    /// Перезагружает список пользовательских доменов.
+    pub fn reload_user_domains(&self, domains: Vec<String>) {
+        self.user_domains.clear();
+        for d in domains {
+            self.user_domains.insert(d.to_lowercase());
+        }
+        self.clear_cache();
     }
 
     /// Строит цепочку egress-попыток для региона.
@@ -524,6 +564,11 @@ impl GeoRouter {
     pub fn clear_cache(&self) {
         self.cache.invalidate_all();
         debug!("GeoRouter resolve cache cleared");
+    }
+
+    /// Возвращает количество европейских доменов по умолчанию.
+    pub fn eu_domains_count(&self) -> usize {
+        self.eu_domains.len()
     }
 
     // ---- Внутренние методы ----

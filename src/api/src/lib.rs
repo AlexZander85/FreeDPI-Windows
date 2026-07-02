@@ -64,6 +64,11 @@ pub trait EngineHandle {
     fn split_tunnel_set_mode(&self, mode: &str);
     fn split_tunnel_add(&self, list: &str, entry_type: &str, value: &str) -> Result<(), String>;
     fn split_tunnel_remove(&self, list: &str, entry_type: &str, value: &str) -> Result<(), String>;
+
+    // ─── Geoblock Domains ─────────────────────────────────────────────────
+    fn geoblock_state(&self) -> serde_json::Value;
+    fn geoblock_add(&self, domain: &str) -> Result<(), String>;
+    fn geoblock_remove(&self, domain: &str) -> Result<(), String>;
 }
 
 // ─── Request/Response типы ─────────────────────────────────────────────────
@@ -161,6 +166,9 @@ pub async fn serve(engine: Arc<dyn EngineHandle + Send + Sync>, api_key: String,
             "/api/v1/splittunnel/remove",
             post(split_tunnel_remove_handler),
         )
+        .route("/api/v1/geoblock", get(geoblock_state_handler))
+        .route("/api/v1/geoblock/add", post(geoblock_add_handler))
+        .route("/api/v1/geoblock/remove", post(geoblock_remove_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -396,7 +404,57 @@ async fn split_tunnel_remove_handler(
         ),
     }
 }
+#[derive(Debug, Deserialize)]
+pub struct GeoblockAddRemoveRequest {
+    pub domain: String,
+}
 
+// ─── Geoblock Handlers ──────────────────────────────────────────────────
+
+/// `GET /api/v1/geoblock` — полное состояние списков гео-обхода.
+async fn geoblock_state_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(state.engine.geoblock_state())
+}
+
+/// `POST /api/v1/geoblock/add` — добавление домена.
+async fn geoblock_add_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(params): Json<GeoblockAddRemoveRequest>,
+) -> impl IntoResponse {
+    match state.engine.geoblock_add(&params.domain) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "added": true,
+                "domain": params.domain,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        ),
+    }
+}
+
+/// `POST /api/v1/geoblock/remove` — удаление домена.
+async fn geoblock_remove_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(params): Json<GeoblockAddRemoveRequest>,
+) -> impl IntoResponse {
+    match state.engine.geoblock_remove(&params.domain) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "removed": true,
+                "domain": params.domain,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        ),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +551,19 @@ mod tests {
             _entry_type: &str,
             _value: &str,
         ) -> Result<(), String> {
+            Ok(())
+        }
+        fn geoblock_state(&self) -> serde_json::Value {
+            serde_json::json!({
+                "static_count": 47,
+                "user_domains": ["netflix.com", "spotify.com"],
+                "probed_domains": []
+            })
+        }
+        fn geoblock_add(&self, _domain: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn geoblock_remove(&self, _domain: &str) -> Result<(), String> {
             Ok(())
         }
     }

@@ -444,3 +444,66 @@ pub async fn remove_split_tunnel_entry(
         Err(format!("API error: {}", body))
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoblockState {
+    pub static_count: usize,
+    pub user_domains: Vec<String>,
+    pub probed_domains: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn get_geoblock_state(api_port: Option<u16>) -> Result<GeoblockState, String> {
+    let port = api_port.unwrap_or(11337);
+    let url = format!("http://127.0.0.1:{}/api/v1/geoblock", port);
+
+    let resp = api_client()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Connection failed: {}", e))?;
+
+    resp.json::<GeoblockState>()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))
+}
+
+#[tauri::command]
+pub async fn add_geoblock_domain(domain: String, api_port: Option<u16>) -> Result<(), String> {
+    let port = api_port.unwrap_or(11337);
+    let url = format!("http://127.0.0.1:{}/api/v1/geoblock/add", port);
+
+    let resp = api_client()
+        .post(&url)
+        .json(&serde_json::json!({ "domain": domain }))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!("API error: {}", body))
+    }
+}
+
+#[tauri::command]
+pub async fn remove_geoblock_domain(domain: String, api_port: Option<u16>) -> Result<(), String> {
+    let port = api_port.unwrap_or(11337);
+    let url = format!("http://127.0.0.1:{}/api/v1/geoblock/remove", port);
+
+    let resp = api_client()
+        .post(&url)
+        .json(&serde_json::json!({ "domain": domain }))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!("API error: {}", body))
+    }
+}

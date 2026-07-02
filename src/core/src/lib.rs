@@ -25,6 +25,7 @@ pub mod packet_engine;
 pub mod probe;
 pub mod proxy;
 pub mod routing;
+pub mod socks;
 pub mod split_tunnel;
 
 use rayon::ThreadPoolBuilder;

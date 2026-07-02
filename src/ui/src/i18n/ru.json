@@ -88,6 +88,11 @@
     "global": "Глобальный",
     "excluded": "Исключён",
     "domains": "{{count}} доменов",
+    "custom_title": "Пользовательские гео-блокировки (через SOCKS5)",
+    "add_placeholder": "Введите домен (например, netflix.com)",
+    "add_btn": "Добавить",
+    "no_custom_domains": "Нет пользовательских гео-блокировок",
+    "probed_title": "Динамически проверенные домены",
     "bad_routes": "Плохие маршруты: {{count}}"
   },
   "settings": {

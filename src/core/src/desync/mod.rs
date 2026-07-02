@@ -27,6 +27,7 @@ pub mod ip;
 pub mod obfs;
 pub mod quic;
 pub mod rand;
+pub mod redirect_table;
 pub mod segment_plan;
 pub mod tcp;
 pub mod tls;
@@ -37,6 +38,7 @@ use pnet_packet::ip::IpNextHeaderProtocol;
 use pnet_packet::ipv4::MutableIpv4Packet;
 use pnet_packet::ipv6::MutableIpv6Packet;
 use pnet_packet::MutablePacket;
+use pnet_packet::Packet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Результат применения desync техники.
@@ -1072,4 +1074,167 @@ pub fn update_checksum_dword(old_csum: u16, old_dword: u32, new_dword: u32) -> u
     let new_lo = (new_dword & 0xFFFF) as u16;
     let csum = update_checksum_word(old_csum, old_hi, new_hi);
     update_checksum_word(csum, old_lo, new_lo)
+}
+
+/// Rewrites destination IP and Port, recalculating IP and TCP checksums.
+/// Also decrements TTL/Hop Limit by 1 for loop prevention.
+pub fn rewrite_dst_addr(
+    packet_data: &[u8],
+    new_dst_ip: IpAddr,
+    new_dst_port: u16,
+) -> anyhow::Result<bytes::Bytes> {
+    let mut buf = bytes::BytesMut::from(packet_data);
+    let mut ip_hdr = parse_ip_header(&buf).ok_or_else(|| anyhow::anyhow!("Invalid IP header"))?;
+    let ip_hdr_len = ip_hdr.header_len();
+
+    // 1. Update Destination IP and TTL/Hop Limit in IP Header
+    match &mut ip_hdr {
+        ParsedIpHeader::V4(_) => {
+            if let IpAddr::V4(new_ip) = new_dst_ip {
+                let mut ip_pkt = MutableIpv4Packet::new(&mut buf[..ip_hdr_len]).unwrap();
+                ip_pkt.set_destination(new_ip);
+                let new_ttl = ip_pkt.get_ttl().saturating_sub(1);
+                ip_pkt.set_ttl(new_ttl);
+                // Recalculate IPv4 Checksum
+                ip_pkt.set_checksum(0);
+                let csum = ipv4_checksum(ip_pkt.packet());
+                ip_pkt.set_checksum(csum);
+            }
+        }
+        ParsedIpHeader::V6(_) => {
+            if let IpAddr::V6(new_ip) = new_dst_ip {
+                let mut ip_pkt = MutableIpv6Packet::new(&mut buf[..ip_hdr_len]).unwrap();
+                ip_pkt.set_destination(new_ip);
+                let new_hl = ip_pkt.get_hop_limit().saturating_sub(1);
+                ip_pkt.set_hop_limit(new_hl);
+            }
+        }
+    }
+
+    // 2. Update Destination Port in TCP Header
+    {
+        let mut tcp_pkt = pnet_packet::tcp::MutableTcpPacket::new(&mut buf[ip_hdr_len..])
+            .ok_or_else(|| anyhow::anyhow!("Invalid TCP header"))?;
+        tcp_pkt.set_destination(new_dst_port);
+        // Recalculate TCP Checksum (includes Pseudo-Header)
+        tcp_pkt.set_checksum(0);
+    }
+
+    let new_tcp_csum = tcp_checksum(ip_hdr.src(), new_dst_ip, &buf[ip_hdr_len..]);
+    let mut tcp_pkt = pnet_packet::tcp::MutableTcpPacket::new(&mut buf[ip_hdr_len..]).unwrap();
+    tcp_pkt.set_checksum(new_tcp_csum);
+
+    Ok(buf.freeze())
+}
+
+/// Rewrites source IP and Port, recalculating IP and TCP checksums (for return path).
+/// Also decrements TTL/Hop Limit by 1 for loop prevention.
+pub fn rewrite_src_addr(
+    packet_data: &[u8],
+    new_src_ip: IpAddr,
+    new_src_port: u16,
+) -> anyhow::Result<bytes::Bytes> {
+    let mut buf = bytes::BytesMut::from(packet_data);
+    let mut ip_hdr = parse_ip_header(&buf).ok_or_else(|| anyhow::anyhow!("Invalid IP header"))?;
+    let ip_hdr_len = ip_hdr.header_len();
+
+    // 1. Update Source IP and TTL/Hop Limit in IP Header
+    match &mut ip_hdr {
+        ParsedIpHeader::V4(_) => {
+            if let IpAddr::V4(new_ip) = new_src_ip {
+                let mut ip_pkt = MutableIpv4Packet::new(&mut buf[..ip_hdr_len]).unwrap();
+                ip_pkt.set_source(new_ip);
+                let new_ttl = ip_pkt.get_ttl().saturating_sub(1);
+                ip_pkt.set_ttl(new_ttl);
+                // Recalculate IPv4 Checksum
+                ip_pkt.set_checksum(0);
+                let csum = ipv4_checksum(ip_pkt.packet());
+                ip_pkt.set_checksum(csum);
+            }
+        }
+        ParsedIpHeader::V6(_) => {
+            if let IpAddr::V6(new_ip) = new_src_ip {
+                let mut ip_pkt = MutableIpv6Packet::new(&mut buf[..ip_hdr_len]).unwrap();
+                ip_pkt.set_source(new_ip);
+                let new_hl = ip_pkt.get_hop_limit().saturating_sub(1);
+                ip_pkt.set_hop_limit(new_hl);
+            }
+        }
+    }
+
+    // 2. Update Source Port in TCP Header
+    {
+        let mut tcp_pkt = pnet_packet::tcp::MutableTcpPacket::new(&mut buf[ip_hdr_len..])
+            .ok_or_else(|| anyhow::anyhow!("Invalid TCP header"))?;
+        tcp_pkt.set_source(new_src_port);
+        // Recalculate TCP Checksum
+        tcp_pkt.set_checksum(0);
+    }
+
+    let new_tcp_csum = tcp_checksum(new_src_ip, ip_hdr.dst(), &buf[ip_hdr_len..]);
+    let mut tcp_pkt = pnet_packet::tcp::MutableTcpPacket::new(&mut buf[ip_hdr_len..]).unwrap();
+    tcp_pkt.set_checksum(new_tcp_csum);
+
+    Ok(buf.freeze())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pnet_packet::ipv4::Ipv4Packet;
+    use pnet_packet::tcp::TcpPacket;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn test_address_rewriting() {
+        // Construct a dummy IPv4 TCP packet
+        let mut pkt_data = vec![0u8; 40]; // 20 bytes IP, 20 bytes TCP
+
+        {
+            let mut ip = MutableIpv4Packet::new(&mut pkt_data[..20]).unwrap();
+            ip.set_version(4);
+            ip.set_header_length(5);
+            ip.set_total_length(40);
+            ip.set_ttl(64);
+            ip.set_next_level_protocol(pnet_packet::ip::IpNextHeaderProtocols::Tcp);
+            ip.set_source(Ipv4Addr::new(192, 168, 1, 10));
+            ip.set_destination(Ipv4Addr::new(8, 8, 8, 8));
+            ip.set_checksum(ipv4_checksum(ip.packet()));
+        }
+
+        {
+            let mut tcp = pnet_packet::tcp::MutableTcpPacket::new(&mut pkt_data[20..]).unwrap();
+            tcp.set_source(12345);
+            tcp.set_destination(80);
+            tcp.set_flags(0x02); // SYN
+            let csum = tcp_checksum(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                tcp.packet(),
+            );
+            tcp.set_checksum(csum);
+        }
+
+        // Test rewrite_dst_addr
+        let dst_rewritten =
+            rewrite_dst_addr(&pkt_data, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 17650).unwrap();
+
+        let ip_rewritten = Ipv4Packet::new(&dst_rewritten[..20]).unwrap();
+        assert_eq!(ip_rewritten.get_destination(), Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq!(ip_rewritten.get_ttl(), 63); // decremented by 1
+
+        let tcp_rewritten = TcpPacket::new(&dst_rewritten[20..]).unwrap();
+        assert_eq!(tcp_rewritten.get_destination(), 17650);
+
+        // Test rewrite_src_addr
+        let src_rewritten =
+            rewrite_src_addr(&dst_rewritten, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80).unwrap();
+
+        let ip_src_rewritten = Ipv4Packet::new(&src_rewritten[..20]).unwrap();
+        assert_eq!(ip_src_rewritten.get_source(), Ipv4Addr::new(8, 8, 8, 8));
+        assert_eq!(ip_src_rewritten.get_ttl(), 62); // decremented by 1
+
+        let tcp_src_rewritten = TcpPacket::new(&src_rewritten[20..]).unwrap();
+        assert_eq!(tcp_src_rewritten.get_source(), 80);
+    }
 }

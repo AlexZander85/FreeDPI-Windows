@@ -146,6 +146,9 @@ pub struct Config {
     /// T57: Пользовательские профили стратегий из TOML [[strategies]] секции
     #[serde(default)]
     pub strategies: Vec<StrategyProfileConfig>,
+    /// T60: Настройки SOCKS5 прокси и списков доменов
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 }
 
 /// Desync секция конфигурации.
@@ -223,6 +226,7 @@ impl Default for Config {
             cpu_threads: 0,
             desync: DesyncSection::default(),
             strategies: Vec::new(),
+            proxy: ProxyConfig::default(),
         }
     }
 }
@@ -659,4 +663,40 @@ fake_ttl_offset = 1
             vec!["FakeSni", "BadChecksum"]
         );
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProxyConfig {
+    /// Включить Opera SOCKS5 proxy routing вообще.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Домены прямо в TOML (маленький список / override).
+    #[serde(default)]
+    pub proxy_domains: Vec<String>,
+    /// Путь к внешнему файлу со списком доменов (один домен на строку).
+    #[serde(default)]
+    pub proxy_domains_file: Option<String>,
+    /// Автоматически определять заблокированные домены через probe.
+    #[serde(default = "default_true")]
+    pub auto_probe: bool,
+    pub max_connections: Option<usize>,
+    pub idle_timeout_secs: Option<u64>,
+}
+
+/// T60: Читает домены из файла, игнорируя пустые строки и комментарии (#...).
+pub fn load_domains_from_file(path: &str) -> anyhow::Result<Vec<String>> {
+    if !std::path::Path::new(path).exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(path)?;
+
+    let domains: Vec<String> = content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_lowercase())
+        .collect();
+
+    tracing::info!("T60: loaded {} domains from {path}", domains.len());
+    Ok(domains)
 }

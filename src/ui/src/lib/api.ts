@@ -79,3 +79,21 @@ export async function removeSplitTunnelEntry(
     apiPort: port,
   });
 }
+
+export interface GeoblockState {
+  static_count: number;
+  user_domains: string[];
+  probed_domains: string[];
+}
+
+export async function getGeoblockState(port?: number) {
+  return invoke<GeoblockState>("get_geoblock_state", { apiPort: port });
+}
+
+export async function addGeoblockDomain(domain: string, port?: number) {
+  return invoke<void>("add_geoblock_domain", { domain, apiPort: port });
+}
+
+export async function removeGeoblockDomain(domain: string, port?: number) {
+  return invoke<void>("remove_geoblock_domain", { domain, apiPort: port });
+}

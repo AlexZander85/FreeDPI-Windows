@@ -472,6 +472,44 @@ impl EngineHandle for ServiceEngine {
             )),
         }
     }
+
+    fn geoblock_state(&self) -> serde_json::Value {
+        if let Some(pipeline) = self.pipeline.get() {
+            let geo = pipeline.geo_router();
+            serde_json::json!({
+                "static_count": geo.eu_domains_count(),
+                "user_domains": geo.user_domains_snapshot(),
+                "probed_domains": []
+            })
+        } else {
+            serde_json::json!({
+                "static_count": 0,
+                "user_domains": [],
+                "probed_domains": []
+            })
+        }
+    }
+
+    fn geoblock_add(&self, domain: &str) -> Result<(), String> {
+        if let Some(pipeline) = self.pipeline.get() {
+            pipeline.geo_router().add_user_domain(domain);
+            Ok(())
+        } else {
+            Err("WinDivert pipeline is not running".to_string())
+        }
+    }
+
+    fn geoblock_remove(&self, domain: &str) -> Result<(), String> {
+        if let Some(pipeline) = self.pipeline.get() {
+            if pipeline.geo_router().remove_user_domain(domain) {
+                Ok(())
+            } else {
+                Err("Domain not found in geoblocked list".to_string())
+            }
+        } else {
+            Err("WinDivert pipeline is not running".to_string())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +573,73 @@ async fn run_service(
     if let Some(pipeline) = pipeline {
         let pipeline = std::sync::Arc::new(pipeline);
         let _ = engine.pipeline.set(pipeline.clone());
+
+        // T60: Загрузка доменов из конфига / внешнего файла при старте
+        if config.proxy.enabled {
+            for domain in &config.proxy.proxy_domains {
+                pipeline.geo_router().add_user_domain(domain);
+            }
+            if let Some(ref path) = config.proxy.proxy_domains_file {
+                if let Ok(domains) = freedpi_core::config::load_domains_from_file(path) {
+                    for domain in domains {
+                        pipeline.geo_router().add_user_domain(&domain);
+                    }
+                }
+            }
+        }
+
+        // T60: Polling-watch внешнего файла со списком доменов на mtime
+        if config.proxy.enabled {
+            if let Some(ref path_str) = config.proxy.proxy_domains_file {
+                let path = path_str.clone();
+                let geo_router = pipeline.geo_router().clone();
+                tokio::spawn(async move {
+                    let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                    loop {
+                        interval.tick().await;
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            if let Ok(mtime) = meta.modified() {
+                                if Some(mtime) != last_mtime {
+                                    last_mtime = Some(mtime);
+                                    if let Ok(domains) =
+                                        freedpi_core::config::load_domains_from_file(&path)
+                                    {
+                                        geo_router.reload_user_domains(domains);
+                                        info!("T60: reloaded geoblock domains from file: {}", path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        // T60: Auto-probe при старте
+        if config.proxy.enabled && config.proxy.auto_probe {
+            let geo_router = pipeline.geo_router().clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let candidates = vec![
+                    "netflix.com".to_string(),
+                    "spotify.com".to_string(),
+                    "telegram.org".to_string(),
+                ];
+                let probe_module = freedpi_core::probe::ProbeModule::new();
+                for domain in candidates {
+                    let result = probe_module.probe(&domain).await;
+                    if result.verdict == freedpi_core::probe::classifier::ProbeVerdict::Blocked {
+                        info!(
+                            "T60: Auto-probe detected '{}' is blocked, routing via SOCKS5 redirect",
+                            domain
+                        );
+                        geo_router.add_user_domain(&domain);
+                    }
+                }
+            });
+        }
+
         let stats = pipeline.stats_arc();
         let shutdown_rx_pipeline = shutdown_rx.resubscribe();
         tokio::spawn(async move {

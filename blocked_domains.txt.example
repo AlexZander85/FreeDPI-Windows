@@ -1,0 +1,9 @@
+# T60: домены, которые всегда идут через Opera SOCKS5 прокси.
+# Один домен на строку. Поддомены НЕ разворачиваются автоматически —
+# добавляй явно (netflix.com и www.netflix.com — разные строки).
+netflix.com
+www.netflix.com
+nflxvideo.net
+spotify.com
+open.spotify.com
+scdn.co
