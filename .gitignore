@@ -31,10 +31,14 @@ review/
 review2/
 
 # === Implementation plans (keep local) ===
-IMPLEMENTATION_PLAN_DPI-PROBE.md
+IMPLEMENTATION_PLAN*.md
 add.md
 add_plan.md
 dpi_detection.md
+sonnet5_review.md
+review_tasks.md
+REVIEW_TASKS_VERIFICATION.md
+reviews/
 
 # === Local secrets / temp ===
 *.env

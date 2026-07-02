@@ -24,7 +24,7 @@
 *   ⚡ **Экстремальная скорость**: Пропускная способность **5-10 Gbps** благодаря zero-copy конвейеру (подсчет ссылок `bytes::Bytes`), lock-free очередям `crossbeam::ArrayQueue` и выделенному пулу native OS воркеров.
 *   🧠 **Автотюнинг стратегий (AutoTune)**: Движок автоматически оценивает эффективность техник обхода на основе обратной связи от соединений (успех/таймаут/джиттер), используя алгоритм **Thompson Sampling** для динамического выбора наиболее стабильного профиля.
 *   🔍 **7-фазный DPI Probe**: Превентивное зондирование хостов (DNS Integrity → TCP Connect → TLS Handshake → HTTP Application → JA4 Fingerprinting → QUIC scan → Data-Volume), классификатор временных аномалий на базе машинного обучения (17 признаков, логистическая регрессия) и дискриминатор направления блокировки (Server-active vs Path-active).
-*   🛡️ **PRNG-Hardening (ChaCha20Rng)**: Полная защита от выявления паттернов desync-инжектов со стороны DPI за счет использования криптографически стойкого генератора `ChaCha20Rng` для всех wire-visible полей и GREASE-последовательностей.
+*   🛡️ **PRNG-Hardening (ChaCha12Rng)**: Полная защита от выявления паттернов desync-инжектов со стороны DPI за счет использования криптографически стойкого генератора `ChaCha12Rng` для всех wire-visible полей и GREASE-последовательностей.
 *   🔒 **Loop Prevention (Moka Cache)**: Надежное предотвращение петель перехвата и повторного анализа инжектов через сверхбыстрый кэш `injected_seqs` по 5-tuple + TCP Sequence.
 *   🌐 **Интеграция DNS & Fallback-маршрутизации**:
     *   **UDP DNS drop**: Автоматический сброс незащищенного DNS на порт 53 для форсирования перехода клиента на DoH (DNS-over-HTTPS).
@@ -43,7 +43,7 @@
 *   ⚡ **Extreme Performance**: Throughput of **5-10 Gbps** powered by a zero-copy pipeline (`bytes::Bytes` ref-counting), lock-free queues (`crossbeam::ArrayQueue`), and a dedicated pool of native OS workers.
 *   🧠 **Auto-Tuning Engine (AutoTune)**: Automatically evaluates desync profile performance based on connection feedback (success/timeout/jitter), leveraging **Thompson Sampling** to select the most stable strategy dynamically.
 *   🔍 **7-Phase DPI Probe**: Preventive host scanning (DNS Integrity → TCP Connect → TLS Handshake → HTTP Application → JA4 Fingerprinting → QUIC scan → Data-Volume), ML-based temporal anomaly classification (logistic regression on 17 features), and direction discriminator (Server-active vs Path-active).
-*   🛡️ **PRNG-Hardening (ChaCha20Rng)**: Prevents DPI from fingerprinting desync packet patterns by employing the cryptographically secure `ChaCha20Rng` generator for all wire-visible header fields and GREASE sets.
+*   🛡️ **PRNG-Hardening (ChaCha12Rng)**: Prevents DPI from fingerprinting desync packet patterns by employing the cryptographically secure `ChaCha12Rng` generator for all wire-visible header fields and GREASE sets.
 *   🔒 **Loop Prevention (Moka Cache)**: Avoids packet loop cascades via a high-speed `injected_seqs` lookup cache mapping 5-tuple and TCP Sequence keys.
 *   🌐 **DNS & Fallback Egress Routing**:
     *   **UDP DNS drop**: Drops unencrypted UDP/53 queries to force client fallback to DoH (DNS-over-HTTPS).
@@ -160,26 +160,148 @@ Fragmentation Overlap, TTL Manipulation (via **HopTab** cache), TTL Jitter, Bad 
 | CPU | Multi-core scaling (dedicated native OS worker threads) |
 | Allocs | **Zero-copy** pipeline (ref-counted `bytes::Bytes` packet wrappers) |
 | Locks | **Lock-free** packet structures and `ArcSwap` strategy rotation |
-| PRNG | **ChaCha20Rng** (hardened wire-visible payload and SEQ offsets) |
+| PRNG | **ChaCha12Rng** / **Xoshiro256++** (dual-RNG: CSPRNG for wire-visible, fast for non-observable) |
 
 ---
 
 ## 📦 Installation
 
-### Option 1: Installer
-1. Download `FreeDPI-Setup.exe` from [Releases](https://github.com/AlexZander85/FreeDPI-Windows/releases)
-2. Run as Administrator
-3. Follow the wizard (installs Windows Service, sets firewall rules, registers driver)
+### Option 1: Installer (recommended)
 
-### Option 2: Build from source
+Run `FreeDPI-Setup.exe` as Administrator (download from [Releases](https://github.com/AlexZander85/FreeDPI-Windows/releases) or build yourself):
+
+```powershell
+FreeDPI-Setup.exe
+```
+
+The installer will:
+1. Copy `freedpi-service.exe` + `WinDivert64.sys` to `C:\Program Files\FreeDPI\`
+2. Register the Windows service via SCM (`--install`)
+3. Start the FreeDPI service
+
+After installation, the service starts automatically at every boot.
+
+### Option 2: Manual deployment
+
+```powershell
+# From dist/
+.\deploy.ps1 install
+```
+
+### Option 3: Build from source
+
 ```bash
-# Clone
-git clone https://github.com/AlexZander85/FreeDPI-Windows.git
-cd FreeDPI-Windows/src
+# Prerequisites: Rust 1.83+, MSVC build tools
+cd src
+cargo build --release -p freedpi-service
+# Output: target/release/freedpi-service.exe
+```
 
-# Build
-cargo build --release
-# Binaries are placed in target/release/
+---
+
+## 🚨 Windows Security — What to Expect
+
+FreeDPI uses **WinDivert** (kernel-level packet filter) and **raw sockets**. This is technically similar to what malware does — so security software will react.
+
+### UAC (User Account Control)
+
+| Step | UAC prompt? | Why |
+|------|-------------|-----|
+| `FreeDPI-Setup.exe` (installer) | ✅ **Once** | Creates dir in `Program Files`, registers service |
+| `freedpi-service.exe --install` | ✅ **Once** | Registers service with SCM |
+| Service startup (`net start`) | ❌ No | Runs as `LocalSystem` — above UAC |
+| Runtime (packet interception) | ❌ No | Kernel-level via WinDivert driver |
+
+> After installation, UAC does **not** bother you again. The service starts automatically on boot.
+
+### Windows Defender & SmartScreen
+
+```
+🟡 SmartScreen:   "Windows protected your PC"
+                  → Click "Run anyway"
+
+🔴 Defender:      May quarantine WinDivert64.sys
+                  → Add exclusion: C:\Program Files\FreeDPI\
+
+🔴 Real-time AV:  May flag kernel driver activity
+                  → This is expected — WinDivert intercepts ALL TCP traffic
+```
+
+**Why this happens:** WinDivert64.sys operates in **ring 0** (kernel) and intercepts every TCP packet. To an antivirus, this looks identical to rootkit behavior. Defender cannot distinguish intent from behavior.
+
+### ⚠️ HVCI / Memory Integrity (Critical)
+
+**Windows 11** enables **Hypervisor-protected Code Integrity (HVCI)** by default on most new devices. HVCI blocks any kernel driver **without a Microsoft WHQL signature**.
+
+```
+❌ WinDivert64.sys IS signed (EV Code Signing by Sectigo)
+❌ But it does NOT have a WHQL signature
+❌ Therefore HVCI will BLOCK it with error 577 (ERROR_INVALID_IMAGE_HASH)
+```
+
+**To fix this, you MUST disable Memory Integrity:**
+
+```
+Settings → Privacy & Security → Windows Security
+→ Device Security → Core Isolation details
+→ Memory Integrity → OFF
+→ Restart
+```
+
+<details>
+<summary>📷 Visual guide (click to expand)</summary>
+
+```
+1. Open Windows Security
+2. Click "Device Security"
+3. Click "Core isolation details"
+4. Toggle "Memory integrity" → OFF
+5. Restart your computer
+```
+
+</details>
+
+> **Alternative:** Run FreeDPI on a machine or VM without HVCI (most Windows 10, older Windows 11 installs).
+
+### Defender ASR (Attack Surface Reduction)
+
+If you have custom ASR rules, they may block raw socket operations:
+
+```
+Add exclusion for: C:\Program Files\FreeDPI\freedpi-service.exe
+```
+
+### Third-party Antivirus (Kaspersky, ESET, Dr.Web, etc.)
+
+These are **less likely** to block WinDivert — it is a well-known library used by many networking tools. You may get a prompt:
+
+```
+"Allow FreeDPI to access the network?" → Allow
+```
+
+---
+
+## ❌ Troubleshooting
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `ERROR_INVALID_IMAGE_HASH (577)` | HVCI / Memory Integrity blocking the driver | Disable Memory Integrity (see above) |
+| `Access denied` | Not running as Administrator | Run PowerShell/cmd as Administrator |
+| `WinDivert driver blocked by antivirus/EDR` | Antivirus quarantined the driver | Add exclusion for `C:\Program Files\FreeDPI\` |
+| `WinDivert not initialized` | Driver failed to install | Check Windows System log, disable HVCI |
+| `Service not starting` | Config missing or corrupted | Check `config.toml` in installation directory |
+
+### Verifying installation
+
+```powershell
+# Check service status
+sc query FreeDPI
+
+# View logs
+Get-Content "$env:ProgramFiles\FreeDPI\freedpi.log" -Tail 50
+
+# Test API
+curl -s http://127.0.0.1:8080/api/v1/status
 ```
 
 ---
@@ -239,7 +361,8 @@ FreeDPI-Windows/
 │   │       │   ├── tls.rs    # TLS evasion
 │   │       │   ├── quic.rs   # QUIC bypass
 │   │       │   ├── http.rs   # HTTP obfuscation
-│   │       │   └── crypto.rs # ChaCha20, PRNG-hardening
+│   │       │   ├── rand.rs   # CSPRNG (ChaCha12Rng), PRNG-hardening
+│   │       │   └── obfs.rs   # Protocol obfuscation (padding, XOR)
 │   │       ├── probe/        # DPI Probe Module (7-phase pipeline)
 │   │       │   ├── ja4_probe.rs   # JA4 TLS analysis
 │   │       │   ├── quic_probe.rs  # QUIC scan

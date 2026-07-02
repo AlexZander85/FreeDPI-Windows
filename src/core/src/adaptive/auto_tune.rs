@@ -325,7 +325,7 @@ impl Default for AutoTune {
     }
 }
 
-/// Pseudo-random f64 in (0, 1) using the project's thread-local ChaCha8Rng.
+/// Pseudo-random f64 in (0, 1) using the project's thread-local ChaCha12Rng.
 /// Used for Thompson Sampling noise — CSPRNG is overkill here, but we reuse
 /// the existing infrastructure rather than adding another dependency.
 ///

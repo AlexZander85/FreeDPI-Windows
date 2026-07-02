@@ -21,8 +21,8 @@ futures = "0.3"
 # Parallel CPU processing
 rayon = "1.10"
 
-# WinDivert packet interception
-windivert = "0.7.0-beta.4"
+# WinDivert packet interception (static linking — no WinDivert.dll needed at runtime)
+windivert = { version = "0.7.0-beta.4", features = ["static"] }
 
 # Windows API (must match windivert's requirement: 0.62)
 windows = { version = "0.62", features = [
@@ -92,3 +92,13 @@ ipnet = "2.10"
 
 # IPC (Named Pipes)
 interprocess = "2"
+
+[profile.release]
+# Full link-time optimization — faster + smaller binary
+lto = "fat"
+# Maximize per-function optimization
+codegen-units = 1
+# Strip debug symbols
+strip = "symbols"
+# Abort on panic — removes unwind tables, smaller binary
+panic = "abort"

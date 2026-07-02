@@ -94,7 +94,7 @@ export default function ProbePanel() {
     if (selectedPresets.length === 0) return;
     setBatchLoading(true);
     try {
-      const results = await invoke<ProbeResponse[]>("run_batch_probe", {
+      const results = await invoke<ProbeResult[]>("run_batch_probe", {
         presetIds: selectedPresets,
         full: true,
       });
