@@ -332,3 +332,115 @@ pub async fn import_domains_from_text(text: String) -> Result<Vec<String>, Strin
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect())
 }
+
+// ─── Split Tunnel ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SplitTunnelState {
+    pub mode: String,
+    #[serde(default)]
+    pub blacklist_domains: Vec<String>,
+    #[serde(default)]
+    pub blacklist_ips: Vec<String>,
+    #[serde(default)]
+    pub blacklist_cidrs: Vec<String>,
+    #[serde(default)]
+    pub whitelist_domains: Vec<String>,
+    #[serde(default)]
+    pub whitelist_ips: Vec<String>,
+    #[serde(default)]
+    pub whitelist_cidrs: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn get_split_tunnel(api_port: Option<u16>) -> Result<SplitTunnelState, String> {
+    let port = api_port.unwrap_or(11337);
+    let url = format!("http://127.0.0.1:{}/api/v1/splittunnel", port);
+
+    let resp = api_client()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Connection failed: {}", e))?;
+
+    resp.json::<SplitTunnelState>()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))
+}
+
+#[tauri::command]
+pub async fn set_split_tunnel_mode(mode: String, api_port: Option<u16>) -> Result<(), String> {
+    let port = api_port.unwrap_or(11337);
+    let url = format!("http://127.0.0.1:{}/api/v1/splittunnel/mode", port);
+
+    let resp = api_client()
+        .post(&url)
+        .json(&serde_json::json!({ "mode": mode }))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("API error: {}", resp.status()))
+    }
+}
+
+#[tauri::command]
+pub async fn add_split_tunnel_entry(
+    list: String,
+    entry_type: String,
+    value: String,
+    api_port: Option<u16>,
+) -> Result<(), String> {
+    let port = api_port.unwrap_or(11337);
+    let url = format!("http://127.0.0.1:{}/api/v1/splittunnel/add", port);
+
+    let resp = api_client()
+        .post(&url)
+        .json(&serde_json::json!({
+            "list": list,
+            "entry_type": entry_type,
+            "value": value,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!("API error: {}", body))
+    }
+}
+
+#[tauri::command]
+pub async fn remove_split_tunnel_entry(
+    list: String,
+    entry_type: String,
+    value: String,
+    api_port: Option<u16>,
+) -> Result<(), String> {
+    let port = api_port.unwrap_or(11337);
+    let url = format!("http://127.0.0.1:{}/api/v1/splittunnel/remove", port);
+
+    let resp = api_client()
+        .post(&url)
+        .json(&serde_json::json!({
+            "list": list,
+            "entry_type": entry_type,
+            "value": value,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!("API error: {}", body))
+    }
+}

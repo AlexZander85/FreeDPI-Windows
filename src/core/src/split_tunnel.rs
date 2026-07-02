@@ -229,6 +229,12 @@ impl SplitTunnel {
         self.whitelist_domains.insert(domain);
     }
 
+    /// Добавляет IP в whitelist.
+    pub fn add_ip_to_whitelist(&self, ip: IpAddr) {
+        debug!("Adding IP to whitelist: {}", ip);
+        self.whitelist_ips.insert(ip);
+    }
+
     /// Добавляет CIDR в whitelist.
     pub fn add_net_to_whitelist(&mut self, net: IpNet) {
         debug!("Adding CIDR to whitelist: {}", net);
@@ -311,14 +317,72 @@ impl SplitTunnel {
         self.mode
     }
 
-    /// Снапшот blacklist для API.
+    /// Удаляет домен из blacklist.
+    pub fn remove_from_blacklist(&self, domain: &str) -> bool {
+        debug!("Removing from blacklist: {}", domain);
+        self.blacklist_domains.remove(domain).is_some()
+    }
+
+    /// Удаляет IP из blacklist.
+    pub fn remove_ip_from_blacklist(&self, ip: &IpAddr) -> bool {
+        debug!("Removing IP from blacklist: {}", ip);
+        self.blacklist_ips.remove(ip).is_some()
+    }
+
+    /// Удаляет CIDR из blacklist по значению.
+    pub fn remove_net_from_blacklist(&mut self, net: &IpNet) -> bool {
+        let len_before = self.blacklist_nets.len();
+        self.blacklist_nets.retain(|n| n != net);
+        self.blacklist_nets.len() < len_before
+    }
+
+    /// Удаляет домен из whitelist.
+    pub fn remove_from_whitelist(&self, domain: &str) -> bool {
+        debug!("Removing from whitelist: {}", domain);
+        self.whitelist_domains.remove(domain).is_some()
+    }
+
+    /// Удаляет IP из whitelist.
+    pub fn remove_ip_from_whitelist(&self, ip: &IpAddr) -> bool {
+        debug!("Removing IP from whitelist: {}", ip);
+        self.whitelist_ips.remove(ip).is_some()
+    }
+
+    /// Удаляет CIDR из whitelist по значению.
+    pub fn remove_net_from_whitelist(&mut self, net: &IpNet) -> bool {
+        let len_before = self.whitelist_nets.len();
+        self.whitelist_nets.retain(|n| n != net);
+        self.whitelist_nets.len() < len_before
+    }
+
+    /// Снапшот blacklist доменов для API.
     pub fn blacklist_snapshot(&self) -> Vec<String> {
         self.blacklist_domains.iter().map(|d| d.clone()).collect()
     }
 
-    /// Снапшот whitelist для API.
+    /// Снапшот blacklist IP для API.
+    pub fn blacklist_ips_snapshot(&self) -> Vec<String> {
+        self.blacklist_ips.iter().map(|ip| ip.to_string()).collect()
+    }
+
+    /// Снапшот blacklist CIDR для API.
+    pub fn blacklist_nets_snapshot(&self) -> Vec<String> {
+        self.blacklist_nets.iter().map(|net| net.to_string()).collect()
+    }
+
+    /// Снапшот whitelist доменов для API.
     pub fn whitelist_snapshot(&self) -> Vec<String> {
         self.whitelist_domains.iter().map(|d| d.clone()).collect()
+    }
+
+    /// Снапшот whitelist IP для API.
+    pub fn whitelist_ips_snapshot(&self) -> Vec<String> {
+        self.whitelist_ips.iter().map(|ip| ip.to_string()).collect()
+    }
+
+    /// Снапшот whitelist CIDR для API.
+    pub fn whitelist_nets_snapshot(&self) -> Vec<String> {
+        self.whitelist_nets.iter().map(|net| net.to_string()).collect()
     }
 }
 
@@ -569,7 +633,7 @@ mod tests {
     #[test]
     fn test_cidr_ipv6() {
         let cidr = IpNet::from_str("2a00:1450::/32").unwrap();
-        let mut tunnel = SplitTunnel::with_cidrs(SplitMode::BlacklistOnly, vec![cidr], Vec::new());
+        let tunnel = SplitTunnel::with_cidrs(SplitMode::BlacklistOnly, vec![cidr], Vec::new());
 
         let ip_in = IpAddr::V6(Ipv6Addr::new(
             0x2a00, 0x1450, 0x4001, 0x0812, 0, 0, 0, 0x200e,
@@ -603,6 +667,53 @@ mod tests {
         let tunnel = SplitTunnel::with_cidrs(SplitMode::BlacklistOnly, vec![cidr], Vec::new());
         let filter = tunnel.build_win_divert_filter();
         assert!(filter.contains("ip.DstAddr != 10.0.0.0/8"));
+    }
+
+    #[test]
+    fn test_remove_domain() {
+        let tunnel = SplitTunnel::new(SplitMode::BlacklistOnly);
+        tunnel.add_to_blacklist("example.com".to_string());
+        assert!(!tunnel.should_bypass_domain("example.com"));
+        assert!(tunnel.remove_from_blacklist("example.com"));
+        assert!(tunnel.should_bypass_domain("example.com"));
+    }
+
+    #[test]
+    fn test_remove_ip() {
+        let tunnel = SplitTunnel::new(SplitMode::BlacklistOnly);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        tunnel.add_ip_to_blacklist(ip);
+        assert!(!tunnel.should_bypass_ip(&ip));
+        assert!(tunnel.remove_ip_from_blacklist(&ip));
+        assert!(tunnel.should_bypass_ip(&ip));
+    }
+
+    #[test]
+    fn test_remove_cidr() {
+        let cidr = IpNet::from_str("10.0.0.0/8").unwrap();
+        let cidr2 = IpNet::from_str("10.0.0.0/8").unwrap();
+        let mut tunnel = SplitTunnel::with_cidrs(SplitMode::BlacklistOnly, vec![cidr], Vec::new());
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        assert!(!tunnel.should_bypass_ip(&ip));
+        assert!(tunnel.remove_net_from_blacklist(&cidr2));
+        assert!(tunnel.should_bypass_ip(&ip));
+    }
+
+    #[test]
+    fn test_snapshots() {
+        let tunnel = SplitTunnel::new(SplitMode::BlacklistOnly);
+        tunnel.add_to_blacklist("blocked.ru".to_string());
+        tunnel.add_ip_to_blacklist(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        tunnel.add_to_whitelist("allowed.com".to_string());
+
+        let bd = tunnel.blacklist_snapshot();
+        assert!(bd.contains(&"blocked.ru".to_string()));
+
+        let bi = tunnel.blacklist_ips_snapshot();
+        assert!(bi.contains(&"1.2.3.4".to_string()));
+
+        let wd = tunnel.whitelist_snapshot();
+        assert!(wd.contains(&"allowed.com".to_string()));
     }
 
     #[test]

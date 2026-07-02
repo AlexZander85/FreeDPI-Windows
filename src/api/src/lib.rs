@@ -58,6 +58,22 @@ pub trait EngineHandle {
     fn probe_batch(&self, domains: &[&str], full: bool) -> Result<serde_json::Value, String>;
     fn get_presets(&self) -> serde_json::Value;
     fn get_probe_history(&self) -> serde_json::Value;
+
+    // ─── Split Tunnel ─────────────────────────────────────────────────────
+    fn split_tunnel_state(&self) -> serde_json::Value;
+    fn split_tunnel_set_mode(&self, mode: &str);
+    fn split_tunnel_add(
+        &self,
+        list: &str,
+        entry_type: &str,
+        value: &str,
+    ) -> Result<(), String>;
+    fn split_tunnel_remove(
+        &self,
+        list: &str,
+        entry_type: &str,
+        value: &str,
+    ) -> Result<(), String>;
 }
 
 // ─── Request/Response типы ─────────────────────────────────────────────────
@@ -145,6 +161,10 @@ pub async fn serve(engine: Arc<dyn EngineHandle + Send + Sync>, api_key: String,
         .route("/api/v1/probe/batch", post(batch_probe_handler))
         .route("/api/v1/probe/presets", get(presets_handler))
         .route("/api/v1/probe/history", get(history_handler))
+        .route("/api/v1/splittunnel", get(split_tunnel_state_handler))
+        .route("/api/v1/splittunnel/mode", post(split_tunnel_set_mode_handler))
+        .route("/api/v1/splittunnel/add", post(split_tunnel_add_handler))
+        .route("/api/v1/splittunnel/remove", post(split_tunnel_remove_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -298,6 +318,85 @@ async fn history_handler(State(state): State<Arc<ApiState>>) -> impl IntoRespons
     Json(state.engine.get_probe_history())
 }
 
+// ─── Split Tunnel Request Types ────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct SplitTunnelModeRequest {
+    pub mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SplitTunnelEntryRequest {
+    pub list: String,
+    pub entry_type: String,
+    pub value: String,
+}
+
+// ─── Split Tunnel Handlers ─────────────────────────────────────────────────
+
+/// `GET /api/v1/splittunnel` — полное состояние split tunnel.
+async fn split_tunnel_state_handler(
+    State(state): State<Arc<ApiState>>,
+) -> impl IntoResponse {
+    Json(state.engine.split_tunnel_state())
+}
+
+/// `POST /api/v1/splittunnel/mode` — смена режима.
+async fn split_tunnel_set_mode_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(params): Json<SplitTunnelModeRequest>,
+) -> impl IntoResponse {
+    state.engine.split_tunnel_set_mode(&params.mode);
+    Json(serde_json::json!({
+        "mode": params.mode,
+        "updated": true,
+    }))
+}
+
+/// `POST /api/v1/splittunnel/add` — добавление записи.
+async fn split_tunnel_add_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(params): Json<SplitTunnelEntryRequest>,
+) -> impl IntoResponse {
+    match state.engine.split_tunnel_add(&params.list, &params.entry_type, &params.value) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "added": true,
+                "list": params.list,
+                "entry_type": params.entry_type,
+                "value": params.value,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        ),
+    }
+}
+
+/// `POST /api/v1/splittunnel/remove` — удаление записи.
+async fn split_tunnel_remove_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(params): Json<SplitTunnelEntryRequest>,
+) -> impl IntoResponse {
+    match state.engine.split_tunnel_remove(&params.list, &params.entry_type, &params.value) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "removed": true,
+                "list": params.list,
+                "entry_type": params.entry_type,
+                "value": params.value,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +466,34 @@ mod tests {
         }
         fn get_probe_history(&self) -> serde_json::Value {
             serde_json::json!([])
+        }
+        fn split_tunnel_state(&self) -> serde_json::Value {
+            serde_json::json!({
+                "mode": "BlacklistOnly",
+                "blacklist_domains": [],
+                "blacklist_ips": [],
+                "blacklist_cidrs": [],
+                "whitelist_domains": [],
+                "whitelist_ips": [],
+                "whitelist_cidrs": [],
+            })
+        }
+        fn split_tunnel_set_mode(&self, _mode: &str) {}
+        fn split_tunnel_add(
+            &self,
+            _list: &str,
+            _entry_type: &str,
+            _value: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn split_tunnel_remove(
+            &self,
+            _list: &str,
+            _entry_type: &str,
+            _value: &str,
+        ) -> Result<(), String> {
+            Ok(())
         }
     }
 

@@ -8,7 +8,9 @@
     "strategies": "Strategies",
     "connections": "Connections",
     "geo": "Geo-Routing",
-    "settings": "Settings"
+    "settings": "Settings",
+    "probe": "Probe",
+    "splittunnel": "Split Tunnel"
   },
   "status": {
     "title": "Engine Status",
@@ -109,6 +111,29 @@
     "label": "Language",
     "en": "English",
     "ru": "Русский"
+  },
+  "splittunnel": {
+    "title": "Split Tunnel",
+    "mode": "Mode",
+    "blacklist_only": "Blacklist Only",
+    "whitelist_only": "Whitelist Only",
+    "auto": "Auto",
+    "blacklist": "Blacklist",
+    "whitelist": "Whitelist",
+    "domains": "Domains",
+    "ips": "IPs",
+    "cidrs": "CIDR Ranges",
+    "add_domain": "Add Domain",
+    "add_ip": "Add IP",
+    "add_cidr": "Add CIDR",
+    "remove": "Remove",
+    "no_entries": "No entries",
+    "placeholder_domain": "e.g. example.com",
+    "placeholder_ip": "e.g. 10.0.0.1",
+    "placeholder_cidr": "e.g. 10.0.0.0/8",
+    "added": "Added successfully",
+    "removed": "Removed successfully",
+    "mode_updated": "Mode updated"
   },
   "theme": {
     "light": "Light",

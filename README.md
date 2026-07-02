@@ -32,13 +32,16 @@
     *   **SOCKS5 Fallback**: Автоматический дроп direct-подключений к заблокированным доменам для перенаправления их клиентом через SOCKS5-прокси.
 *   ⚙️ **TOML-стратегии**: Поддержка секции `[[strategies]]` для добавления пользовательских профилей десинхронизации, динамически сливаемых с реестром по умолчанию без перезапуска службы.
 *   💿 **Один файл — всё включено**: WinDivert статически слинкован в `freedpi-service.exe` — отдельный `WinDivert.dll` не требуется. Размер бинарника всего **~4.9 MB** (снижение на **38.5%**) благодаря LTO, strip и panic=abort.
-*   🧩 **Split Tunnel с CIDR и IPv6**: Фильтрация трафика по CIDR-диапазонам (`10.0.0.0/8`) и полная поддержка IPv6-адресов наряду с точными IP и доменами.
+*   🌍 **Geo-unblocking через Opera VPN**: Встроенная маршрутизация через бесплатные SOCKS5-прокси Opera для европейского трафика — обход региональных блокировок без подписки на VPN-сервис. Европейский трафик автоматически направляется через Opera, US — через пользовательский прокси, RU — напрямую (desync).
+*   📡 **Работает полностью локально**: Никаких внешних VPN-серверов, VPS или платных подписок не требуется — весь DPI-обход выполняется на уровне ядра Windows  через WinDivert. 100% локально, 100% приватно.
+*   🖥️ **Desktop UI (Tauri v2 + React)**: Элегантный системный трей + веб-дашборд с 7 вкладками (Status, Strategies, Connections, Geo-Routing, Split Tunnel, Settings, Probe). Двухпроцессная архитектура: `freedpi-service.exe` (SYSTEM) + `ByeByeDPI.exe` (user) — изоляция привилегий и устойчивость к сбоям.
+*   🧩 **Split Tunnel с CIDR и IPv6**: Фильтрация трафика по CIDR-диапазонам (`10.0.0.0/8`) и полная поддержка IPv6-адресов наряду с точными IP и доменами. Управление через REST API или GUI.
 *   📦 **Готовый установщик**: `FreeDPI-Setup.exe` (C# .NET 8, single-file publish) копирует файлы, устанавливает драйвер WinDivert и регистрирует службу Windows за один шаг.
 *   🎯 **SeqSpoof — флагманская техника**: out-of-window SEQ number spoofing — инжект пакетов с SEQ-номерами за пределами окна приёма, которые DPI считывает раньше легитимных, а целевой сервер игнорирует. Технология, принципиально отсутствующая в GoodbyeDPI/zapret/ByeDPI.
 *   🔗 **Connection Tracking 5-tuple**: Полноценный conntrack на `DashMap` с автоматической сборкой мусора (GC по истечении таймаута) — каждый поток идентифицируется по 5-tuple (src_ip, dst_ip, proto, src_port, dst_port). Основа работы всех desync-инжектов и loop prevention.
 *   🧩 **Split Tunnel 3-режима**: Blacklist (обходить всё, кроме указанного), Whitelist (обходить только указанное), Auto (авто-детект DPI-блокировок через Probe Module) — с CIDR-диапазонами и IPv6.
 *   🔄 **Hot-reload конфига**: TOML-конфиг и секция `[[strategies]]` обновляются на лету через `ArcSwap` без перезапуска службы.
-*   🌐 **REST API + AI-agent интеграция**: Полноценный HTTP API (Axum) на порту 8080 — управление стратегиями, probe, тюнинг, routing overrides, чтение логов. Готов для интеграции с AI-агентами.
+*   🌐 **REST API + AI-agent интеграция**: Полноценный HTTP API (Axum) на `127.0.0.1:11337` с `X-API-Key` аутентификацией — управление стратегиями, probe, тюнинг, routing overrides, split tunnel CRUD, чтение логов. Готов для интеграции с AI-агентами.
 
 ## 🇬🇧 About
 
@@ -57,13 +60,16 @@
     *   **SOCKS5 Fallback**: Drops direct TCP SYN connections to blocked hosts to force client-side SOCKS5/Proxy fallback.
 *   ⚙️ **TOML Custom Profiles**: Declaring custom strategies via the `[[strategies]]` section in `config.toml` with seamless registry merging and hot-reload.
 *   💿 **Single-file deployment**: WinDivert is statically linked into `freedpi-service.exe` — no separate `WinDivert.dll` required. Binary size only **~4.9 MB** (**38.5% reduction**) thanks to LTO, stripping, and `panic=abort`.
-*   🧩 **CIDR + IPv6 Split Tunnel**: Filter traffic by network ranges (`10.0.0.0/8`) with full IPv6 address support alongside exact IPs and domain names.
+*   🌍 **Geo-unblocking via Opera VPN**: Built-in routing through free Opera SOCKS5 proxies for European traffic — bypass regional blocks without VPN subscription. European traffic → OperaVPN, US → user proxy, RU → direct (desync).
+*   📡 **Fully Local Operation**: No external VPN servers, VPS, or paid subscriptions needed — all DPI bypass runs at kernel level via WinDivert. 100% local, 100% private.
+*   🖥️ **Desktop UI (Tauri v2 + React)**: Elegant system tray + web dashboard with 7 tabs (Status, Strategies, Connections, Geo-Routing, Split Tunnel, Settings, Probe). Two-process architecture: `freedpi-service.exe` (SYSTEM) + `ByeByeDPI.exe` (user) — privilege isolation and crash resilience.
+*   🧩 **CIDR + IPv6 Split Tunnel**: Filter traffic by network ranges (`10.0.0.0/8`) with full IPv6 address support alongside exact IPs and domain names. Manage via REST API or GUI.
 *   📦 **Ready-to-run installer**: `FreeDPI-Setup.exe` (C# .NET 8, single-file publish) copies files, installs the WinDivert kernel driver, and registers the Windows service in a single step.
 *   🎯 **SeqSpoof — flagship technique**: Out-of-window SEQ number spoofing — injects packets with SEQ numbers beyond the receiver window, so DPI reads them before legitimate packets while the target server ignores them. A technique fundamentally absent in GoodbyeDPI/zapret/ByeDPI.
 *   🔗 **5-tuple Connection Tracking**: Full conntrack on `DashMap` with automatic GC (timeout-based eviction) — every flow identified by 5-tuple (src_ip, dst_ip, proto, src_port, dst_port). Foundation of all desync injection and loop prevention.
 *   🧩 **Split Tunnel 3-mode**: Blacklist (bypass everything except listed), Whitelist (bypass only listed), Auto (auto-detect DPI blocks via Probe Module) — with CIDR ranges and IPv6.
 *   🔄 **Hot-reload config**: TOML config and `[[strategies]]` section update at runtime via `ArcSwap` — no service restart required.
-*   🌐 **REST API + AI-agent integration**: Full HTTP API (Axum) on port 8080 — strategy management, probe, tuning, routing overrides, log streaming. Ready for AI-agent integration.
+*   🌐 **REST API + AI-agent integration**: Full HTTP API (Axum) on `127.0.0.1:11337` with `X-API-Key` authentication — strategy management, probe, tuning, routing overrides, split tunnel CRUD, log streaming. Ready for AI-agent integration.
 
 ## 🏗️ Architecture
 
@@ -383,9 +389,14 @@ FreeDPI-Windows/
 │   │       │   └── discriminator.rs # Direction classification
 │   │       ├── adaptive/     # Auto-TTL, AutoTune registry
 │   │       └── conntrack.rs  # Connection tracking (injected_seqs cache)
-│   ├── api/                  # REST API (Axum)
+│   │       └── split_tunnel.rs # Split tunnel (CIDR + IPv6 + persistence)
+│   ├── api/                  # REST API (Axum, port 11337, X-API-Key)
 │   ├── service/              # Windows Service (SCM Native wrapper)
 │   └── ui/                   # System tray GUI (Tauri v2 + React)
+│       └── src/
+│           ├── components/
+│           │   ├── SplitTunnelPanel.tsx  # Split Tunnel GUI
+│           │   └── ...
 └── ARCHITECTURE.md           # Full technical architecture documentation
 ```
 

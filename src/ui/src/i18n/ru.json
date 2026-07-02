@@ -8,7 +8,9 @@
     "strategies": "Стратегии",
     "connections": "Соединения",
     "geo": "Гео-маршрутизация",
-    "settings": "Настройки"
+    "settings": "Настройки",
+    "probe": "Проверка",
+    "splittunnel": "Split Tunnel"
   },
   "status": {
     "title": "Статус движка",
@@ -109,6 +111,29 @@
     "label": "Язык",
     "en": "English",
     "ru": "Русский"
+  },
+  "splittunnel": {
+    "title": "Split Tunnel",
+    "mode": "Режим",
+    "blacklist_only": "Только blacklist",
+    "whitelist_only": "Только whitelist",
+    "auto": "Авто",
+    "blacklist": "Чёрный список (bypass)",
+    "whitelist": "Белый список (bypass)",
+    "domains": "Домены",
+    "ips": "IP-адреса",
+    "cidrs": "CIDR диапазоны",
+    "add_domain": "Добавить домен",
+    "add_ip": "Добавить IP",
+    "add_cidr": "Добавить CIDR",
+    "remove": "Удалить",
+    "no_entries": "Нет записей",
+    "placeholder_domain": "например example.com",
+    "placeholder_ip": "например 10.0.0.1",
+    "placeholder_cidr": "например 10.0.0.0/8",
+    "added": "Добавлено",
+    "removed": "Удалено",
+    "mode_updated": "Режим изменён"
   },
   "theme": {
     "light": "Светлая",

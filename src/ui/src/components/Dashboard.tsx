@@ -10,10 +10,11 @@ import ConntrackPanel from "./ConntrackPanel";
 import GeoPanel from "./GeoPanel";
 import SettingsPanel from "./SettingsPanel";
 import ProbePanel from "./ProbePanel";
+import SplitTunnelPanel from "./SplitTunnelPanel";
 
-type Tab = "status" | "strategies" | "connections" | "geo" | "settings" | "probe";
+type Tab = "status" | "strategies" | "connections" | "geo" | "settings" | "probe" | "splittunnel";
 
-const tabs: Tab[] = ["status", "strategies", "connections", "geo", "settings", "probe"];
+const tabs: Tab[] = ["status", "strategies", "connections", "geo", "splittunnel", "settings", "probe"];
 
 export default function Dashboard() {
   const { t } = useTranslation();
@@ -79,6 +80,7 @@ export default function Dashboard() {
         {activeTab === "strategies" && <StrategyPanel />}
         {activeTab === "connections" && <ConntrackPanel />}
         {activeTab === "geo" && <GeoPanel />}
+        {activeTab === "splittunnel" && <SplitTunnelPanel />}
         {activeTab === "settings" && <SettingsPanel />}
         {activeTab === "probe" && <ProbePanel />}
       </main>

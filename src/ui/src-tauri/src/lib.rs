@@ -19,6 +19,10 @@ pub fn run() {
             commands::save_custom_list,
             commands::delete_custom_list,
             commands::import_domains_from_text,
+            commands::get_split_tunnel,
+            commands::set_split_tunnel_mode,
+            commands::add_split_tunnel_entry,
+            commands::remove_split_tunnel_entry,
         ])
         .setup(|app| {
             tray::setup_tray(app.handle())?;

@@ -15,4 +15,5 @@ num_cpus.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 uuid.workspace = true
+ipnet.workspace = true
 windows.workspace = true

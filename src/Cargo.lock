@@ -724,6 +724,7 @@ dependencies = [
  "clap",
  "freedpi-api",
  "freedpi-core",
+ "ipnet",
  "num_cpus",
  "serde_json",
  "tokio",

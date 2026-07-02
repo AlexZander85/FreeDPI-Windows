@@ -25,6 +25,7 @@ use freedpi_api::{
 use freedpi_core::{
     adaptive::hop_tab::HopTab, config::Config, conntrack::Conntrack, dns::fakeip::FakeIpManager,
     engine::ProcessingPipeline, infra::sentinel::Sentinel, routing::geo::GeoRouter,
+    split_tunnel::{SplitMode, SplitTunnel},
 };
 use std::path::PathBuf;
 use std::sync::{
@@ -87,10 +88,16 @@ struct ServiceEngine {
     running: AtomicBool,
     probe_history: std::sync::Mutex<Vec<serde_json::Value>>,
     pub pipeline: std::sync::OnceLock<Arc<ProcessingPipeline>>,
+    split_tunnel: std::sync::Mutex<SplitTunnel>,
 }
 
 impl ServiceEngine {
-    fn new() -> Self {
+    fn new(config: &Config) -> Self {
+        let split_mode = match config.split_mode {
+            freedpi_core::config::SplitModeConfig::BlacklistOnly => SplitMode::BlacklistOnly,
+            freedpi_core::config::SplitModeConfig::WhitelistOnly => SplitMode::WhitelistOnly,
+            freedpi_core::config::SplitModeConfig::Auto => SplitMode::Auto,
+        };
         Self {
             start_time: std::time::Instant::now(),
             packets_processed: AtomicU64::new(0),
@@ -99,6 +106,7 @@ impl ServiceEngine {
             running: AtomicBool::new(true),
             probe_history: std::sync::Mutex::new(Vec::new()),
             pipeline: std::sync::OnceLock::new(),
+            split_tunnel: std::sync::Mutex::new(SplitTunnel::new(split_mode)),
         }
     }
 }
@@ -346,6 +354,124 @@ impl EngineHandle for ServiceEngine {
             .collect();
         serde_json::Value::Array(json)
     }
+
+    fn split_tunnel_state(&self) -> serde_json::Value {
+        let st = self.split_tunnel.lock().unwrap();
+        serde_json::json!({
+            "mode": match st.mode() {
+                SplitMode::BlacklistOnly => "BlacklistOnly",
+                SplitMode::WhitelistOnly => "WhitelistOnly",
+                SplitMode::Auto => "Auto",
+            },
+            "blacklist_domains": st.blacklist_snapshot(),
+            "blacklist_ips": st.blacklist_ips_snapshot(),
+            "blacklist_cidrs": st.blacklist_nets_snapshot(),
+            "whitelist_domains": st.whitelist_snapshot(),
+            "whitelist_ips": st.whitelist_ips_snapshot(),
+            "whitelist_cidrs": st.whitelist_nets_snapshot(),
+        })
+    }
+
+    fn split_tunnel_set_mode(&self, mode: &str) {
+        let new_mode = match mode {
+            "WhitelistOnly" => SplitMode::WhitelistOnly,
+            "Auto" => SplitMode::Auto,
+            _ => SplitMode::BlacklistOnly,
+        };
+        let mut st = self.split_tunnel.lock().unwrap();
+        st.set_mode(new_mode);
+    }
+
+    fn split_tunnel_add(&self, list: &str, entry_type: &str, value: &str) -> Result<(), String> {
+        use std::net::IpAddr;
+        use std::str::FromStr;
+
+        let mut st = self.split_tunnel.lock().unwrap();
+        match (list, entry_type) {
+            ("blacklist", "domain") => {
+                st.add_to_blacklist(value.to_string());
+                Ok(())
+            }
+            ("blacklist", "ip") => {
+                let ip = IpAddr::from_str(value).map_err(|e| format!("Invalid IP: {}", e))?;
+                st.add_ip_to_blacklist(ip);
+                Ok(())
+            }
+            ("blacklist", "cidr") => {
+                let net =
+                    ipnet::IpNet::from_str(value).map_err(|e| format!("Invalid CIDR: {}", e))?;
+                st.add_net_to_blacklist(net);
+                Ok(())
+            }
+            ("whitelist", "domain") => {
+                st.add_to_whitelist(value.to_string());
+                Ok(())
+            }
+            ("whitelist", "ip") => {
+                let ip = IpAddr::from_str(value).map_err(|e| format!("Invalid IP: {}", e))?;
+                st.add_ip_to_whitelist(ip);
+                Ok(())
+            }
+            ("whitelist", "cidr") => {
+                let net =
+                    ipnet::IpNet::from_str(value).map_err(|e| format!("Invalid CIDR: {}", e))?;
+                st.add_net_to_whitelist(net);
+                Ok(())
+            }
+            _ => Err(format!(
+                "Invalid list '{}' or entry_type '{}'. Use blacklist/whitelist and domain/ip/cidr",
+                list, entry_type
+            )),
+        }
+    }
+
+    fn split_tunnel_remove(
+        &self,
+        list: &str,
+        entry_type: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        use std::net::IpAddr;
+        use std::str::FromStr;
+
+        let mut st = self.split_tunnel.lock().unwrap();
+        match (list, entry_type) {
+            ("blacklist", "domain") => {
+                st.remove_from_blacklist(value);
+                Ok(())
+            }
+            ("blacklist", "ip") => {
+                let ip = IpAddr::from_str(value).map_err(|e| format!("Invalid IP: {}", e))?;
+                st.remove_ip_from_blacklist(&ip);
+                Ok(())
+            }
+            ("blacklist", "cidr") => {
+                let net =
+                    ipnet::IpNet::from_str(value).map_err(|e| format!("Invalid CIDR: {}", e))?;
+                st.remove_net_from_blacklist(&net);
+                Ok(())
+            }
+            ("whitelist", "domain") => {
+                st.remove_from_whitelist(value);
+                Ok(())
+            }
+            ("whitelist", "ip") => {
+                let ip = IpAddr::from_str(value).map_err(|e| format!("Invalid IP: {}", e))?;
+                st.remove_ip_from_whitelist(&ip);
+                Ok(())
+            }
+            ("whitelist", "cidr") => {
+                let net =
+                    ipnet::IpNet::from_str(value).map_err(|e| format!("Invalid CIDR: {}", e))?;
+                st.remove_net_from_whitelist(&net);
+                Ok(())
+            }
+            _ => Err(format!(
+                "Invalid list '{}' or entry_type '{}'",
+                list, entry_type
+            )),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -533,7 +659,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     };
 
     freedpi_core::engine::refresh_local_ips();
-    let engine = Arc::new(ServiceEngine::new());
+    let engine = Arc::new(ServiceEngine::new(&config));
 
     // Run in tokio runtime
     let rt = match tokio::runtime::Runtime::new() {
@@ -660,7 +786,7 @@ fn main() -> anyhow::Result<()> {
 
     let config = Config::load(&cli.config)?;
     freedpi_core::engine::refresh_local_ips();
-    let engine = Arc::new(ServiceEngine::new());
+    let engine = Arc::new(ServiceEngine::new(&config));
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_foreground(config, engine))
