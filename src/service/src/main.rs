@@ -86,6 +86,7 @@ struct ServiceEngine {
     sentinel: Arc<Sentinel>,
     running: AtomicBool,
     probe_history: std::sync::Mutex<Vec<serde_json::Value>>,
+    pub pipeline: std::sync::OnceLock<Arc<ProcessingPipeline>>,
 }
 
 impl ServiceEngine {
@@ -97,6 +98,7 @@ impl ServiceEngine {
             sentinel: Arc::new(Sentinel::create()),
             running: AtomicBool::new(true),
             probe_history: std::sync::Mutex::new(Vec::new()),
+            pipeline: std::sync::OnceLock::new(),
         }
     }
 }
@@ -143,7 +145,33 @@ impl EngineHandle for ServiceEngine {
         })
     }
     fn tune_strategy(&self, params: &TuneParams) {
-        info!("Strategy tune: id={}", params.strategy_id);
+        let core_params: freedpi_core::adaptive::auto_tune::TuneParams =
+            match serde_json::from_value(params.params.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        "Strategy tune: id={} — некорректный JSON параметров: {}",
+                        params.strategy_id, e
+                    );
+                    return;
+                }
+            };
+        match self.pipeline.get() {
+            Some(pipeline) => {
+                pipeline.apply_strategy_tune(params.strategy_id, core_params);
+                info!(
+                    "Strategy tune: id={} применён к работающему pipeline",
+                    params.strategy_id
+                );
+            }
+            None => {
+                warn!(
+                    "Strategy tune: id={} получен, но pipeline не запущен \
+                     (WinDivert не инициализирован — нет прав администратора?)",
+                    params.strategy_id
+                );
+            }
+        }
     }
     fn set_routing_override(&self, params: &RoutingOverride) {
         info!("Routing override: {} → {}", params.domain, params.region);
@@ -380,6 +408,7 @@ async fn run_service(
     // Start pipeline
     if let Some(pipeline) = pipeline {
         let pipeline = std::sync::Arc::new(pipeline);
+        let _ = engine.pipeline.set(pipeline.clone());
         let stats = pipeline.stats_arc();
         let shutdown_rx_pipeline = shutdown_rx.resubscribe();
         tokio::spawn(async move {

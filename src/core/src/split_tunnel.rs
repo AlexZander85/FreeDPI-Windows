@@ -191,7 +191,8 @@ impl SplitTunnel {
     /// WinDivert фильтр может быть длиной до 256 символов.
     /// Если blacklist слишком большой — используем базовый фильтр.
     pub fn build_win_divert_filter(&self) -> String {
-        let base = "(ip or ipv6) && (tcp.DstPort == 443 or tcp.SrcPort == 443 \
+        let base = "(ip or ipv6) && ((outbound && tcp.DstPort == 443 && tcp.PayloadLength > 5 \
+                     && tcp.Payload[0] == 0x16 && tcp.Payload[1] == 0x03 && tcp.Payload[5] == 0x01) \
                      or udp.DstPort == 53 or udp.DstPort == 443)"
             .to_string();
 

@@ -9,7 +9,7 @@
 //! ChaCha8Rng — CSPRNG, DPI не может восстановить state по выходам.
 //! Xoshiro256++ — passes BigCrush, O'Neill 2019, быстрый non-crypto PRNG.
 
-use rand_chacha::ChaCha8Rng;
+use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 
 // ============================================================================
@@ -17,8 +17,8 @@ use rand_core::{RngCore, SeedableRng};
 // ============================================================================
 
 thread_local! {
-    static THREAD_RNG: std::cell::RefCell<ChaCha8Rng> =
-        std::cell::RefCell::new(ChaCha8Rng::from_entropy());
+    static THREAD_RNG: std::cell::RefCell<ChaCha20Rng> =
+        std::cell::RefCell::new(ChaCha20Rng::from_entropy());
 }
 
 pub fn random_u64() -> u64 {
@@ -71,10 +71,10 @@ const RESEED_MASK: u64 = RESEED_INTERVAL - 1;
 
 /// Per-connection dual RNG.
 /// - `fast`: Xoshiro256++ для non-observable полей (TTL jitter, padding length).
-/// - `crypto`: ChaCha8Rng для wire-visible полей (GREASE, TLS random, session ID).
+/// - `crypto`: ChaCha20Rng для wire-visible полей (GREASE, TLS random, session ID).
 pub struct PerConnRng {
     fast: Xoshiro256ppState,
-    crypto: ChaCha8Rng,
+    crypto: ChaCha20Rng,
     counter: u64,
 }
 
@@ -98,7 +98,7 @@ impl PerConnRng {
                 splitmix64(fast_seed.wrapping_add(0xBB67AE8584CAA73B)),
                 splitmix64(fast_seed.wrapping_add(0x3C6EF372FE94F82B)),
             ]),
-            crypto: ChaCha8Rng::from_seed(seed),
+            crypto: ChaCha20Rng::from_seed(seed),
             counter: 0,
         }
     }
@@ -117,7 +117,7 @@ impl PerConnRng {
         if (self.counter & RESEED_MASK) == 0 {
             let mut new_seed = [0u8; 32];
             rand_core::OsRng.fill_bytes(&mut new_seed);
-            self.crypto = ChaCha8Rng::from_seed(new_seed);
+            self.crypto = ChaCha20Rng::from_seed(new_seed);
         }
         self.crypto.next_u64()
     }
@@ -162,6 +162,13 @@ impl PerConnRng {
         (self.next_wire_u64() >> 32) as u32
     }
 
+    /// Returns a random value in `[0, range)` using Lemire's multiplication method.
+    ///
+    /// ## Modulo Bias Note
+    /// This method performs Lemire's multiplication-high algorithm without a rejection step
+    /// to guarantee constant-time execution and maximum speed. As a result, it introduces a
+    /// tiny modulo bias on the order of `range / 2^64`. For small ranges (such as TTL offsets
+    /// or packet padding lengths), this bias is mathematically negligible and wire-invisible.
     pub fn next_unbiased(&mut self, range: u64) -> u64 {
         if range == 0 {
             return 0;
@@ -183,11 +190,12 @@ impl PerConnRng {
     }
 
     pub fn generate_grease_set(&mut self) -> (u16, u16, u16, u16) {
+        let r = self.next_wire_u64();
         (
-            self.pick_grease(),
-            self.pick_grease(),
-            self.pick_grease(),
-            self.pick_grease(),
+            GREASE_VALUES[(r & 0xF) as usize],
+            GREASE_VALUES[((r >> 4) & 0xF) as usize],
+            GREASE_VALUES[((r >> 8) & 0xF) as usize],
+            GREASE_VALUES[((r >> 12) & 0xF) as usize],
         )
     }
 
@@ -206,7 +214,7 @@ impl PerConnRng {
                 splitmix64(fast_seed.wrapping_add(0xBB67AE8584CAA73B)),
                 splitmix64(fast_seed.wrapping_add(0x3C6EF372FE94F82B)),
             ]),
-            crypto: ChaCha8Rng::from_seed(seed),
+            crypto: ChaCha20Rng::from_seed(seed),
             counter: 0,
         }
     }
@@ -264,7 +272,7 @@ mod tests {
     fn test_random_range() {
         for _ in 0..1000 {
             let val = random_range(5, 10);
-            assert!(val >= 5 && val <= 10);
+            assert!((5..=10).contains(&val));
         }
     }
 

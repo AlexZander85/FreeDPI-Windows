@@ -35,4 +35,5 @@ pub mod persist;
 pub mod probe_tune_run;
 pub mod seq_spoof;
 pub mod strategy;
+pub mod strategy_profile;
 pub mod target_escalate;

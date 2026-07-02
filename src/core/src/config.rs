@@ -101,8 +101,12 @@ pub struct WindivertConfig {
 }
 
 fn default_filter() -> String {
-    "(ip or ipv6) && (tcp.DstPort == 443 or tcp.SrcPort == 443 \
-     or udp.DstPort == 53 or udp.DstPort == 443)"
+    "(ip or ipv6) && ( \
+        (outbound && tcp.DstPort == 443 && tcp.PayloadLength > 5 \
+            && tcp.Payload[0] == 0x16 && tcp.Payload[1] == 0x03 && tcp.Payload[5] == 0x01) \
+        or udp.DstPort == 53 \
+        or udp.DstPort == 443 \
+    )"
         .to_string()
 }
 fn default_queue_len() -> u32 {

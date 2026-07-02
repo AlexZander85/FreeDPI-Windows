@@ -12,6 +12,8 @@
 
 use crate::adaptive::auto_tune::{AutoTune, TuneParams};
 use crate::adaptive::hop_tab::HopTab;
+use crate::adaptive::strategy::StrategyCategory;
+use crate::adaptive::strategy_profile::{StrategyProfile, StrategyProfileRegistry};
 use crate::classifier::{Classification, ClassifiedPacket, Classifier};
 use crate::conntrack::Conntrack;
 use crate::desync::group::DesyncGroup;
@@ -19,6 +21,7 @@ use crate::desync::{DesyncConfig, DesyncTechnique};
 use crate::dns::fakeip::FakeIpManager;
 use crate::packet_engine::{PacketBufferPool, PacketEngine, PaddedCounter};
 use crate::routing::geo::GeoRouter;
+use arc_swap::ArcSwap;
 use pnet_packet::ipv4::Ipv4Packet;
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
@@ -133,7 +136,10 @@ pub struct ProcessingPipeline {
     geo_router: Arc<GeoRouter>,
     hop_tab: Arc<HopTab>,
     conntrack: Arc<Conntrack>,
-    desync_group: Arc<DesyncGroup>,
+    profile_registry: Arc<StrategyProfileRegistry>,
+    active_profile_tls: ArcSwap<String>,
+    active_profile_quic: ArcSwap<String>,
+    active_profile_http: ArcSwap<String>,
     config: ProcessingConfig,
     stats: Arc<ProcessingStats>,
     injected_seqs: moka::sync::Cache<SeqKey, ()>,
@@ -230,7 +236,31 @@ impl ProcessingPipeline {
     ) -> Result<Self, anyhow::Error> {
         let packet_engine = Arc::new(PacketEngine::new(filter)?);
         let conntrack = Arc::new(Conntrack::new(Duration::from_secs(120)));
-        let desync_group = Arc::new(Self::build_desync_group(&config));
+        let profile_registry = Arc::new(StrategyProfileRegistry::with_defaults(
+            &config.desync,
+            &config.techniques,
+        ));
+        let active_profile_tls = ArcSwap::from_pointee(
+            profile_registry
+                .get_default_for_category(StrategyCategory::Tls)
+                .expect("outbound_tls must be registered")
+                .name
+                .clone(),
+        );
+        let active_profile_quic = ArcSwap::from_pointee(
+            profile_registry
+                .get_default_for_category(StrategyCategory::Quic)
+                .expect("outbound_quic must be registered")
+                .name
+                .clone(),
+        );
+        let active_profile_http = ArcSwap::from_pointee(
+            profile_registry
+                .get_default_for_category(StrategyCategory::Http)
+                .expect("outbound_http must be registered")
+                .name
+                .clone(),
+        );
 
         // Buffer pool: capacity = workers * 4 (глубина на worker)
         // Каждый буфер 2048 байт → pool = 4 * 4 * 2048 = ~32 KB
@@ -242,7 +272,10 @@ impl ProcessingPipeline {
             geo_router,
             hop_tab,
             conntrack,
-            desync_group,
+            profile_registry,
+            active_profile_tls,
+            active_profile_quic,
+            active_profile_http,
             config,
             stats: Arc::new(ProcessingStats::new()),
             injected_seqs: moka::sync::Cache::builder()
@@ -257,7 +290,31 @@ impl ProcessingPipeline {
 
     pub fn new_api_only(config: ProcessingConfig) -> Self {
         let packet_engine = Arc::new(PacketEngine::new_api_only());
-        let desync_group = Arc::new(Self::build_desync_group(&config));
+        let profile_registry = Arc::new(StrategyProfileRegistry::with_defaults(
+            &config.desync,
+            &config.techniques,
+        ));
+        let active_profile_tls = ArcSwap::from_pointee(
+            profile_registry
+                .get_default_for_category(StrategyCategory::Tls)
+                .expect("outbound_tls must be registered")
+                .name
+                .clone(),
+        );
+        let active_profile_quic = ArcSwap::from_pointee(
+            profile_registry
+                .get_default_for_category(StrategyCategory::Quic)
+                .expect("outbound_quic must be registered")
+                .name
+                .clone(),
+        );
+        let active_profile_http = ArcSwap::from_pointee(
+            profile_registry
+                .get_default_for_category(StrategyCategory::Http)
+                .expect("outbound_http must be registered")
+                .name
+                .clone(),
+        );
 
         let buf_pool = Arc::new(PacketBufferPool::new(64));
 
@@ -267,7 +324,10 @@ impl ProcessingPipeline {
             geo_router: Arc::new(GeoRouter::new_default()),
             hop_tab: Arc::new(HopTab::new()),
             conntrack: Arc::new(Conntrack::new(Duration::from_secs(120))),
-            desync_group,
+            profile_registry,
+            active_profile_tls,
+            active_profile_quic,
+            active_profile_http,
             config,
             stats: Arc::new(ProcessingStats::new()),
             injected_seqs: moka::sync::Cache::builder()
@@ -279,104 +339,102 @@ impl ProcessingPipeline {
             has_non_empty_session_ticket: false,
         }
     }
+    pub fn profile_registry(&self) -> &Arc<StrategyProfileRegistry> {
+        &self.profile_registry
+    }
 
-    fn build_desync_group(config: &ProcessingConfig) -> DesyncGroup {
-        let mut group = DesyncGroup::new(config.desync.clone());
-        if config.techniques.is_empty() {
-            group.add(DesyncTechnique::FakeSni);
-            group.add(DesyncTechnique::BadChecksum);
-        } else {
-            for t in &config.techniques {
-                group.add(*t);
+    fn resolve_active_profile(&self, category: StrategyCategory) -> &StrategyProfile {
+        let active_name = match category {
+            StrategyCategory::Tls => self.active_profile_tls.load(),
+            StrategyCategory::Quic => self.active_profile_quic.load(),
+            StrategyCategory::Http => self.active_profile_http.load(),
+            other => unreachable!(
+                "resolve_active_profile вызван для категории {:?} без hot-path переключения",
+                other
+            ),
+        };
+        self.profile_registry.get(active_name.as_str()).unwrap_or_else(|| {
+            self.profile_registry
+                .get("outbound_tls")
+                .expect("outbound_tls всегда зарегистрирован")
+        })
+    }
+
+    pub fn apply_strategy_tune(&self, strategy_id: u32, params: TuneParams) {
+        let Some(profile) = self.profile_registry.get_by_id(strategy_id) else {
+            warn!("apply_strategy_tune: неизвестный strategy_id={}", strategy_id);
+            return;
+        };
+        match profile.category {
+            StrategyCategory::Tls => self.active_profile_tls.store(Arc::new(profile.name.clone())),
+            StrategyCategory::Quic => self.active_profile_quic.store(Arc::new(profile.name.clone())),
+            StrategyCategory::Http => self.active_profile_http.store(Arc::new(profile.name.clone())),
+            _ => {
+                tracing::info!(
+                    "apply_strategy_tune: id={} (профиль='{}', категория={:?}) — только числовой override",
+                    strategy_id, profile.name, profile.category
+                );
             }
         }
-        // Валидация при построении — падаем рано с понятной ошибкой
-        if let Err(e) = group.validate() {
-            tracing::error!("DesyncGroup validation failed: {}", e);
-            // Fallback на safe default: только FakeSni + BadChecksum
-            let mut safe_group = DesyncGroup::new(config.desync.clone());
-            safe_group.add(DesyncTechnique::FakeSni);
-            safe_group.add(DesyncTechnique::BadChecksum);
-            return safe_group;
+        self.auto_tune.lock().unwrap().set_override(&profile.name, params);
+        tracing::info!(
+            "apply_strategy_tune: id={} → активный профиль для {:?} = '{}'",
+            strategy_id, profile.category, profile.name
+        );
+    }
+
+    pub fn clear_strategy_tune(&self, strategy_id: u32) {
+        let Some(profile) = self.profile_registry.get_by_id(strategy_id) else {
+            warn!("clear_strategy_tune: неизвестный strategy_id={}", strategy_id);
+            return;
+        };
+        if let Some(default_profile) = self.profile_registry.get_default_for_category(profile.category) {
+            match profile.category {
+                StrategyCategory::Tls => {
+                    self.active_profile_tls.store(Arc::new(default_profile.name.clone()))
+                }
+                StrategyCategory::Quic => {
+                    self.active_profile_quic.store(Arc::new(default_profile.name.clone()))
+                }
+                StrategyCategory::Http => {
+                    self.active_profile_http.store(Arc::new(default_profile.name.clone()))
+                }
+                _ => {}
+            }
         }
-        group
+        self.auto_tune.lock().unwrap().clear_override(&profile.name);
+        tracing::info!("clear_strategy_tune: id={} — сброшен к default профилю категории", strategy_id);
     }
 
     pub async fn run(self: Arc<Self>, shutdown: tokio::sync::broadcast::Receiver<()>) {
         debug!("ProcessingPipeline started");
 
         let n_workers = num_cpus::get().max(2);
-        const QUEUE_SIZE: usize = 1024;
-
-        // Per-worker lock-free queues for rendezvous-free handoff
-        let queues: Vec<Arc<crossbeam::queue::ArrayQueue<CapturedPacket>>> = (0..n_workers)
-            .map(|_| Arc::new(crossbeam::queue::ArrayQueue::new(QUEUE_SIZE)))
-            .collect();
-
         let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut worker_handles = Vec::with_capacity(n_workers);
 
-        // ── Producer: reads from WinDivert, distributes by packet hash ──
-        {
+        for _ in 0..n_workers {
             let engine = self.packet_engine.clone();
             let stats = self.stats.clone();
-            let queues = queues.clone();
+            let self_clone = self.clone();
+            let pool = self.buf_pool.clone();
             let shutdown_flag = shutdown_flag.clone();
             let mut shutdown_rx = shutdown.resubscribe();
 
-            let pool = self.buf_pool.clone();
-            tokio::task::spawn_blocking(move || {
+            let handle = std::thread::spawn(move || {
                 loop {
-                    if shutdown_rx.try_recv().is_ok() {
-                        debug!("WinDivert recv: shutdown signal received");
+                    if shutdown_rx.try_recv().is_ok() || shutdown_flag.load(Ordering::Acquire) {
                         shutdown_flag.store(true, Ordering::Release);
                         break;
                     }
                     match engine.recv_blocking(&pool) {
                         Ok((data, addr)) => {
                             stats.total_received.fetch_add(1, Ordering::Relaxed);
-                            let pkt = CapturedPacket { data, addr };
+                            let captured = CapturedPacket { data, addr };
 
-                            // Route by 4-tuple hash — все пакеты одного TCP-соединения → один воркер
-                            let idx = route_to_worker(&pkt.data, n_workers);
-
-                            // Non-blocking push with spin-retry
-                            while queues[idx].push(pkt.clone()).is_err() {
-                                std::hint::spin_loop();
-                            }
-                        }
-                        Err(e) => {
-                            // На ошибку recv не делаем break — WinDivert handle мог
-                            // смениться через update_filter. Producer переживёт смену.
-                            // Если ошибка повторяется — retry с экспоненциальной задержкой.
-                            error!("WinDivert recv error: {}", e);
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                    }
-                }
-            });
-        }
-
-        // ── Workers: N std::threads calling sync methods directly ──
-        // All pipeline fields are behind Arc — clone per worker.
-        let mut worker_handles = Vec::with_capacity(n_workers);
-        for queue in queues.into_iter() {
-            let shutdown_flag = shutdown_flag.clone();
-            let self_clone = self.clone();
-
-            let handle = std::thread::spawn(move || {
-                let mut empty_spins: u32 = 0;
-
-                loop {
-                    if shutdown_flag.load(Ordering::Acquire) {
-                        break;
-                    }
-
-                    match queue.pop() {
-                        Some(captured) => {
-                            empty_spins = 0;
                             match self_clone.process_one_sync(&captured) {
                                 Ok(decision) => {
-                                    self_clone.execute_decision_sync(decision, &captured)
+                                    self_clone.execute_decision_sync(decision, &captured);
                                 }
                                 Err(e) => {
                                     debug!("Packet processing error (forwarding fallback): {}", e);
@@ -384,19 +442,13 @@ impl ProcessingPipeline {
                                     self_clone.forward_packet_sync(&captured);
                                 }
                             }
-                            // Возвращаем буфер захваченного пакета в пул.
-                            // Все send/inject уже сделали release на своих клонах;
-                            // captured.data — последний владелец исходного буфера.
+                            // Release the buffer back to pool
                             self_clone.buf_pool.release_bytes(captured.data);
                         }
-                        None => {
-                            empty_spins += 1;
-                            if empty_spins < 100 {
-                                std::hint::spin_loop();
-                            } else {
-                                std::thread::sleep(Duration::from_micros(100));
-                                empty_spins = 0;
-                            }
+                        Err(e) => {
+                            // On read error, log and wait briefly
+                            error!("WinDivert recv error: {}", e);
+                            std::thread::sleep(Duration::from_millis(10));
                         }
                     }
                 }
@@ -422,6 +474,7 @@ impl ProcessingPipeline {
     /// `None` означает "неизвестно" — техники обрабатывают как false.
     fn apply_desync_sync(
         &self,
+        group: &DesyncGroup,
         packet: bytes::Bytes,
         dscp_value: Option<u8>,
         tune_params: Option<TuneParams>,
@@ -430,7 +483,9 @@ impl ProcessingPipeline {
     ) -> crate::desync::DesyncResult {
         let override_params: Option<crate::desync::group::ConfigOverride> =
             tune_params.map(Into::into);
-        self.desync_group.apply_with_rng(
+        let mut group_clone = group.clone();
+        group_clone.set_context(self.hop_tab.clone(), self.conntrack.clone());
+        group_clone.apply_with_rng(
             &packet,
             dscp_value,
             override_params,
@@ -486,7 +541,7 @@ impl ProcessingPipeline {
                 if self.config.only_outbound && !is_outbound_cached(cp.src_ip) {
                     return Ok(PacketDecision::Forward);
                 }
-                // Quick pre-filter
+                // Quick pre-filter: check and set desync_applied atomically using conntrack write lock
                 let conn_key = crate::conntrack::ConnKey::new(
                     cp.src_ip,
                     cp.dst_ip,
@@ -494,14 +549,21 @@ impl ProcessingPipeline {
                     cp.dst_port,
                     cp.protocol,
                 );
-                let desync_applied = self
-                    .conntrack
-                    .get(&conn_key)
-                    .map(|e| e.desync_applied)
-                    .unwrap_or(false);
-                if !Classifier::is_desync_target(&captured.data, desync_applied) {
+
+                let mut should_desync = false;
+                if Classifier::is_client_hello(&captured.data[cp.payload_offset..]) && captured.data.len() - cp.payload_offset >= 50 {
+                    should_desync = self.conntrack.check_and_apply_desync(conn_key, || {
+                        ip_to_u64(cp.src_ip)
+                            ^ (ip_to_u64(cp.dst_ip) << 32)
+                            ^ ((cp.src_port as u64) << 48)
+                            ^ (cp.dst_port as u64)
+                    });
+                }
+
+                if !should_desync {
                     return Ok(PacketDecision::Forward);
                 }
+
                 self.process_outbound_tls_sync(captured, &cp)
             }
             Classification::Quic(cp) => {
@@ -515,7 +577,7 @@ impl ProcessingPipeline {
                 if self.config.only_outbound && !is_outbound_cached(cp.src_ip) {
                     return Ok(PacketDecision::Forward);
                 }
-                self.process_http_sync(captured)
+                self.process_http_sync(captured, &cp)
             }
             _ => Ok(PacketDecision::Forward),
         }
@@ -622,6 +684,10 @@ impl ProcessingPipeline {
             entry.is_resumption = is_resumption;
         }
 
+        // T55: резолвим активный профиль для TLS — то, что реально может переключить
+        // tune_strategy (не только числа поверх фиксированного FakeSni+BadChecksum).
+        let profile = self.resolve_active_profile(StrategyCategory::Tls);
+
         // 5. DesyncGroup — sync directly; fork RNG from conntrack if available
         let packet = captured.data.clone();
         let (dscp_value, conn_rng_fork) = if let Some(mut entry) = self.conntrack.get_mut(&conn_key)
@@ -632,24 +698,30 @@ impl ProcessingPipeline {
             (None, None)
         };
         let tune_start = Instant::now();
+        let auto_tune_override = self.auto_tune.lock().unwrap().recommend(&profile.name);
+        let mut tune_params = profile.merged_params(&auto_tune_override);
+        if self.config.hop_tab_enabled && tune_params.fake_ttl_offset.is_none() {
+            tune_params.fake_ttl_offset = self.hop_tab.fake_ttl_for_ip(&cp.dst_ip);
+        }
         let result = self.apply_desync_sync(
+            &profile.desync_group,
             packet,
             dscp_value,
-            Some(self.get_tuned_config("outbound_tls")),
+            Some(tune_params),
             Some(is_resumption),
             conn_rng_fork,
         );
 
-        // 5.0. AutoTune
+        // 5.0. AutoTune — записываем под именем АКТИВНОГО профиля, не хардкод "outbound_tls"
         {
             let latency_us = tune_start.elapsed().as_micros() as u64;
             let success = !result.inject.is_empty() || result.modified.is_some();
             let mut tune = self.auto_tune.lock().unwrap();
-            tune.record("outbound_tls", success, latency_us);
-            if tune.should_escalate("outbound_tls") {
+            tune.record(&profile.name, success, latency_us);
+            if tune.should_escalate(&profile.name) {
                 warn!(
-                    "AutoTune: outbound_tls strategy degrading (latency={}us)",
-                    latency_us
+                    "AutoTune: '{}' strategy degrading (latency={}us)",
+                    profile.name, latency_us
                 );
             }
         }
@@ -670,6 +742,7 @@ impl ProcessingPipeline {
                 }
             }
         }
+
 
         if result.inject.is_empty() && result.modified.is_none() && !result.drop {
             return Ok(PacketDecision::Forward);
@@ -749,8 +822,34 @@ impl ProcessingPipeline {
             }
         }
 
+        // T55: резолвим активный профиль для QUIC.
+        let profile = self.resolve_active_profile(StrategyCategory::Quic);
+
         // T43: QUIC не использует is_resumption — передаём None
-        let result = self.apply_desync_sync(packet, None, None, None, None);
+        let tune_start = Instant::now();
+        let auto_tune_override = self.auto_tune.lock().unwrap().recommend(&profile.name);
+        let mut tune_params = profile.merged_params(&auto_tune_override);
+        if self.config.hop_tab_enabled && tune_params.fake_ttl_offset.is_none() {
+            tune_params.fake_ttl_offset = self.hop_tab.fake_ttl_for_ip(&cp.dst_ip);
+        }
+        let result = self.apply_desync_sync(
+            &profile.desync_group,
+            packet,
+            None,
+            Some(tune_params),
+            None,
+            None,
+        );
+
+        {
+            let latency_us = tune_start.elapsed().as_micros() as u64;
+            let success = !result.inject.is_empty() || result.modified.is_some();
+            let mut tune = self.auto_tune.lock().unwrap();
+            tune.record(&profile.name, success, latency_us);
+            if tune.should_escalate(&profile.name) {
+                warn!("AutoTune: '{}' strategy degrading (latency={}us)", profile.name, latency_us);
+            }
+        }
         if result.inject.is_empty() && result.modified.is_none() && !result.drop {
             return Ok(PacketDecision::Forward);
         }
@@ -780,10 +879,37 @@ impl ProcessingPipeline {
     fn process_http_sync(
         &self,
         captured: &CapturedPacket,
+        cp: &crate::classifier::ClassifiedPacket,
     ) -> Result<PacketDecision, anyhow::Error> {
         let packet = captured.data.clone();
+        // T55: резолвим активный профиль для HTTP.
+        let profile = self.resolve_active_profile(StrategyCategory::Http);
+
         // T43: HTTP не использует is_resumption — передаём None
-        let result = self.apply_desync_sync(packet, None, None, None, None);
+        let tune_start = Instant::now();
+        let auto_tune_override = self.auto_tune.lock().unwrap().recommend(&profile.name);
+        let mut tune_params = profile.merged_params(&auto_tune_override);
+        if self.config.hop_tab_enabled && tune_params.fake_ttl_offset.is_none() {
+            tune_params.fake_ttl_offset = self.hop_tab.fake_ttl_for_ip(&cp.dst_ip);
+        }
+        let result = self.apply_desync_sync(
+            &profile.desync_group,
+            packet,
+            None,
+            Some(tune_params),
+            None,
+            None,
+        );
+
+        {
+            let latency_us = tune_start.elapsed().as_micros() as u64;
+            let success = !result.inject.is_empty() || result.modified.is_some();
+            let mut tune = self.auto_tune.lock().unwrap();
+            tune.record(&profile.name, success, latency_us);
+            if tune.should_escalate(&profile.name) {
+                warn!("AutoTune: '{}' strategy degrading (latency={}us)", profile.name, latency_us);
+            }
+        }
         if result.inject.is_empty() && result.modified.is_none() && !result.drop {
             return Ok(PacketDecision::Forward);
         }
@@ -899,32 +1025,6 @@ struct CapturedPacket {
     addr: WinDivertAddress<NetworkLayer>,
 }
 
-/// Route packet to a worker by hashing the TCP 4-tuple (src_ip, dst_ip, src_port, dst_port).
-/// Все пакеты одного соединения → один воркер (in-order desync).
-fn route_to_worker(packet: &[u8], n_workers: usize) -> usize {
-    if let Some(ip) = crate::desync::parse_ip_header(packet) {
-        if ip.protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp {
-            let tcp_data = &packet[ip.header_len()..];
-            if let Some(tcp) = pnet_packet::tcp::TcpPacket::new(tcp_data) {
-                let mut h = 0u64;
-                h = h
-                    .wrapping_mul(0x9E3779B97F4A7C15)
-                    .wrapping_add(ip_to_u64(ip.src()));
-                h = h
-                    .wrapping_mul(0x9E3779B97F4A7C15)
-                    .wrapping_add(ip_to_u64(ip.dst()));
-                h = h
-                    .wrapping_mul(0x9E3779B97F4A7C15)
-                    .wrapping_add(tcp.get_source() as u64);
-                h = h
-                    .wrapping_mul(0x9E3779B97F4A7C15)
-                    .wrapping_add(tcp.get_destination() as u64);
-                return (h as usize) % n_workers;
-            }
-        }
-    }
-    0
-}
 
 /// Cached list of local IP addresses, populated once at startup.
 static LOCAL_IPS: OnceLock<Arc<Vec<IpAddr>>> = OnceLock::new();
@@ -1106,5 +1206,86 @@ mod tests {
         // В нормальном CH session_ticket extension есть (ext type 0x0023),
         // но он пустой (data length = 0)
         assert!(!has_non_empty_session_ticket(&ch));
+    }
+}
+
+impl CapturedPacket {
+    #[cfg(test)]
+    fn for_test(data: Vec<u8>) -> Self {
+        Self {
+            data: bytes::Bytes::from(data),
+            addr: unsafe { std::mem::zeroed() },
+        }
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    fn build_synthetic_client_hello() -> Vec<u8> {
+        let mut pkt = Vec::new();
+        // IPv4 Header (20 bytes)
+        pkt.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x00, // Version, IHL, Total Length
+            0x00, 0x00, 0x00, 0x00, // Id, Flags, Frag Offset
+            0x40, 0x06, 0x00, 0x00, // TTL(64), Protocol(6), Checksum
+            127, 0, 0, 1,           // Src IP (127.0.0.1)
+            127, 0, 0, 1,           // Dst IP (127.0.0.1)
+        ]);
+        // TCP Header (20 bytes)
+        pkt.extend_from_slice(&[
+            0x30, 0x39,             // Src Port (12345)
+            0x01, 0xBB,             // Dst Port (443)
+            0x00, 0x00, 0x00, 0x01, // Seq
+            0x00, 0x00, 0x00, 0x00, // Ack
+            0x50, 0x18, 0xFF, 0xFF, // Data offset (5 * 4 = 20), Flags (PSH | ACK)
+            0x00, 0x00, 0x00, 0x00, // Checksum, Urgent
+        ]);
+        // TLS ClientHello (min 6 bytes for classification)
+        pkt.extend_from_slice(&[
+            0x16, 0x03, 0x01,       // Record layer: Handshake, TLS 1.0
+            0x00, 0x36,             // Record length
+            0x01,                   // ClientHello
+        ]);
+        // Rest of the ClientHello payload
+        pkt.extend_from_slice(&[0; 50]);
+
+        // Fix IPv4 total length: 20 + 20 + 5 + 51 = 96
+        let total_len = pkt.len() as u16;
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+
+        pkt
+    }
+
+    /// Два потока конкурентно видят один и тот же ClientHello (одинаковый conn_key
+    /// и одинаковый TLS record) — is_desync_target должен вернуть false во втором
+    /// проходе независимо от того, какой поток обработал пакет первым.
+    #[test]
+    fn concurrent_desync_gate_applies_once() {
+        let pipeline = Arc::new(ProcessingPipeline::new_api_only(ProcessingConfig::default()));
+        let packet = build_synthetic_client_hello();
+
+        let p1 = pipeline.clone();
+        let p2 = pipeline.clone();
+        let pkt1 = packet.clone();
+        let pkt2 = packet.clone();
+
+        let t1 = thread::spawn(move || p1.process_one_sync(&CapturedPacket::for_test(pkt1)));
+        let t2 = thread::spawn(move || p2.process_one_sync(&CapturedPacket::for_test(pkt2)));
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        // Ровно один из двух результатов — реальный десинк (Inject/Modify),
+        // второй — Forward (гейт desync_applied сработал).
+        let decisions: Vec<_> = [r1, r2].into_iter().filter_map(Result::ok).collect();
+        let desync_count = decisions
+            .iter()
+            .filter(|d| !matches!(d, PacketDecision::Forward))
+            .count();
+        assert_eq!(desync_count, 1, "десинк должен примениться ровно один раз из двух конкурентных проходов");
     }
 }

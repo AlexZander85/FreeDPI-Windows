@@ -123,6 +123,51 @@ impl Conntrack {
         }
     }
 
+    /// Проверяет и устанавливает флаг desync_applied атомарно.
+    /// Возвращает true, если флаг был успешно установлен с false на true (или создана новая запись с true).
+    /// Возвращает false, если флаг уже был true.
+    pub fn check_and_apply_desync(&self, key: ConnKey, conn_id_generator: impl FnOnce() -> u64) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.inner.map.entry(key) {
+            Entry::Occupied(mut e) => {
+                let entry = e.get_mut();
+                if entry.desync_applied {
+                    false
+                } else {
+                    entry.desync_applied = true;
+                    entry.last_activity = Instant::now();
+                    true
+                }
+            }
+            Entry::Vacant(e) => {
+                let conn_id = conn_id_generator();
+                let entry = ConntrackEntry {
+                    client_isn: 0,
+                    server_isn: 0,
+                    client_seq: 0,
+                    server_seq: 0,
+                    client_ack: 0,
+                    server_ack: 0,
+                    rtt_us: 0,
+                    state: ConnState::SynSent,
+                    desync_applied: true,
+                    dscp_spoof: crate::desync::rand::random_range(0, 48) as u8,
+                    strategy_id: 0,
+                    last_activity: Instant::now(),
+                    dup_ack_count: 0,
+                    rng: Some(crate::desync::rand::PerConnRng::new(conn_id)),
+                    quic_pn: 0,
+                    quic_dcid: vec![],
+                    is_resumption: false,
+                };
+                e.insert(entry);
+                self.inner.total_created.fetch_add(1, Ordering::Relaxed);
+                self.inner.active_count.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+        }
+    }
+
     pub fn get(
         &self,
         key: &ConnKey,
@@ -256,7 +301,7 @@ impl Default for Conntrack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::Ipv4Addr;
     use std::time::Instant;
 
     fn test_key() -> ConnKey {

@@ -188,6 +188,7 @@ pub enum DesyncTechnique {
     PortShuffle,
     Wclamp,
     TsMd5,
+    SeqSpoof,
     // === IP ===
     FragOverlap,
     BadChecksum,
@@ -265,6 +266,7 @@ impl DesyncTechnique {
             Self::PortShuffle => "PortShuffle",
             Self::Wclamp => "Wclamp",
             Self::TsMd5 => "TsMd5",
+            Self::SeqSpoof => "SeqSpoof",
             Self::FragOverlap => "FragOverlap",
             Self::BadChecksum => "BadChecksum",
             Self::TtlManipulation => "TtlManipulation",
@@ -336,6 +338,7 @@ impl DesyncTechnique {
             Self::PortShuffle => "CandyTunnel",
             Self::Wclamp => "RIPDPI",
             Self::TsMd5 => "RIPDPI",
+            Self::SeqSpoof => "sni-spoofing-rust",
             Self::FragOverlap => "dpibreak",
             Self::BadChecksum => "zapret",
             Self::TtlManipulation => "zapret",
@@ -404,7 +407,8 @@ impl DesyncTechnique {
             | Self::UnidirFrag
             | Self::PortShuffle
             | Self::Wclamp
-            | Self::TsMd5 => TechniqueCategory::Tcp,
+            | Self::TsMd5
+            | Self::SeqSpoof => TechniqueCategory::Tcp,
             #[allow(deprecated)]
             Self::TcpPreopen => TechniqueCategory::Tcp,
             Self::FragOverlap
@@ -523,6 +527,7 @@ impl DesyncTechnique {
             | Self::QuicRetryInject
             | Self::QuicConnectionClose
             | Self::QuicStreamReset
+            | Self::SeqSpoof
             | Self::Udp2Icmp => TechniqueEffect::InvalidatesSeq,
             #[allow(deprecated)]
             Self::TcpPreopen => TechniqueEffect::InvalidatesSeq,

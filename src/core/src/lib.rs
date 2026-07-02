@@ -3,6 +3,16 @@
 //! Core library providing the packet engine, connection tracking,
 //! split tunneling, and runtime infrastructure for DPI bypass on Windows.
 
+#![allow(
+    unused_imports,
+    unused_variables,
+    clippy::too_many_arguments,
+    clippy::manual_range_contains,
+    clippy::len_zero,
+    clippy::items_after_test_module,
+    clippy::useless_vec
+)]
+
 pub mod adaptive;
 pub mod classifier;
 pub mod config;

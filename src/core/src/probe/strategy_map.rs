@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 pub struct StrategyRecommendation {
     pub strategy_id: u32,
     pub strategy_name: String,
+    /// T55: имя профиля в StrategyProfileRegistry
+    pub profile_name: String,
     pub category: StrategyCategory,
     pub confidence: f64,
     pub rationale: String,
@@ -34,6 +36,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
             recs.push(StrategyRecommendation {
                 strategy_id: 100,
                 strategy_name: "doh_dns".into(),
+                profile_name: "dns_doh".into(),
                 category: StrategyCategory::Dns,
                 confidence: 0.95,
                 rationale: "DNS poisoned — force DoH resolver".into(),
@@ -43,6 +46,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
             recs.push(StrategyRecommendation {
                 strategy_id: 100,
                 strategy_name: "doh_dns".into(),
+                profile_name: "dns_doh".into(),
                 category: StrategyCategory::Dns,
                 confidence: 0.90,
                 rationale: "DNS intercepted — UDP blocked, use DoH".into(),
@@ -57,6 +61,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
             recs.push(StrategyRecommendation {
                 strategy_id: 1,
                 strategy_name: "tcp_split".into(),
+                profile_name: "outbound_tls".into(),
                 category: StrategyCategory::Tcp,
                 confidence: 0.85,
                 rationale: "TCP RST — DPI inspecting SYN/CH, apply split".into(),
@@ -66,6 +71,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
             recs.push(StrategyRecommendation {
                 strategy_id: 3,
                 strategy_name: "fake_sni".into(),
+                profile_name: "outbound_tls".into(),
                 category: StrategyCategory::Tls,
                 confidence: 0.80,
                 rationale: "TCP timeout — SYN drop, use fake SNI with low TTL".into(),
@@ -75,6 +81,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
             recs.push(StrategyRecommendation {
                 strategy_id: 9,
                 strategy_name: "mss_clamp".into(),
+                profile_name: "tcp_mss_clamp".into(),
                 category: StrategyCategory::Tcp,
                 confidence: 0.85,
                 rationale: "Data-volume cut — DPI counting packets, use MSS clamp + reorder".into(),
@@ -90,6 +97,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 15,
                     strategy_name: "tls_record_frag".into(),
+                    profile_name: "outbound_tls_tlsfrag".into(),
                     category: StrategyCategory::Tls,
                     confidence: 0.90,
                     rationale: "TLS 1.3 blocked, 1.2 works — force TLS 1.2 + record frag".into(),
@@ -99,16 +107,17 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 6,
                     strategy_name: "seq_number_spoof".into(),
+                    profile_name: "outbound_tls_seqspoof".into(),
                     category: StrategyCategory::Tcp,
                     confidence: 0.85,
-                    rationale: "TLS garbage injection — DPI injecting fake records, use SEQ spoof"
-                        .into(),
+                    rationale: "TLS garbage injection — DPI injecting fake records, use SEQ spoof".into(),
                 });
             }
             TlsFailureCode::Reset => {
                 recs.push(StrategyRecommendation {
                     strategy_id: 7,
                     strategy_name: "disorder".into(),
+                    profile_name: "outbound_tls_disorder".into(),
                     category: StrategyCategory::Tcp,
                     confidence: 0.80,
                     rationale: "TLS RST — DPI killing handshake, use disorder".into(),
@@ -118,6 +127,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 4,
                     strategy_name: "hostfake".into(),
+                    profile_name: "outbound_tls_hostfake".into(),
                     category: StrategyCategory::Tcp,
                     confidence: 0.85,
                     rationale: "SNI blocked — use hostfake with allowed SNI".into(),
@@ -127,6 +137,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 35,
                     strategy_name: "socks5_fallback".into(),
+                    profile_name: "socks5_fallback".into(),
                     category: StrategyCategory::General,
                     confidence: 0.90,
                     rationale: "Certificate substitution — MITM detected, use proxy".into(),
@@ -143,6 +154,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 8,
                     strategy_name: "tcp_window_clamp".into(),
+                    profile_name: "tcp_window_clamp".into(),
                     category: StrategyCategory::Tcp,
                     confidence: 0.80,
                     rationale: "HTTP cutoff — DPI counting packets, use window clamp".into(),
@@ -152,6 +164,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 35,
                     strategy_name: "socks5_fallback".into(),
+                    profile_name: "socks5_fallback".into(),
                     category: StrategyCategory::General,
                     confidence: 0.95,
                     rationale: "HTTP 451 — legal block, proxy required".into(),
@@ -161,6 +174,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 35,
                     strategy_name: "socks5_fallback".into(),
+                    profile_name: "socks5_fallback".into(),
                     category: StrategyCategory::General,
                     confidence: 0.85,
                     rationale: "ISP block page — redirect to foreign domain, use proxy".into(),
@@ -170,6 +184,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 35,
                     strategy_name: "socks5_fallback".into(),
+                    profile_name: "socks5_fallback".into(),
                     category: StrategyCategory::General,
                     confidence: 0.90,
                     rationale: "RKN stub page detected — use proxy".into(),
@@ -187,6 +202,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 50,
                     strategy_name: "ja4_spoof".into(),
+                    profile_name: "outbound_tls".into(),
                     category: StrategyCategory::Tls,
                     confidence: 0.90,
                     rationale: format!("Fingerprint blocking detected — spoof JA4 of {}", working,),
@@ -196,6 +212,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 4,
                     strategy_name: "hostfake".into(),
+                    profile_name: "outbound_tls_hostfake".into(),
                     category: StrategyCategory::Tcp,
                     confidence: 0.85,
                     rationale:
@@ -214,6 +231,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 60,
                     strategy_name: "force_tcp_http2".into(),
+                    profile_name: "socks5_fallback".into(),
                     category: StrategyCategory::General,
                     confidence: 0.85,
                     rationale: "QUIC blocked — force HTTP/2 over TCP (disable HTTP/3)".into(),
@@ -223,6 +241,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 61,
                     strategy_name: "force_quic".into(),
+                    profile_name: "outbound_quic".into(),
                     category: StrategyCategory::General,
                     confidence: 0.90,
                     rationale: "TCP blocked, QUIC works — force HTTP/3 (disable TCP fallback)"
@@ -240,6 +259,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 70,
                     strategy_name: "ml_anomaly_response".into(),
+                    profile_name: "outbound_tls".into(),
                     category: StrategyCategory::Tcp,
                     confidence: ml.score,
                     rationale: format!(
@@ -253,6 +273,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
                 recs.push(StrategyRecommendation {
                     strategy_id: 70,
                     strategy_name: "ml_anomaly_response".into(),
+                    profile_name: "outbound_tls".into(),
                     category: StrategyCategory::Tcp,
                     confidence: ml.score * 0.7,
                     rationale: format!(
@@ -273,6 +294,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
             recs.push(StrategyRecommendation {
                 strategy_id: 9,
                 strategy_name: "mss_clamp".into(),
+                profile_name: "tcp_mss_clamp".into(),
                 category: StrategyCategory::Tcp,
                 confidence: 0.80,
                 rationale: format!(
@@ -288,6 +310,7 @@ pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
         recs.push(StrategyRecommendation {
             strategy_id: 35,
             strategy_name: "socks5_fallback".into(),
+            profile_name: "socks5_fallback".into(),
             category: StrategyCategory::General,
             confidence: 0.70,
             rationale: "TCP timeout on foreign IP — possible CIDR whitelist, use proxy".into(),
@@ -449,5 +472,13 @@ mod tests {
         assert!(recs
             .iter()
             .any(|r| r.strategy_name == "ml_anomaly_response"));
+    }
+
+    #[test]
+    fn test_recommend_includes_profile_name() {
+        let result = make_test_result(DnsFailureCode::Ok, TcpFailureCode::Reset, None);
+        let recs = recommend(&result);
+        let rec = recs.iter().find(|r| r.strategy_name == "tcp_split").unwrap();
+        assert_eq!(rec.profile_name, "outbound_tls");
     }
 }

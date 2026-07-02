@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 /// Параметры для auto-tune.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct TuneParams {
     pub split_size: Option<usize>,
     pub split_count: Option<usize>,
@@ -72,6 +72,8 @@ pub struct AutoTune {
     strategy_indices: std::collections::HashMap<String, usize>,
     /// Tune threshold.
     tune_threshold: f64,
+    /// Manual overrides.
+    pub manual_overrides: std::collections::HashMap<String, TuneParams>,
 }
 
 impl AutoTune {
@@ -80,7 +82,16 @@ impl AutoTune {
             metrics: [const { StrategyMetrics::new() }; MAX_STRATEGIES],
             strategy_indices: std::collections::HashMap::new(),
             tune_threshold: 0.5,
+            manual_overrides: std::collections::HashMap::new(),
         }
+    }
+
+    pub fn set_override(&mut self, strategy_name: &str, params: TuneParams) {
+        self.manual_overrides.insert(strategy_name.to_string(), params);
+    }
+
+    pub fn clear_override(&mut self, strategy_name: &str) {
+        self.manual_overrides.remove(strategy_name);
     }
 
     fn get_or_create_index(&mut self, strategy_name: &str) -> usize {
@@ -221,6 +232,9 @@ impl AutoTune {
 
     /// Gets recommended params for a strategy.
     pub fn recommend(&self, strategy_name: &str) -> TuneParams {
+        if let Some(overridden) = self.manual_overrides.get(strategy_name) {
+            return overridden.clone();
+        }
         let idx = match self.strategy_indices.get(strategy_name) {
             Some(&idx) => idx,
             None => return TuneParams::default(),
