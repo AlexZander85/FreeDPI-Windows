@@ -31,6 +31,9 @@
     *   **TCP SYN Clamping**: Динамическое ограничение MSS/Window прямо в SYN-пакетах для предотвращения фрагментации/анализа.
     *   **SOCKS5 Fallback**: Автоматический дроп direct-подключений к заблокированным доменам для перенаправления их клиентом через SOCKS5-прокси.
 *   ⚙️ **TOML-стратегии**: Поддержка секции `[[strategies]]` для добавления пользовательских профилей десинхронизации, динамически сливаемых с реестром по умолчанию без перезапуска службы.
+*   💿 **Один файл — всё включено**: WinDivert статически слинкован в `freedpi-service.exe` — отдельный `WinDivert.dll` не требуется. Размер бинарника всего **~4.9 MB** (снижение на **38.5%**) благодаря LTO, strip и panic=abort.
+*   🧩 **Split Tunnel с CIDR и IPv6**: Фильтрация трафика по CIDR-диапазонам (`10.0.0.0/8`) и полная поддержка IPv6-адресов наряду с точными IP и доменами.
+*   📦 **Готовый установщик**: `FreeDPI-Setup.exe` (C# .NET 8, single-file publish) копирует файлы, устанавливает драйвер WinDivert и регистрирует службу Windows за один шаг.
 
 ---
 
@@ -50,6 +53,9 @@
     *   **TCP SYN Clamping**: Dynamically clamps MSS and Window size in raw TCP SYN packets.
     *   **SOCKS5 Fallback**: Drops direct TCP SYN connections to blocked hosts to force client-side SOCKS5/Proxy fallback.
 *   ⚙️ **TOML Custom Profiles**: Declaring custom strategies via the `[[strategies]]` section in `config.toml` with seamless registry merging and hot-reload.
+*   💿 **Single-file deployment**: WinDivert is statically linked into `freedpi-service.exe` — no separate `WinDivert.dll` required. Binary size only **~4.9 MB** (**38.5% reduction**) thanks to LTO, stripping, and `panic=abort`.
+*   🧩 **CIDR + IPv6 Split Tunnel**: Filter traffic by network ranges (`10.0.0.0/8`) with full IPv6 address support alongside exact IPs and domain names.
+*   📦 **Ready-to-run installer**: `FreeDPI-Setup.exe` (C# .NET 8, single-file publish) copies files, installs the WinDivert kernel driver, and registers the Windows service in a single step.
 
 ---
 

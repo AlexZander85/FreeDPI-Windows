@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "freedpi-api"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "freedpi-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "freedpi-service"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
