@@ -5,7 +5,7 @@
 - 15 — из zapret2 (multisplit, fakedsplit, syndata, badsum, synhide, ipfrag...)
 - 10 — Windows-эксклюзивных (IP frag overlap, MSS clamp, ACK suppress, reorder, RST selective...)
 - 9 — из Nova (geo-routing, proxy chain, strategy evolution, per-app routing, Opera VPN)
-- 3 — split tunneling (blacklist/whitelist/auto)
+- 3 — split tunneling (blacklist/whitelist/auto + CIDR + IPv6)
 - 8 — из sing-box (TLS Spoof, TLS Record Fragment, uTLS, Reality, FakeIP DNS, Rule Sets...)
 - 7 — из NaiveProxy (Chrome JA3, H2 SETTINGS, RST padding, H2 padding, Preamble, Multi-session, PQ)
 - 14 — из b4 (Combo frag, SeqOverlap, TLS mutation, Fake QUIC, Detect & Escalate, RST protect, Window manip...)
@@ -132,10 +132,11 @@
 │                                                                          │
 │  ┌──────────────────────────────────────────────────────────────────┐   │
 │  │              Split Tunnel Engine                                  │   │
-│  │  ┌─────────────┐ ┌─────────────┐ ┌────────────┐                 │   │
-│  │  │ Blacklist    │ │ Whitelist   │ │ Auto-Detect │                 │   │
-│  │  │ (DashSet)    │ │ (DashSet)   │ │ (prober)   │                 │   │
-│  │  └─────────────┘ └─────────────┘ └────────────┘                 │   │
+│  │  ┌─────────────┐ ┌─────────────┐ ┌────────────┐ ┌─────────────┐ │   │
+│  │  │ Blacklist    │ │ Whitelist   │ │ Auto-Detect │ │ CIDR Range  │ │   │
+│  │  │ (DashSet)    │ │ (DashSet)   │ │ (prober)   │ │ (Vec<IpNet>)│ │   │
+│  │  └─────────────┘ └─────────────┘ └────────────┘ └─────────────┘ │   │
+│  │  │ IpAddr (IPv4+IPv6) • u128 TL-cache • WinDivert CIDR filter   │   │
 │  └──────────────────────────────────────────────────────────────────┘   │
 │                                                                          │
 │  ┌──────────────────────────────────────────────────────────────────┐   │
@@ -158,7 +159,7 @@ FreeDPI-win/
 │   └── src/
 │       ├── lib.rs
 │       ├── packet_engine.rs      # WinDivert + raw sockets
-│       ├── split_tunnel.rs       # Blacklist/whitelist engine
+│       ├── split_tunnel.rs       # Blacklist/whitelist/auto + CIDR + IPv6
 │       ├── classifier.rs         # Packet classification
 │       ├── desync/               # Desync techniques (Rust port)
 │       │   ├── mod.rs
@@ -238,9 +239,12 @@ impl PacketEngine {
 
 ### 3.3 Split Tunneling Engine
 
+**v1.0.0 — обновление: IpAddr вместо Ipv4Addr, CIDR-диапазоны (Vec\<IpNet\>), IPv6.**
+
 ```rust
-use dashmap::DashSet;
-use std::net::Ipv4Addr;
+use dashmap::{DashMap, DashSet};
+use ipnet::IpNet;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -256,11 +260,18 @@ pub enum SplitMode {
 }
 
 /// Движок раздельного туннелирования
+///
+/// Поддерживает 3 источника фильтрации (в порядке приоритета):
+/// 1. Точные IP-адреса (DashSet<IpAddr>) — IPv4 и IPv6
+/// 2. CIDR-диапазоны (Vec<IpNet>) — 10.0.0.0/8, 2001:db8::/32
+/// 3. Доменные имена (DashSet<String>)
 pub struct SplitTunnel {
     blacklist_domains: Arc<DashSet<String>>,
-    blacklist_ips: Arc<DashSet<Ipv4Addr>>,
+    blacklist_ips: Arc<DashSet<IpAddr>>,
+    blacklist_nets: Arc<Vec<IpNet>>,
     whitelist_domains: Arc<DashSet<String>>,
-    whitelist_ips: Arc<DashSet<Ipv4Addr>>,
+    whitelist_ips: Arc<DashSet<IpAddr>>,
+    whitelist_nets: Arc<Vec<IpNet>>,
     auto_detected: Arc<DashSet<String>>,
     mode: SplitMode,
     /// Шардированный счетчик — минимизируем contention
@@ -268,43 +279,71 @@ pub struct SplitTunnel {
 }
 
 impl SplitTunnel {
+    /// Конструктор с CIDR-диапазонами
+    pub fn with_cidrs(
+        mode: SplitMode,
+        blacklist_nets: Vec<IpNet>,
+        whitelist_nets: Vec<IpNet>,
+    ) -> Self { /* ... */ }
+
     /// Проверка: нужно ли обходить этот IP?
+    /// Порядок проверки: точный IP → CIDR → режим
     #[inline(always)]
-    pub fn should_bypass_ip(&self, dst_ip: &Ipv4Addr) -> bool {
+    pub fn should_bypass_ip(&self, dst_ip: &IpAddr) -> bool {
         match self.mode {
-            SplitMode::WhitelistOnly => self.whitelist_ips.contains(dst_ip),
-            SplitMode::BlacklistOnly => !self.blacklist_ips.contains(dst_ip),
+            SplitMode::WhitelistOnly => {
+                self.whitelist_ips.contains(dst_ip)
+                    || self.nets_contain(&self.whitelist_nets, dst_ip)
+            }
+            SplitMode::BlacklistOnly => {
+                !self.blacklist_ips.contains(dst_ip)
+                    && !self.nets_contain(&self.blacklist_nets, dst_ip)
+            }
             SplitMode::Auto => !self.auto_detected.contains(/* ip→domain map */),
         }
     }
 
-    /// Быстрая проверка с thread-local cache (FIX-1: устраняет 5 DashMap lookups/packet).
-    pub fn should_bypass_ip_fast(&self, dst_ip: &Ipv4Addr) -> bool {
-        // thread_local! RefCell<Vec<(u32, bool)>> cache (1024 entries)
-        // Cache hit → return cached value
-        // Cache miss → DashMap lookup → cache result
+    /// Быстрая проверка с thread-local cache.
+    /// Ключ кэша: u128 (вмещает IPv4 как u64 и IPv6 целиком).
+    pub fn should_bypass_ip_fast(&self, dst_ip: &IpAddr) -> bool {
+        // thread_local! RefCell<Vec<(u128, bool)>> cache (1024 entries)
+        // addr_to_key() конвертирует IpAddr → u128:
+        //   IPv4: 0x0000_0000_0000_0000_ffff_ffff_<ipv4>
+        //   IPv6: u128 from octets
+        // Cache hit → return cached value (nanoseconds)
+        // Cache miss → should_bypass_ip() → cache result
     }
 
-    /// Построение селективного WinDivert фильтра (захватывает исключительно исходящий TLS ClientHello)
+    /// Построение селективного WinDivert фильтра
+    /// IPv4 CIDR → ip.DstAddr != X.X.X.X/Y
+    /// IPv6 CIDR — пропускаем (WinDivert 2.2 не поддерживает ipv6.DstAddr)
     pub fn build_win_divert_filter(&self) -> String {
-        // Базовый фильтр захватывает исходящие TCP-пакеты на порт 443,
-        // содержащие TLS ClientHello (0x16 0x03 на смещении нагрузки),
-        // а также UDP DNS (порт 53) и UDP QUIC (порт 443).
-        // Пример фильтра: "(ip or ipv6) && ((outbound && tcp.DstPort == 443 && tcp.PayloadLength > 5 && tcp.Payload[0] == 0x16 && tcp.Payload[1] == 0x03 && tcp.Payload[5] == 0x01) or udp.DstPort == 53 or udp.DstPort == 443)"
-        
-        // При наличии blacklist-исключений фильтр дополняется отрицаниями по IP
+        let mut filter = String::from("(ip or ipv6) && (");
+        // ... базовый TLS ClientHello фильтр ...
+        // Добавить отрицания для blacklist CIDR:
+        //   "ip.DstAddr != 10.0.0.0/8 && ip.DstAddr != 192.168.0.0/16"
+        filter.push_str(")");
+        filter
     }
+
+    /// Поиск IP в списке CIDR (линейный, n < 50)
+    fn nets_contain(&self, nets: &[IpNet], ip: &IpAddr) -> bool {
+        nets.iter().any(|net| net.contains(ip))
+    }
+
+    pub fn add_net_to_blacklist(&self, net: IpNet) { /* ... */ }
+    pub fn add_ip_to_blacklist(&self, ip: IpAddr) { /* ... */ }
+    pub fn add_domain_to_whitelist(&self, domain: &str) { /* ... */ }
 }
 
 /// Auto-режим: асинхронный prober
 pub struct AutoProber {
-    /// Probe-соединения через tokio::spawn
     pending: Arc<DashSet<String>>,
 }
 
 impl AutoProber {
-    /// Проверить доступность сайта
-    pub async fn probe(domain: &str, ip: Ipv4Addr) -> ProbeResult {
+    /// Проверить доступность сайта (поддерживает IPv4 и IPv6)
+    pub async fn probe(domain: &str, ip: IpAddr) -> ProbeResult {
         // 1. TCP connect с таймаутом 3 сек
         let stream = tokio::time::timeout(
             Duration::from_secs(3),
@@ -559,14 +598,18 @@ impl Conntrack {
 | W9 | **TCP Fast Open Abuse** | `desync::tcp` | TFO cookie + fake data в SYN |
 | W10 | **Adaptive DPI Detection** | `adaptive` | Анализ ответов DPI → авто-выбор стратегии |
 
-### 4.5 Split Tunneling техники (3 шт)
+### 4.5 Split Tunneling техники (6 шт)
 
 | # | Техника | Rust модуль | Описание |
 |---|---------|-------------|----------|
 | S1 | **Blacklist mode** | `split_tunnel` | Только blacklist-сайты через обход |
 | S2 | **Whitelist mode** | `split_tunnel` | Все, кроме whitelist, через обход |
 | S3 | **Auto mode** | `split_tunnel` | Авто-детекция: probe → classify |
-| S3a | **Auto-detect persistence** (NoDPI) | `split_tunnel` | ✅ Whitelist кэш + blocked_domains.txt |
+| S3a | **Auto-detect persistence** (NoDPI) | `split_tunnel` | Whitelist кэш + blocked_domains.txt |
+| S4 | **CIDR Blacklist** | `split_tunnel` | CIDR-диапазон в blacklist (10.0.0.0/8) |
+| S5 | **CIDR Whitelist** | `split_tunnel` | CIDR-диапазон в whitelist (192.168.0.0/16) |
+| S6 | **IPv6 — полная поддержка** | `split_tunnel` | IpAddr + u128 TL-cache, IPv6 CIDR |
+| S7 | **WinDivert CIDR фильтр** | `split_tunnel` | ip.DstAddr != 10.0.0.0/8 (IPv4 only) |
 
 ---
 
