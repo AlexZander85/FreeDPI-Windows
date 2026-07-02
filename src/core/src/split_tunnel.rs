@@ -367,7 +367,10 @@ impl SplitTunnel {
 
     /// Снапшот blacklist CIDR для API.
     pub fn blacklist_nets_snapshot(&self) -> Vec<String> {
-        self.blacklist_nets.iter().map(|net| net.to_string()).collect()
+        self.blacklist_nets
+            .iter()
+            .map(|net| net.to_string())
+            .collect()
     }
 
     /// Снапшот whitelist доменов для API.
@@ -382,7 +385,10 @@ impl SplitTunnel {
 
     /// Снапшот whitelist CIDR для API.
     pub fn whitelist_nets_snapshot(&self) -> Vec<String> {
-        self.whitelist_nets.iter().map(|net| net.to_string()).collect()
+        self.whitelist_nets
+            .iter()
+            .map(|net| net.to_string())
+            .collect()
     }
 }
 

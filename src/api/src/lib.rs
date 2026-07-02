@@ -62,18 +62,8 @@ pub trait EngineHandle {
     // ─── Split Tunnel ─────────────────────────────────────────────────────
     fn split_tunnel_state(&self) -> serde_json::Value;
     fn split_tunnel_set_mode(&self, mode: &str);
-    fn split_tunnel_add(
-        &self,
-        list: &str,
-        entry_type: &str,
-        value: &str,
-    ) -> Result<(), String>;
-    fn split_tunnel_remove(
-        &self,
-        list: &str,
-        entry_type: &str,
-        value: &str,
-    ) -> Result<(), String>;
+    fn split_tunnel_add(&self, list: &str, entry_type: &str, value: &str) -> Result<(), String>;
+    fn split_tunnel_remove(&self, list: &str, entry_type: &str, value: &str) -> Result<(), String>;
 }
 
 // ─── Request/Response типы ─────────────────────────────────────────────────
@@ -162,9 +152,15 @@ pub async fn serve(engine: Arc<dyn EngineHandle + Send + Sync>, api_key: String,
         .route("/api/v1/probe/presets", get(presets_handler))
         .route("/api/v1/probe/history", get(history_handler))
         .route("/api/v1/splittunnel", get(split_tunnel_state_handler))
-        .route("/api/v1/splittunnel/mode", post(split_tunnel_set_mode_handler))
+        .route(
+            "/api/v1/splittunnel/mode",
+            post(split_tunnel_set_mode_handler),
+        )
         .route("/api/v1/splittunnel/add", post(split_tunnel_add_handler))
-        .route("/api/v1/splittunnel/remove", post(split_tunnel_remove_handler))
+        .route(
+            "/api/v1/splittunnel/remove",
+            post(split_tunnel_remove_handler),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -335,9 +331,7 @@ pub struct SplitTunnelEntryRequest {
 // ─── Split Tunnel Handlers ─────────────────────────────────────────────────
 
 /// `GET /api/v1/splittunnel` — полное состояние split tunnel.
-async fn split_tunnel_state_handler(
-    State(state): State<Arc<ApiState>>,
-) -> impl IntoResponse {
+async fn split_tunnel_state_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     Json(state.engine.split_tunnel_state())
 }
 
@@ -358,7 +352,10 @@ async fn split_tunnel_add_handler(
     State(state): State<Arc<ApiState>>,
     Json(params): Json<SplitTunnelEntryRequest>,
 ) -> impl IntoResponse {
-    match state.engine.split_tunnel_add(&params.list, &params.entry_type, &params.value) {
+    match state
+        .engine
+        .split_tunnel_add(&params.list, &params.entry_type, &params.value)
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -380,7 +377,10 @@ async fn split_tunnel_remove_handler(
     State(state): State<Arc<ApiState>>,
     Json(params): Json<SplitTunnelEntryRequest>,
 ) -> impl IntoResponse {
-    match state.engine.split_tunnel_remove(&params.list, &params.entry_type, &params.value) {
+    match state
+        .engine
+        .split_tunnel_remove(&params.list, &params.entry_type, &params.value)
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({

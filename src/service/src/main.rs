@@ -23,8 +23,13 @@ use freedpi_api::{
     EngineHandle, RoutingOverride, StrategyTestParams, StrategyTestResult, TuneParams,
 };
 use freedpi_core::{
-    adaptive::hop_tab::HopTab, config::Config, conntrack::Conntrack, dns::fakeip::FakeIpManager,
-    engine::ProcessingPipeline, infra::sentinel::Sentinel, routing::geo::GeoRouter,
+    adaptive::hop_tab::HopTab,
+    config::Config,
+    conntrack::Conntrack,
+    dns::fakeip::FakeIpManager,
+    engine::ProcessingPipeline,
+    infra::sentinel::Sentinel,
+    routing::geo::GeoRouter,
     split_tunnel::{SplitMode, SplitTunnel},
 };
 use std::path::PathBuf;
@@ -425,12 +430,7 @@ impl EngineHandle for ServiceEngine {
         }
     }
 
-    fn split_tunnel_remove(
-        &self,
-        list: &str,
-        entry_type: &str,
-        value: &str,
-    ) -> Result<(), String> {
+    fn split_tunnel_remove(&self, list: &str, entry_type: &str, value: &str) -> Result<(), String> {
         use std::net::IpAddr;
         use std::str::FromStr;
 
