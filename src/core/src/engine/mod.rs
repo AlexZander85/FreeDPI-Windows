@@ -113,6 +113,7 @@ pub struct ProcessingConfig {
     pub proxy_config: crate::config::ProxyConfig,
     pub dns_config: crate::config::DnsConfig,
     pub adaptive_router_config: crate::routing::adaptive_router::AdaptiveRouterConfig,
+    pub zero_config: crate::config::ZeroConfigConfig,
 }
 
 impl Default for ProcessingConfig {
@@ -132,6 +133,7 @@ impl Default for ProcessingConfig {
             dns_config: crate::config::DnsConfig::default(),
             adaptive_router_config: crate::routing::adaptive_router::AdaptiveRouterConfig::default(
             ),
+            zero_config: crate::config::ZeroConfigConfig::default(),
         }
     }
 }
@@ -159,6 +161,8 @@ pub struct ProcessingPipeline {
     redirect_table: Arc<crate::desync::redirect_table::RedirectTable>,
     socks_redirector: Arc<crate::proxy::redirector::SocksRedirector>,
     dns_proxy: Arc<crate::dns::dns_proxy::DnsProxyEngine>,
+    #[allow(dead_code)]
+    zero_config: Arc<crate::proxy::zero_config::ZeroConfigEngine>,
     adaptive_router: Arc<crate::routing::adaptive_router::AdaptiveRouter>,
     /// Флаг наличия non-empty session ticket от сервера.
     /// Устанавливается после успешного TLS handshake, когда сервер
@@ -301,6 +305,46 @@ impl ProcessingPipeline {
 
         let redirect_table = Arc::new(crate::desync::redirect_table::RedirectTable::new());
 
+        // T63: Initialize and start ZeroConfigEngine background task
+        let zero_config = Arc::new(crate::proxy::zero_config::ZeroConfigEngine::new(
+            config.zero_config.clone(),
+        ));
+        let zero_config_clone = zero_config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = zero_config_clone.initialize().await {
+                tracing::error!("Failed to initialize Zero-Config bypass engine: {e}");
+            }
+        });
+
+        // T63: Initialize Whitelist Detector if auto_detect is enabled
+        if config.zero_config.auto_detect {
+            let canary_path = std::path::Path::new(&config.zero_config.canary_domains_path);
+            if !canary_path.exists() {
+                let default_content = "# Whitelist Detector Canary Domains\n\
+                                       gosuslugi.ru,positive\n\
+                                       vk.com,positive\n\
+                                       sberbank.ru,positive\n\
+                                       example.com,negative\n\
+                                       iana.org,negative\n\
+                                       rfc-editor.org,negative\n";
+                let _ = std::fs::write(canary_path, default_content);
+            }
+
+            match crate::detector::canary_list::load_canary_list(canary_path) {
+                Ok(canaries) => {
+                    let detector = Arc::new(crate::detector::detector::WhitelistDetector::new(
+                        canaries,
+                        zero_config.clone(),
+                        config.zero_config.detection_interval_secs,
+                    ));
+                    detector.start_loop();
+                }
+                Err(e) => {
+                    tracing::error!("Failed to load canary domains for Whitelist Detector: {e:#}");
+                }
+            }
+        }
+
         // Запуск SOCKS5-редиректора в бэкграунде
         let proxy_pool = Arc::new(crate::proxy::types::OperaProxyPool::new(vec![
             "185.167.238.201:1080".parse().unwrap(),
@@ -313,6 +357,7 @@ impl ProcessingPipeline {
             redirect_table.clone(),
             proxy_pool.clone(),
             config.proxy_config.custom_proxy.clone(),
+            zero_config.clone(),
         ));
         let redirector_clone = redirector.clone();
         tokio::spawn(async move {
@@ -339,6 +384,7 @@ impl ProcessingPipeline {
             },
             fake_ip.clone(),
             geo_router.clone(),
+            zero_config.clone(),
         ));
 
         let adaptive_router = Arc::new(crate::routing::adaptive_router::AdaptiveRouter::new(
@@ -366,6 +412,7 @@ impl ProcessingPipeline {
             redirect_table,
             socks_redirector: redirector,
             dns_proxy,
+            zero_config,
             adaptive_router,
             has_non_empty_session_ticket: false,
         })
@@ -422,6 +469,12 @@ impl ProcessingPipeline {
         }
 
         let redirect_table = Arc::new(crate::desync::redirect_table::RedirectTable::new());
+
+        // T63: Initialize ZeroConfigEngine for api-only (disabled or default configuration)
+        let zero_config = Arc::new(crate::proxy::zero_config::ZeroConfigEngine::new(
+            config.zero_config.clone(),
+        ));
+
         let proxy_pool = Arc::new(crate::proxy::types::OperaProxyPool::new(vec![
             "185.167.238.201:1080".parse().unwrap(),
         ]));
@@ -429,6 +482,7 @@ impl ProcessingPipeline {
             redirect_table.clone(),
             proxy_pool.clone(),
             config.proxy_config.custom_proxy.clone(),
+            zero_config.clone(),
         ));
 
         let fake_ip = Arc::new(FakeIpManager::new(1000));
@@ -451,6 +505,7 @@ impl ProcessingPipeline {
             },
             fake_ip.clone(),
             geo_router.clone(),
+            zero_config.clone(),
         ));
 
         let adaptive_router = Arc::new(crate::routing::adaptive_router::AdaptiveRouter::new(
@@ -478,6 +533,7 @@ impl ProcessingPipeline {
             redirect_table,
             socks_redirector: redirector,
             dns_proxy,
+            zero_config,
             adaptive_router,
             has_non_empty_session_ticket: false,
         }
@@ -998,7 +1054,10 @@ impl ProcessingPipeline {
                         crate::routing::GeoRegion::Europe | crate::routing::GeoRegion::UnitedStates
                     )
                 };
-                let has_sni_or_host = matches!(&classification, Classification::Tls(_) | Classification::Http(_));
+                let has_sni_or_host = matches!(
+                    &classification,
+                    Classification::Tls(_) | Classification::Http(_)
+                );
 
                 let decision = self.adaptive_router.decide(
                     domain.as_deref(),

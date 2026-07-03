@@ -78,6 +78,7 @@ pub struct DnsProxyEngine {
     pub cache: DashMap<String, (IpAddr, Instant)>,
     pub doh_client: reqwest::Client,
     pub system_resolver: Option<trust_dns_resolver::TokioAsyncResolver>,
+    pub zero_config: Arc<crate::proxy::zero_config::ZeroConfigEngine>,
 }
 
 impl DnsProxyEngine {
@@ -85,6 +86,7 @@ impl DnsProxyEngine {
         config: DnsProxyConfig,
         fake_ip_manager: Arc<FakeIpManager>,
         geo_router: Arc<GeoRouter>,
+        zero_config: Arc<crate::proxy::zero_config::ZeroConfigEngine>,
     ) -> Self {
         let doh_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
@@ -109,6 +111,7 @@ impl DnsProxyEngine {
             cache: DashMap::new(),
             doh_client,
             system_resolver,
+            zero_config,
         }
     }
 
@@ -211,6 +214,29 @@ impl DnsProxyEngine {
             }
         }
 
+        // 1. Попытка обычного DoH
+        if let Some(ip) = self.resolve_via_doh_normal(domain, query_type).await {
+            return Some(ip);
+        }
+
+        // 2. Если обычный DoH заблокирован, пробуем DoH с маскировкой через Opera CONNECT
+        if self.zero_config.is_active() {
+            debug!(
+                "T63: Normal DoH failed, trying masqueraded DoH over Opera tunnel for {}...",
+                domain
+            );
+            if let Some(ip) = self.resolve_via_doh_masqueraded(domain, query_type).await {
+                let ttl = { self.config.read().unwrap().ttl as u64 };
+                self.cache
+                    .insert(cache_key, (ip, Instant::now() + Duration::from_secs(ttl)));
+                return Some(ip);
+            }
+        }
+
+        None
+    }
+
+    async fn resolve_via_doh_normal(&self, domain: &str, query_type: u16) -> Option<IpAddr> {
         let (doh_servers, ttl_fallback) = {
             let config = self.config.read().unwrap();
             (config.doh_servers.clone(), config.ttl)
@@ -249,10 +275,12 @@ impl DnsProxyEngine {
                                     if let Some(ip_str) = entry["data"].as_str() {
                                         let ip_clean = ip_str.trim_end_matches('.');
                                         if let Ok(ip) = ip_clean.parse::<IpAddr>() {
-                                            let ttl =
-                                                entry["TTL"].as_u64().unwrap_or(ttl_fallback as u64);
+                                            let ttl = entry["TTL"]
+                                                .as_u64()
+                                                .unwrap_or(ttl_fallback as u64);
+                                            let cache_key = format!("{}:{}", domain, query_type);
                                             self.cache.insert(
-                                                cache_key.clone(),
+                                                cache_key,
                                                 (ip, Instant::now() + Duration::from_secs(ttl)),
                                             );
                                             return Some(ip);
@@ -269,6 +297,142 @@ impl DnsProxyEngine {
             }
         }
         None
+    }
+
+    async fn resolve_via_doh_masqueraded(&self, domain: &str, query_type: u16) -> Option<IpAddr> {
+        let tunnel = self.zero_config.get_tunnel()?;
+
+        // CONNECT к IP 8.8.8.8 на порт 443 через туннель Opera с fake SNI
+        let opera_stream = match tunnel.connect("8.8.8.8", 443).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("DoH masquerade: CONNECT to 8.8.8.8:443 failed: {e:#}");
+                return None;
+            }
+        };
+
+        // Вложенный TLS-хэндшейк с dns.google
+        let connector = crate::proxy::http_tunnel::build_tls_connector();
+        let server_name = match rustls::pki_types::ServerName::try_from("dns.google") {
+            Ok(name) => name.to_owned(),
+            Err(_) => return None,
+        };
+        let mut tls_stream = match connector.connect(server_name, opera_stream).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("DoH masquerade: Inner TLS handshake with 'dns.google' failed: {e:#}");
+                return None;
+            }
+        };
+
+        let dns_query = self.build_dns_wire_query(domain, query_type);
+
+        let http_request = format!(
+            "POST /dns-query HTTP/1.1\r\n\
+             Host: dns.google\r\n\
+             Content-Type: application/dns-message\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            dns_query.len()
+        );
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if tls_stream.write_all(http_request.as_bytes()).await.is_err() {
+            return None;
+        }
+        if tls_stream.write_all(&dns_query).await.is_err() {
+            return None;
+        }
+
+        let mut response = Vec::with_capacity(1024);
+        if tls_stream.read_to_end(&mut response).await.is_err() {
+            return None;
+        }
+
+        let header_end = response.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let body = &response[header_end + 4..];
+
+        if body.len() < 12 {
+            return None;
+        }
+
+        let ancount = u16::from_be_bytes([body[6], body[7]]) as usize;
+        if ancount == 0 {
+            return None;
+        }
+
+        // Skip header (12) + question section
+        let mut pos = 12;
+        while pos < body.len() && body[pos] != 0 {
+            pos += 1 + body[pos] as usize;
+        }
+        pos += 1; // null terminator
+        pos += 4; // QTYPE + QCLASS
+
+        // Parse first answer NAME (handles compression pointers correctly)
+        loop {
+            if pos >= body.len() {
+                return None;
+            }
+            let len = body[pos];
+            if len == 0 {
+                pos += 1;
+                break;
+            } else if (len & 0xC0) == 0xC0 {
+                pos += 2; // Pointer terminates the name
+                break;
+            } else {
+                pos += 1 + len as usize;
+            }
+        }
+
+        if pos + 10 > body.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([body[pos], body[pos + 1]]);
+        let rdlength = u16::from_be_bytes([body[pos + 8], body[pos + 9]]) as usize;
+        pos += 10;
+
+        if rtype == 1 && rdlength == 4 && pos + 4 <= body.len() {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                body[pos],
+                body[pos + 1],
+                body[pos + 2],
+                body[pos + 3],
+            ));
+            return Some(ip);
+        } else if rtype == 28 && rdlength == 16 && pos + 16 <= body.len() {
+            let mut ipv6_bytes = [0u8; 16];
+            ipv6_bytes.copy_from_slice(&body[pos..pos + 16]);
+            let ip = IpAddr::V6(std::net::Ipv6Addr::from(ipv6_bytes));
+            return Some(ip);
+        }
+
+        None
+    }
+
+    fn build_dns_wire_query(&self, domain: &str, query_type: u16) -> Vec<u8> {
+        let mut query = Vec::with_capacity(12 + domain.len() + 6);
+        let txn_id = (crate::desync::rand::random_u32() & 0xFFFF) as u16;
+        query.extend_from_slice(&txn_id.to_be_bytes()); // Transaction ID
+        query.extend_from_slice(&0x0100u16.to_be_bytes()); // Flags: standard query, RD=1
+        query.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+        query.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT = 0
+        query.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
+        query.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
+
+        for label in domain.split('.') {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0); // Root label
+
+        query.extend_from_slice(&query_type.to_be_bytes()); // QTYPE
+        query.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+
+        query
     }
 
     async fn resolve_via_system(&self, domain: &str, query_type: u16) -> Option<IpAddr> {
@@ -331,7 +495,13 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = DnsProxyEngine::new(config, fake_ip, geo);
+        let zero_config = Arc::new(crate::proxy::zero_config::ZeroConfigEngine::new(
+            crate::config::ZeroConfigConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        ));
+        let engine = DnsProxyEngine::new(config, fake_ip, geo, zero_config);
 
         assert_eq!(
             engine.classify_domain("adserver.com"),

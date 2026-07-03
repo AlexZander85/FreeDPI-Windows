@@ -12,6 +12,7 @@ pub struct SocksRedirector {
     pub table: Arc<RedirectTable>,
     pub proxy_pool: Arc<OperaProxyPool>,
     pub custom_proxy: Arc<std::sync::RwLock<crate::config::CustomProxyConfig>>,
+    pub zero_config: Arc<crate::proxy::zero_config::ZeroConfigEngine>,
 }
 
 impl SocksRedirector {
@@ -19,11 +20,13 @@ impl SocksRedirector {
         table: Arc<RedirectTable>,
         proxy_pool: Arc<OperaProxyPool>,
         custom_proxy: crate::config::CustomProxyConfig,
+        zero_config: Arc<crate::proxy::zero_config::ZeroConfigEngine>,
     ) -> Self {
         Self {
             table,
             proxy_pool,
             custom_proxy: Arc::new(std::sync::RwLock::new(custom_proxy)),
+            zero_config,
         }
     }
 
@@ -83,6 +86,35 @@ impl SocksRedirector {
             .domain
             .clone()
             .unwrap_or_else(|| entry.orig_dst_ip.to_string());
+
+        // T63: Zero-Config Whitelist Bypass routing
+        if self.zero_config.is_active() {
+            if let Some(tunnel) = self.zero_config.get_tunnel() {
+                debug!(
+                    "SocksRedirector: routing via Zero-Config Opera tunnel to {target_host}:{}",
+                    entry.orig_dst_port
+                );
+                match tunnel.connect(&target_host, entry.orig_dst_port).await {
+                    Ok(mut outbound) => {
+                        let bridge_result = copy_bidirectional(&mut inbound, &mut outbound).await;
+                        self.table.remove(client_src_port);
+                        match bridge_result {
+                            Ok((up, down)) => {
+                                debug!(
+                                    "bridge {target_host}:{} closed (Zero-Config): {up}B up / {down}B down",
+                                    entry.orig_dst_port
+                                );
+                                return Ok(());
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    Err(e) => {
+                        warn!("SocksRedirector: Zero-Config Opera tunnel failed: {e:#}. Falling back to default proxy paths.");
+                    }
+                }
+            }
+        }
 
         let custom = { self.custom_proxy.read().unwrap().clone() };
 
@@ -260,7 +292,18 @@ mod tests {
             ..Default::default()
         };
 
-        let redirector = Arc::new(SocksRedirector::new(table.clone(), pool, custom_cfg));
+        let zero_config = Arc::new(crate::proxy::zero_config::ZeroConfigEngine::new(
+            crate::config::ZeroConfigConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        ));
+        let redirector = Arc::new(SocksRedirector::new(
+            table.clone(),
+            pool,
+            custom_cfg,
+            zero_config,
+        ));
         // Bind to a random port in REDIRECTOR_PORT_RANGE
         let redirector_port = redirector.bind_and_run().await.unwrap();
 

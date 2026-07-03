@@ -93,6 +93,13 @@ ipnet = "2.10"
 # IPC (Named Pipes)
 interprocess = "2"
 
+md-5 = "0.10"
+sha1 = "0.10"
+hex = "0.4"
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pki-types = "1"
+
 [profile.release]
 # Full link-time optimization — faster + smaller binary
 lto = "fat"

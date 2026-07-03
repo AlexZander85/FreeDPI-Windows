@@ -18,6 +18,7 @@ pub mod classifier;
 pub mod config;
 pub mod conntrack;
 pub mod desync;
+pub mod detector;
 pub mod dns;
 pub mod engine;
 pub mod infra;

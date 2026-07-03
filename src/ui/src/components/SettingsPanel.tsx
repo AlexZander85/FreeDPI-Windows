@@ -12,6 +12,8 @@ interface Settings {
   dns_doh_url: string;
   dns_dot_addr: string;
   dns_cache_ttl: number;
+  zero_config_enabled: boolean;
+  zero_config_auto_detect: boolean;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -24,37 +26,79 @@ const DEFAULT_SETTINGS: Settings = {
   dns_doh_url: "https://cloudflare-dns.com/dns-query",
   dns_dot_addr: "1.1.1.1:853",
   dns_cache_ttl: 300,
+  zero_config_enabled: true,
+  zero_config_auto_detect: false,
 };
 
 function parseTomlToSettings(raw: string): Partial<Settings> {
-  const result: Record<string, string | number> = {};
+  const result: Partial<Settings> = {};
+  let currentSection = "";
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      currentSection = trimmed.slice(1, -1).trim();
+      continue;
+    }
     const eq = trimmed.indexOf("=");
     if (eq === -1) continue;
     const key = trimmed.slice(0, eq).trim();
-    let val: string | number = trimmed.slice(eq + 1).trim();
-    if (typeof val === "string" && val.startsWith('"') && val.endsWith('"')) {
-      val = val.slice(1, -1);
-    } else if (!isNaN(Number(val))) {
-      val = Number(val);
+    const valStr = trimmed.slice(eq + 1).trim();
+    let val: string | number | boolean = valStr;
+    if (valStr.startsWith('"') && valStr.endsWith('"')) {
+      val = valStr.slice(1, -1);
+    } else if (valStr === "true") {
+      val = true;
+    } else if (valStr === "false") {
+      val = false;
+    } else if (!isNaN(Number(valStr))) {
+      val = Number(valStr);
     }
-    result[key] = val;
+
+    if (currentSection === "api" && key === "port") {
+      result.api_port = val as number;
+    } else if (currentSection === "windivert" && key === "filter") {
+      result.windivert_filter = val as string;
+    } else if (currentSection === "dns") {
+      if (key === "doh_url") result.dns_doh_url = val as string;
+      if (key === "dot_addr") result.dns_dot_addr = val as string;
+      if (key === "cache_ttl") result.dns_cache_ttl = val as number;
+    } else if (currentSection === "desync") {
+      if (key === "fake_sni") result.fake_sni = val as string;
+      if (key === "split_size") result.split_size = val as number;
+      if (key === "split_count") result.split_count = val as number;
+      if (key === "fake_ttl_offset") result.fake_ttl_offset = val as number;
+    } else if (currentSection === "zero_config") {
+      if (key === "enabled") result.zero_config_enabled = val as boolean;
+      if (key === "auto_detect") result.zero_config_auto_detect = val as boolean;
+    }
   }
-  return result as Partial<Settings>;
+  return result;
 }
 
 function settingsToToml(s: Settings): string {
-  const lines: string[] = [];
-  for (const [key, val] of Object.entries(s)) {
-    if (typeof val === "string") {
-      lines.push(`${key} = "${val}"`);
-    } else {
-      lines.push(`${key} = ${val}`);
-    }
-  }
-  return lines.join("\n");
+  return `[api]
+port = ${s.api_port}
+enabled = true
+
+[windivert]
+filter = "${s.windivert_filter}"
+
+[dns]
+doh_url = "${s.dns_doh_url}"
+dot_addr = "${s.dns_dot_addr}"
+cache_ttl = ${s.dns_cache_ttl}
+
+[desync]
+fake_sni = "${s.fake_sni}"
+split_size = ${s.split_size}
+split_count = ${s.split_count}
+fake_ttl_offset = ${s.fake_ttl_offset}
+
+[zero_config]
+enabled = ${s.zero_config_enabled}
+auto_detect = ${s.zero_config_auto_detect}
+`;
 }
 
 export default function SettingsPanel() {
@@ -62,7 +106,7 @@ export default function SettingsPanel() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [saved, setSaved] = useState(false);
 
-  const update = (key: keyof Settings, value: string | number) => {
+  const update = (key: keyof Settings, value: string | number | boolean) => {
     setSettings((prev) => ({ ...prev, [key]: value }));
     setSaved(false);
   };
@@ -91,7 +135,9 @@ export default function SettingsPanel() {
     }
   };
 
-  useState(() => { load(); });
+  useState(() => {
+    load();
+  });
 
   return (
     <div className="space-y-4">
@@ -110,6 +156,24 @@ export default function SettingsPanel() {
       </div>
 
       <div className="space-y-3">
+        {/* Zero-Config Whitelist Bypass Settings */}
+        <SettingGroup title={t("settings.zero_config_title")}>
+          <SettingCheckbox
+            label={t("settings.zero_config_enabled")}
+            description={t("settings.zero_config_enabled_desc")}
+            value={settings.zero_config_enabled}
+            onChange={(v) => update("zero_config_enabled", v)}
+          />
+          <div className="pt-2 border-t" style={{ borderColor: "var(--border)" }}>
+            <SettingCheckbox
+              label={t("settings.zero_config_auto_detect")}
+              description={t("settings.zero_config_auto_detect_desc")}
+              value={settings.zero_config_auto_detect}
+              onChange={(v) => update("zero_config_auto_detect", v)}
+            />
+          </div>
+        </SettingGroup>
+
         <SettingGroup title={t("settings.advanced")}>
           <SettingInput
             label={t("settings.windivert_filter")}
@@ -239,6 +303,39 @@ function SettingNumber({
           border: "1px solid var(--border)",
         }}
       />
+    </div>
+  );
+}
+
+function SettingCheckbox({
+  label,
+  description,
+  value,
+  onChange,
+}: {
+  label: string;
+  description?: string;
+  value: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div className="flex items-start space-x-3 py-1">
+      <input
+        type="checkbox"
+        checked={value}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-1 h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+      />
+      <div className="text-sm">
+        <label className="font-medium cursor-pointer" style={{ color: "var(--text-primary)" }} onClick={() => onChange(!value)}>
+          {label}
+        </label>
+        {description && (
+          <p className="text-xs mt-0.5" style={{ color: "var(--text-secondary)" }}>
+            {description}
+          </p>
+        )}
+      </div>
     </div>
   );
 }

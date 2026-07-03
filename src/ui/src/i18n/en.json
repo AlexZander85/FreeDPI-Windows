@@ -112,6 +112,11 @@
     "dns_doh_url": "DNS-over-HTTPS URL",
     "dns_dot_addr": "DNS-over-TLS Address",
     "dns_cache_ttl": "DNS Cache TTL (s)",
+    "zero_config_title": "Whitelist Bypass (Zero-Config)",
+    "zero_config_enabled": "Enable Zero-Config Bypass",
+    "zero_config_enabled_desc": "Always route blocked resources through a masked Opera HTTPS CONNECT tunnel.",
+    "zero_config_auto_detect": "Automatic Whitelist Detection (Smart Bypass)",
+    "zero_config_auto_detect_desc": "Automatically trigger Opera tunnel when ISP transitions into a whitelist drop-all censorship mode.",
     "save": "Save",
     "saved": "Saved!",
     "reset": "Reset to Defaults"

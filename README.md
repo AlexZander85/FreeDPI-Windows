@@ -42,6 +42,8 @@
 *   🧩 **Split Tunnel 3-режима**: Blacklist (обходить всё, кроме указанного), Whitelist (обходить только указанное), Auto (авто-детект DPI-блокировок через Probe Module) — с CIDR-диапазонами и IPv6.
 *   🔄 **Hot-reload конфига**: TOML-конфиг и секция `[[strategies]]` обновляются на лету через `ArcSwap` без перезапуска службы.
 *   🌐 **REST API + AI-agent интеграция**: Полноценный HTTP API (Axum) на `127.0.0.1:11337` с `X-API-Key` аутентификацией — управление стратегиями, probe, тюнинг, routing overrides, split tunnel CRUD, чтение логов. Готов для интеграции с AI-агентами.
+*   🚀 **Zero-Config Обход & Детектор Белых Списков (Чебурнет-детектор)**: Умный автоматический обход режима жестких белых списков провайдера. Фоновый детектор совершает двухэтапные пробы (TCP Connect + TLS ClientHello с фейковым SNI) к контрольным канарейкам. При обнаружении drop-all режима бэкенд динамически активирует защищенный HTTPS CONNECT туннель через прокси-серверы Opera с маскировкой под Госуслуги, используя прогретый пул TLS-соединений для нулевой задержки.
+
 
 ## 🇬🇧 About
 
@@ -70,6 +72,8 @@
 *   🧩 **Split Tunnel 3-mode**: Blacklist (bypass everything except listed), Whitelist (bypass only listed), Auto (auto-detect DPI blocks via Probe Module) — with CIDR ranges and IPv6.
 *   🔄 **Hot-reload config**: TOML config and `[[strategies]]` section update at runtime via `ArcSwap` — no service restart required.
 *   🌐 **REST API + AI-agent integration**: Full HTTP API (Axum) on `127.0.0.1:11337` with `X-API-Key` authentication — strategy management, probe, tuning, routing overrides, split tunnel CRUD, log streaming. Ready for AI-agent integration.
+*   🚀 **Zero-Config Whitelist Bypass & Drop-All Detector**: Smart automated bypass for strict ISP whitelist censorship. A background detector runs two-stage probes (TCP Connect + TLS ClientHello with fake SNI) targeting positive/negative canaries. Upon drop-all whitelist detection, the backend dynamically spins up a masked Opera HTTPS CONNECT tunnel (pretending to be gosuslugi.ru) utilizing a pre-warmed connection pool for zero latency.
+
 
 ## 🏗️ Architecture
 

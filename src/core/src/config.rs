@@ -152,6 +152,9 @@ pub struct Config {
     /// T60: Adaptive Multi-Path Router config
     #[serde(default)]
     pub adaptive_router: crate::routing::adaptive_router::AdaptiveRouterConfig,
+    /// T63: Zero-Config Whitelist Bypass config
+    #[serde(default)]
+    pub zero_config: ZeroConfigConfig,
 }
 
 /// Desync секция конфигурации.
@@ -231,6 +234,7 @@ impl Default for Config {
             strategies: Vec::new(),
             proxy: ProxyConfig::default(),
             adaptive_router: crate::routing::adaptive_router::AdaptiveRouterConfig::default(),
+            zero_config: ZeroConfigConfig::default(),
         }
     }
 }
@@ -274,6 +278,7 @@ impl Config {
             proxy_config: self.proxy.clone(),
             dns_config: self.dns.clone(),
             adaptive_router_config: self.adaptive_router.clone(),
+            zero_config: self.zero_config.clone(),
         }
     }
 }
@@ -725,4 +730,67 @@ pub fn load_domains_from_file(path: &str) -> anyhow::Result<Vec<String>> {
 
     tracing::info!("T60: loaded {} domains from {path}", domains.len());
     Ok(domains)
+}
+
+/// T63: Конфигурация Zero-Config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZeroConfigConfig {
+    /// Включить Zero-Config движок.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Включить автоматическое определение режима белых списков.
+    #[serde(default)]
+    pub auto_detect: bool,
+    /// Путь к файлу со списком канареек.
+    #[serde(default = "default_canary_domains_path")]
+    pub canary_domains_path: String,
+    /// Интервал проверки в секундах.
+    #[serde(default = "default_detection_interval_secs")]
+    pub detection_interval_secs: u64,
+    /// Путь к файлу кэша Opera credentials.
+    #[serde(default = "default_opera_cache_path")]
+    pub opera_cache_path: String,
+    /// SNI для маскировки Opera over TCP.
+    #[serde(default = "default_opera_masquerade_sni")]
+    pub opera_masquerade_sni: String,
+    /// SNI для маскировки DoH запросов к Google.
+    #[serde(default = "default_doh_google_masquerade_sni")]
+    pub doh_google_masquerade_sni: String,
+    /// SNI для маскировки DoH запросов к Cloudflare.
+    #[serde(default = "default_doh_cloudflare_masquerade_sni")]
+    pub doh_cloudflare_masquerade_sni: String,
+}
+
+fn default_canary_domains_path() -> String {
+    "canary_domains.txt".into()
+}
+fn default_detection_interval_secs() -> u64 {
+    600
+}
+fn default_opera_cache_path() -> String {
+    "opera_credentials.json".into()
+}
+fn default_opera_masquerade_sni() -> String {
+    "gosuslugi.ru".into()
+}
+fn default_doh_google_masquerade_sni() -> String {
+    "translate.google.com".into()
+}
+fn default_doh_cloudflare_masquerade_sni() -> String {
+    "gosuslugi.ru".into()
+}
+
+impl Default for ZeroConfigConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_detect: false,
+            canary_domains_path: default_canary_domains_path(),
+            detection_interval_secs: default_detection_interval_secs(),
+            opera_cache_path: default_opera_cache_path(),
+            opera_masquerade_sni: default_opera_masquerade_sni(),
+            doh_google_masquerade_sni: default_doh_google_masquerade_sni(),
+            doh_cloudflare_masquerade_sni: default_doh_cloudflare_masquerade_sni(),
+        }
+    }
 }

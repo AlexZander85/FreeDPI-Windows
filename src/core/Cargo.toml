@@ -40,6 +40,12 @@ hmac = "0.12"
 aes-gcm = "0.10"
 aes = "0.8"
 cipher = "0.4"
+md-5 = { workspace = true }
+sha1 = { workspace = true }
+hex = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [features]
 default = []

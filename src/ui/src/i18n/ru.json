@@ -112,6 +112,11 @@
     "dns_doh_url": "DNS-over-HTTPS URL",
     "dns_dot_addr": "DNS-over-TLS адрес",
     "dns_cache_ttl": "TTL кэша DNS (с)",
+    "zero_config_title": "Обход белых списков (Zero-Config)",
+    "zero_config_enabled": "Включить Zero-Config обход",
+    "zero_config_enabled_desc": "Постоянно пропускать блокируемые ресурсы через зашифрованный HTTPS-туннель Opera прокси с маскировкой.",
+    "zero_config_auto_detect": "Автоматическое определение белых списков (умный обход)",
+    "zero_config_auto_detect_desc": "Автоматически включать туннель Opera при обнаружении перехода провайдера в режим белых списков (drop-all/чебурнет).",
     "save": "Сохранить",
     "saved": "Сохранено!",
     "reset": "Сбросить по умолчанию"
