@@ -402,9 +402,7 @@ fn extract_digest_param<'a>(header: &'a str, name: &str) -> Option<&'a str> {
         let end = stripped.find('"')?;
         Some(&stripped[..end])
     } else {
-        let end = rest
-            .find([',', ' ', '\n'])
-            .unwrap_or(rest.len());
+        let end = rest.find([',', ' ', '\n']).unwrap_or(rest.len());
         Some(&rest[..end])
     }
 }

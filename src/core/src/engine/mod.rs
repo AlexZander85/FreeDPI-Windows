@@ -114,6 +114,7 @@ pub struct ProcessingConfig {
     pub dns_config: crate::config::DnsConfig,
     pub adaptive_router_config: crate::routing::adaptive_router::AdaptiveRouterConfig,
     pub zero_config: crate::config::ZeroConfigConfig,
+    pub awg: crate::config::AwgConfig,
 }
 
 impl Default for ProcessingConfig {
@@ -134,6 +135,7 @@ impl Default for ProcessingConfig {
             adaptive_router_config: crate::routing::adaptive_router::AdaptiveRouterConfig::default(
             ),
             zero_config: crate::config::ZeroConfigConfig::default(),
+            awg: crate::config::AwgConfig::default(),
         }
     }
 }
@@ -164,6 +166,7 @@ pub struct ProcessingPipeline {
     #[allow(dead_code)]
     zero_config: Arc<crate::proxy::zero_config::ZeroConfigEngine>,
     adaptive_router: Arc<crate::routing::adaptive_router::AdaptiveRouter>,
+    awg_tunnel: ArcSwap<Option<Arc<crate::proxy::awg_tunnel::AwgTunnel>>>,
     /// Флаг наличия non-empty session ticket от сервера.
     /// Устанавливается после успешного TLS handshake, когда сервер
     /// прислал session ticket. Используется для 0-RTT resumption
@@ -391,6 +394,25 @@ impl ProcessingPipeline {
             config.adaptive_router_config.clone(),
         ));
 
+        let awg_tunnel_state = Arc::new(ArcSwap::from_pointee(None));
+        if config.awg.enabled {
+            let awg_config = config.awg.clone();
+            let engine_clone = packet_engine.clone();
+            let state_clone = awg_tunnel_state.clone();
+            tokio::spawn(async move {
+                tracing::info!("AWG: Starting userspace AmneziaWG tunnel...");
+                match crate::proxy::awg_tunnel::AwgTunnel::start(awg_config, engine_clone).await {
+                    Ok(tunnel) => {
+                        tracing::info!("AWG: Userspace AmneziaWG tunnel started successfully!");
+                        state_clone.store(Arc::new(Some(Arc::new(tunnel))));
+                    }
+                    Err(e) => {
+                        tracing::error!("AWG: Failed to start userspace AmneziaWG tunnel: {e:#}");
+                    }
+                }
+            });
+        }
+
         Ok(Self {
             packet_engine,
             fake_ip,
@@ -414,6 +436,7 @@ impl ProcessingPipeline {
             dns_proxy,
             zero_config,
             adaptive_router,
+            awg_tunnel: Arc::try_unwrap(awg_tunnel_state).unwrap(),
             has_non_empty_session_ticket: false,
         })
     }
@@ -535,6 +558,7 @@ impl ProcessingPipeline {
             dns_proxy,
             zero_config,
             adaptive_router,
+            awg_tunnel: ArcSwap::from_pointee(None),
             has_non_empty_session_ticket: false,
         }
     }
@@ -1079,7 +1103,24 @@ impl ProcessingPipeline {
                     }
                     crate::routing::adaptive_router::RoutingDecision::Proxy => {
                         if cp.protocol == 17 {
-                            // Drop UDP/QUIC to force TCP fallback
+                            let awg_guard = self.awg_tunnel.load();
+                            if let Some(ref awg) = **awg_guard {
+                                debug!(
+                                    "AdaptiveRouter decided Proxy: routing UDP/QUIC packet to {}:{} via Userspace AmneziaWG",
+                                    cp.dst_ip, cp.dst_port
+                                );
+                                let awg_clone = Arc::clone(awg);
+                                let data_copy = captured.data.clone().to_vec();
+                                crate::Runtime::global().io.spawn(async move {
+                                    if let Err(e) = awg_clone.send_ip_packet(data_copy).await {
+                                        error!("AWG: failed to send packet: {e:#}");
+                                    }
+                                });
+                                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                                return Ok(PacketDecision::Drop);
+                            }
+
+                            // Drop UDP/QUIC to force TCP fallback if AWG is not enabled/active
                             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
                             return Ok(PacketDecision::Drop);
                         }

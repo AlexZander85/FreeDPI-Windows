@@ -1,3 +1,5 @@
+pub mod awg_obfuscator;
+pub mod awg_tunnel;
 pub mod http_tunnel;
 pub mod redirector;
 pub mod rewrite;

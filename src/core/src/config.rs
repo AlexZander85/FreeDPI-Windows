@@ -155,6 +155,9 @@ pub struct Config {
     /// T63: Zero-Config Whitelist Bypass config
     #[serde(default)]
     pub zero_config: ZeroConfigConfig,
+    /// AmneziaWG configuration
+    #[serde(default)]
+    pub awg: AwgConfig,
 }
 
 /// Desync секция конфигурации.
@@ -235,6 +238,7 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             adaptive_router: crate::routing::adaptive_router::AdaptiveRouterConfig::default(),
             zero_config: ZeroConfigConfig::default(),
+            awg: AwgConfig::default(),
         }
     }
 }
@@ -279,6 +283,7 @@ impl Config {
             dns_config: self.dns.clone(),
             adaptive_router_config: self.adaptive_router.clone(),
             zero_config: self.zero_config.clone(),
+            awg: self.awg.clone(),
         }
     }
 }
@@ -791,6 +796,97 @@ impl Default for ZeroConfigConfig {
             opera_masquerade_sni: default_opera_masquerade_sni(),
             doh_google_masquerade_sni: default_doh_google_masquerade_sni(),
             doh_cloudflare_masquerade_sni: default_doh_cloudflare_masquerade_sni(),
+        }
+    }
+}
+
+/// T63: AmneziaWG configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AwgConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_awg_endpoint")]
+    pub endpoint: String,
+    #[serde(default)]
+    pub private_key: String,
+    #[serde(default)]
+    pub public_key: String,
+    #[serde(default)]
+    pub address: String, // e.g. "10.0.0.2/32"
+    #[serde(default = "default_awg_jc")]
+    pub jc: usize,
+    #[serde(default = "default_awg_jmin")]
+    pub jmin: usize,
+    #[serde(default = "default_awg_jmax")]
+    pub jmax: usize,
+    #[serde(default = "default_awg_s1")]
+    pub s1: usize,
+    #[serde(default = "default_awg_s2")]
+    pub s2: usize,
+    #[serde(default)]
+    pub s3: usize,
+    #[serde(default)]
+    pub s4: usize,
+    #[serde(default = "default_awg_h1")]
+    pub h1: u32,
+    #[serde(default = "default_awg_h2")]
+    pub h2: u32,
+    #[serde(default = "default_awg_h3")]
+    pub h3: u32,
+    #[serde(default = "default_awg_h4")]
+    pub h4: u32,
+}
+
+fn default_awg_endpoint() -> String {
+    "engage.cloudflareclient.com:2408".to_string()
+}
+fn default_awg_jc() -> usize {
+    4
+}
+fn default_awg_jmin() -> usize {
+    40
+}
+fn default_awg_jmax() -> usize {
+    1000
+}
+fn default_awg_s1() -> usize {
+    120
+}
+fn default_awg_s2() -> usize {
+    60
+}
+fn default_awg_h1() -> u32 {
+    512345
+}
+fn default_awg_h2() -> u32 {
+    512346
+}
+fn default_awg_h3() -> u32 {
+    512347
+}
+fn default_awg_h4() -> u32 {
+    512348
+}
+
+impl Default for AwgConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_awg_endpoint(),
+            private_key: String::new(),
+            public_key: String::new(),
+            address: "10.0.0.2/32".to_string(),
+            jc: default_awg_jc(),
+            jmin: default_awg_jmin(),
+            jmax: default_awg_jmax(),
+            s1: default_awg_s1(),
+            s2: default_awg_s2(),
+            s3: 0,
+            s4: 0,
+            h1: default_awg_h1(),
+            h2: default_awg_h2(),
+            h3: default_awg_h3(),
+            h4: default_awg_h4(),
         }
     }
 }

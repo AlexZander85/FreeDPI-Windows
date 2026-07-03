@@ -738,6 +738,7 @@ dependencies = [
  "native-tls",
  "num_cpus",
  "pnet_packet",
+ "rand",
  "rand_chacha",
  "rand_core",
  "rayon",
@@ -760,6 +761,7 @@ dependencies = [
  "uuid",
  "windivert",
  "windows",
+ "wireguard-sans-io",
 ]
 
 [[package]]
@@ -2977,6 +2979,12 @@ checksum = "f593a95398737aeed53e489c785df13f3618e41dbcd6718c6addbf1395aa6876"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "wireguard-sans-io"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4fc121e899ba74996f51ee00b16c12968d7570c83c64642e61bf7843cd21771"
 
 [[package]]
 name = "wit-bindgen"
