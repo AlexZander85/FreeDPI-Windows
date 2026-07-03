@@ -33,6 +33,11 @@ use windivert::WinDivert;
 /// Реалистичный размер слота пула: обычный MTU + запас (не 65535).
 const POOLED_BUF_SIZE: usize = 2048;
 
+/// T62: Максимальный размер batch (пакетов за один syscall).
+const RECV_BATCH_SIZE: usize = 64;
+/// T62: Размер буфера для batch recv (64 пакета × 2048 байт).
+const RECV_BATCH_BUFFER_SIZE: usize = RECV_BATCH_SIZE * 2048; // 128 KB
+
 /// Lock-free пул переиспользуемых `BytesMut` для single-copy recv.
 ///
 /// ## single-copy
@@ -525,6 +530,170 @@ impl PacketEngine {
             packets_dropped: self.stats.packets_dropped.load(Ordering::Relaxed),
         }
     }
+
+    /// T62: Пакетный приём — до 64 пакетов за один syscall.
+    ///
+    /// WinDivertRecvEx возвращает немедленно, если есть хотя бы 1 пакет.
+    /// При высокой нагрузке возвращает полные батчи (adaptive batching).
+    ///
+    /// # Arguments
+    /// * `pool` — buffer pool для аллокации Bytes на каждый пакет
+    ///
+    /// # Returns
+    /// `Vec<(bytes::Bytes, WinDivertAddress)>` — до 64 пакетов
+    pub fn recv_batch(
+        &self,
+        pool: &PacketBufferPool,
+    ) -> Result<Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)>> {
+        let guard = self.divert.load();
+        let Some(ref divert) = **guard else {
+            anyhow::bail!("WinDivert not initialized (API-only mode)");
+        };
+
+        // 1. Выделяем один большой буфер для batch (thread-local reuse)
+        thread_local! {
+            static BATCH_BUF: std::cell::RefCell<Vec<u8>> =
+                std::cell::RefCell::new(vec![0u8; RECV_BATCH_BUFFER_SIZE]);
+        }
+
+        let packets = BATCH_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+
+            // 2. Вызываем WinDivertRecvEx — до 64 пакетов за 1 syscall
+            match divert.recv_ex(&mut buf[..], RECV_BATCH_SIZE as u8) {
+                Ok(pkts) => {
+                    // 3. Для каждого пакета: берём BytesMut из pool, memcpy, freeze
+                    let mut result = Vec::with_capacity(pkts.len());
+                    for pkt in pkts {
+                        let mut data_buf = pool.acquire();
+                        let len = pkt.data.len();
+
+                        if len > data_buf.capacity() {
+                            // Jumbo frame — аллоцируем под размер
+                            data_buf = bytes::BytesMut::from(&pkt.data[..]);
+                        } else {
+                            // memcpy из batch buffer в pool buffer (~50ns для 1500B)
+                            data_buf.resize(len, 0);
+                            data_buf[..len].copy_from_slice(&pkt.data);
+                        }
+
+                        result.push((data_buf.freeze(), pkt.address));
+                    }
+                    Ok(result)
+                }
+                Err(e) => Err(anyhow::anyhow!("WinDivertRecvEx failed: {}", e)),
+            }
+        })?;
+
+        self.stats.packets_received.fetch_add(packets.len() as u64, Ordering::Relaxed);
+        Ok(packets)
+    }
+
+    /// T62: Пакетная отправка — до 64 пакетов за один syscall.
+    ///
+    /// # Arguments
+    /// * `packets` — вектор (data, address) для отправки
+    ///
+    /// # Returns
+    /// Количество успешно отправленных пакетов.
+    pub fn send_batch(
+        &self,
+        packets: &[(bytes::Bytes, WinDivertAddress<NetworkLayer>)],
+    ) -> Result<usize> {
+        if packets.is_empty() {
+            return Ok(0);
+        }
+
+        let guard = self.divert.load();
+        let Some(ref divert) = **guard else {
+            anyhow::bail!("WinDivert not initialized (API-only mode)");
+        };
+
+        let mut total_sent = 0;
+        let mut wd_packets = Vec::with_capacity(packets.len());
+
+        for (data, addr) in packets {
+            wd_packets.push(WinDivertPacket {
+                address: addr.clone(),
+                data: std::borrow::Cow::Borrowed(&data[..]),
+            });
+        }
+
+        // Вызываем send_ex с массивом WinDivertPacket
+        match divert.send_ex(&wd_packets) {
+            Ok(n) => {
+                total_sent = n as usize;
+                self.stats.packets_sent.fetch_add(total_sent as u64, Ordering::Relaxed);
+            }
+            Err(e) => {
+                // Fallback: отправляем по одному
+                tracing::warn!("send_ex failed ({}), falling back to individual send", e);
+                for (data, addr) in packets {
+                    let wd_packet = WinDivertPacket {
+                        address: addr.clone(),
+                        data: std::borrow::Cow::Borrowed(data),
+                    };
+                    if divert.send(&wd_packet).is_ok() {
+                        total_sent += 1;
+                        self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        Ok(total_sent)
+    }
+
+    /// T62: Пакетная инъекция (impostor packets) — до 64 за один syscall.
+    pub fn inject_batch_via_divert(
+        &self,
+        packets: &[(bytes::Bytes, WinDivertAddress<NetworkLayer>)],
+    ) -> Result<usize> {
+        if packets.is_empty() {
+            return Ok(0);
+        }
+
+        let guard = self.divert.load();
+        let Some(ref divert) = **guard else {
+            anyhow::bail!("WinDivert not initialized");
+        };
+
+        let mut wd_packets = Vec::with_capacity(packets.len());
+        for (data, addr) in packets {
+            let mut a = addr.clone();
+            a.set_impostor(true);
+            wd_packets.push(WinDivertPacket {
+                address: a,
+                data: std::borrow::Cow::Borrowed(&data[..]),
+            });
+        }
+
+        match divert.send_ex(&wd_packets) {
+            Ok(n) => {
+                let sent = n as usize;
+                self.stats.packets_injected.fetch_add(sent as u64, Ordering::Relaxed);
+                Ok(sent)
+            }
+            Err(e) => {
+                // Fallback: индивидуальная отправка
+                tracing::warn!("inject_batch send_ex failed ({}), fallback", e);
+                let mut sent = 0;
+                for (data, addr) in packets {
+                    let mut a = addr.clone();
+                    a.set_impostor(true);
+                    let wd_packet = WinDivertPacket {
+                        address: a,
+                        data: std::borrow::Cow::Borrowed(data),
+                    };
+                    if divert.send(&wd_packet).is_ok() {
+                        sent += 1;
+                    }
+                }
+                self.stats.packets_injected.fetch_add(sent as u64, Ordering::Relaxed);
+                Ok(sent)
+            }
+        }
+    }
 }
 
 /// Копия статистики (не-atomic, для чтения).
@@ -844,5 +1013,46 @@ mod tests {
         // Пул пуст
         let overflow = pool.acquire();
         assert_eq!(overflow.len(), POOLED_BUF_SIZE);
+    }
+}
+
+#[cfg(test)]
+mod t62_tests {
+    use super::*;
+
+    #[test]
+    fn test_recv_batch_buffer_size() {
+        // 64 packets × 2048 bytes = 128 KB
+        assert_eq!(RECV_BATCH_BUFFER_SIZE, 131_072);
+        assert_eq!(RECV_BATCH_SIZE, 64);
+    }
+
+    #[test]
+    fn test_batch_buffers_capacity() {
+        // Проверяем что Vec::with_capacity(64) не reallocates в типичном случае
+        let forward_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> = Vec::with_capacity(64);
+        assert_eq!(forward_batch.capacity(), 64);
+
+        let inject_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> = Vec::with_capacity(64);
+        assert_eq!(inject_batch.capacity(), 64);
+    }
+
+    #[test]
+    fn test_send_batch_empty() {
+        // send_batch с пустым вектором должен возвращать Ok(0) без syscall
+        let engine = PacketEngine::new_api_only();
+        let empty: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> = Vec::new();
+        let result = engine.send_batch(&empty);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_inject_batch_empty() {
+        let engine = PacketEngine::new_api_only();
+        let empty: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> = Vec::new();
+        let result = engine.inject_batch_via_divert(&empty);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
     }
 }

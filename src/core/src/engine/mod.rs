@@ -111,6 +111,8 @@ pub struct ProcessingConfig {
     pub techniques: Vec<DesyncTechnique>,
     pub strategies: Vec<crate::config::StrategyProfileConfig>,
     pub proxy_config: crate::config::ProxyConfig,
+    pub dns_config: crate::config::DnsConfig,
+    pub adaptive_router_config: crate::routing::adaptive_router::AdaptiveRouterConfig,
 }
 
 impl Default for ProcessingConfig {
@@ -127,6 +129,9 @@ impl Default for ProcessingConfig {
             techniques: Vec::new(),
             strategies: Vec::new(),
             proxy_config: crate::config::ProxyConfig::default(),
+            dns_config: crate::config::DnsConfig::default(),
+            adaptive_router_config: crate::routing::adaptive_router::AdaptiveRouterConfig::default(
+            ),
         }
     }
 }
@@ -152,7 +157,9 @@ pub struct ProcessingPipeline {
     /// Один пул на все workers (ArrayQueue — lock-free MPMC, безопасно для concurrent access).
     buf_pool: Arc<PacketBufferPool>,
     redirect_table: Arc<crate::desync::redirect_table::RedirectTable>,
-    socks_redirector: Arc<crate::socks::redirector::SocksRedirector>,
+    socks_redirector: Arc<crate::proxy::redirector::SocksRedirector>,
+    dns_proxy: Arc<crate::dns::dns_proxy::DnsProxyEngine>,
+    adaptive_router: Arc<crate::routing::adaptive_router::AdaptiveRouter>,
     /// Флаг наличия non-empty session ticket от сервера.
     /// Устанавливается после успешного TLS handshake, когда сервер
     /// прислал session ticket. Используется для 0-RTT resumption
@@ -295,16 +302,48 @@ impl ProcessingPipeline {
         let redirect_table = Arc::new(crate::desync::redirect_table::RedirectTable::new());
 
         // Запуск SOCKS5-редиректора в бэкграунде
-        let redirector = Arc::new(crate::socks::redirector::SocksRedirector::new(
+        let proxy_pool = Arc::new(crate::proxy::types::OperaProxyPool::new(vec![
+            "185.167.238.201:1080".parse().unwrap(),
+            "185.167.238.202:1080".parse().unwrap(),
+            "185.167.238.203:1080".parse().unwrap(),
+            "185.167.238.204:1080".parse().unwrap(),
+            "185.167.238.205:1080".parse().unwrap(),
+        ]));
+        let redirector = Arc::new(crate::proxy::redirector::SocksRedirector::new(
             redirect_table.clone(),
+            proxy_pool.clone(),
             config.proxy_config.custom_proxy.clone(),
         ));
         let redirector_clone = redirector.clone();
         tokio::spawn(async move {
-            if let Err(e) = redirector_clone.run(17650).await {
+            if let Err(e) = redirector_clone.bind_and_run().await {
                 tracing::error!("Failed to start SocksRedirector: {}", e);
             }
         });
+
+        let dns_config_doh_url = config.dns_config.doh_url.clone();
+        let dns_proxy = Arc::new(crate::dns::dns_proxy::DnsProxyEngine::new(
+            crate::dns::dns_proxy::DnsProxyConfig {
+                enabled: true,
+                adblock_enabled: false,
+                doh_servers: vec![dns_config_doh_url],
+                system_dns_servers: vec!["8.8.8.8".to_string()],
+                censored_domains: Vec::new(),
+                adblock_domains: vec![
+                    "doubleclick.net".into(),
+                    "googlesyndication.com".into(),
+                    "googleadservices.com".into(),
+                    "google-analytics.com".into(),
+                ],
+                ttl: config.dns_config.cache_ttl as u32,
+            },
+            fake_ip.clone(),
+            geo_router.clone(),
+        ));
+
+        let adaptive_router = Arc::new(crate::routing::adaptive_router::AdaptiveRouter::new(
+            config.adaptive_router_config.clone(),
+        ));
 
         Ok(Self {
             packet_engine,
@@ -326,6 +365,8 @@ impl ProcessingPipeline {
             buf_pool,
             redirect_table,
             socks_redirector: redirector,
+            dns_proxy,
+            adaptive_router,
             has_non_empty_session_ticket: false,
         })
     }
@@ -381,15 +422,45 @@ impl ProcessingPipeline {
         }
 
         let redirect_table = Arc::new(crate::desync::redirect_table::RedirectTable::new());
-        let redirector = Arc::new(crate::socks::redirector::SocksRedirector::new(
+        let proxy_pool = Arc::new(crate::proxy::types::OperaProxyPool::new(vec![
+            "185.167.238.201:1080".parse().unwrap(),
+        ]));
+        let redirector = Arc::new(crate::proxy::redirector::SocksRedirector::new(
             redirect_table.clone(),
+            proxy_pool.clone(),
             config.proxy_config.custom_proxy.clone(),
+        ));
+
+        let fake_ip = Arc::new(FakeIpManager::new(1000));
+        let geo_router = Arc::new(GeoRouter::new_default());
+        let dns_config_doh_url = config.dns_config.doh_url.clone();
+        let dns_proxy = Arc::new(crate::dns::dns_proxy::DnsProxyEngine::new(
+            crate::dns::dns_proxy::DnsProxyConfig {
+                enabled: true,
+                adblock_enabled: false,
+                doh_servers: vec![dns_config_doh_url],
+                system_dns_servers: vec!["8.8.8.8".to_string()],
+                censored_domains: Vec::new(),
+                adblock_domains: vec![
+                    "doubleclick.net".into(),
+                    "googlesyndication.com".into(),
+                    "googleadservices.com".into(),
+                    "google-analytics.com".into(),
+                ],
+                ttl: config.dns_config.cache_ttl as u32,
+            },
+            fake_ip.clone(),
+            geo_router.clone(),
+        ));
+
+        let adaptive_router = Arc::new(crate::routing::adaptive_router::AdaptiveRouter::new(
+            config.adaptive_router_config.clone(),
         ));
 
         Self {
             packet_engine,
-            fake_ip: Arc::new(FakeIpManager::new(1000)),
-            geo_router: Arc::new(GeoRouter::new_default()),
+            fake_ip,
+            geo_router,
             hop_tab: Arc::new(HopTab::new()),
             conntrack: Arc::new(Conntrack::new(Duration::from_secs(120))),
             profile_registry,
@@ -406,11 +477,13 @@ impl ProcessingPipeline {
             buf_pool,
             redirect_table,
             socks_redirector: redirector,
+            dns_proxy,
+            adaptive_router,
             has_non_empty_session_ticket: false,
         }
     }
 
-    pub fn socks_redirector(&self) -> &Arc<crate::socks::redirector::SocksRedirector> {
+    pub fn socks_redirector(&self) -> &Arc<crate::proxy::redirector::SocksRedirector> {
         &self.socks_redirector
     }
 
@@ -511,61 +584,192 @@ impl ProcessingPipeline {
     }
 
     pub async fn run(self: Arc<Self>, shutdown: tokio::sync::broadcast::Receiver<()>) {
-        debug!("ProcessingPipeline started");
+        debug!("ProcessingPipeline started (T62 batch mode)");
 
-        let n_workers = num_cpus::get().max(2);
+        let n_workers = num_cpus::get().clamp(2, 16);
         let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut worker_handles = Vec::with_capacity(n_workers);
 
-        for _ in 0..n_workers {
+        for id in 0..n_workers {
             let engine = self.packet_engine.clone();
-            let stats = self.stats.clone();
-            let self_clone = self.clone();
+            let pipeline = self.clone();
             let pool = self.buf_pool.clone();
             let shutdown_flag = shutdown_flag.clone();
             let mut shutdown_rx = shutdown.resubscribe();
 
-            let handle = std::thread::spawn(move || {
-                loop {
-                    if shutdown_rx.try_recv().is_ok() || shutdown_flag.load(Ordering::Acquire) {
-                        shutdown_flag.store(true, Ordering::Release);
-                        break;
-                    }
-                    match engine.recv_blocking(&pool) {
-                        Ok((data, addr)) => {
-                            stats.total_received.fetch_add(1, Ordering::Relaxed);
-                            let captured = CapturedPacket { data, addr };
-
-                            match self_clone.process_one_sync(&captured) {
-                                Ok(decision) => {
-                                    self_clone.execute_decision_sync(decision, &captured);
-                                }
-                                Err(e) => {
-                                    debug!("Packet processing error (forwarding fallback): {}", e);
-                                    self_clone.stats.errors.fetch_add(1, Ordering::Relaxed);
-                                    self_clone.forward_packet_sync(&captured);
-                                }
-                            }
-                            // Release the buffer back to pool
-                            self_clone.buf_pool.release_bytes(captured.data);
+            let handle = std::thread::Builder::new()
+                .name(format!("fp-worker-{}", id))
+                .spawn(move || {
+                    loop {
+                        if shutdown_rx.try_recv().is_ok() || shutdown_flag.load(Ordering::Acquire) {
+                            shutdown_flag.store(true, Ordering::Release);
+                            break;
                         }
-                        Err(e) => {
-                            // On read error, log and wait briefly
-                            error!("WinDivert recv error: {}", e);
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
+                        Self::worker_loop(id, engine.clone(), pipeline.clone(), pool.clone(), shutdown_flag.clone());
                     }
-                }
-            });
-
+                })
+                .expect("spawn worker");
             worker_handles.push(handle);
         }
 
-        // Wait for all workers to finish
+        // Wait for shutdown
+        let mut shutdown_rx = shutdown.resubscribe();
+        let _ = shutdown_rx.recv().await;
+        shutdown_flag.store(true, Ordering::Release);
         for handle in worker_handles {
             let _ = handle.join();
         }
+
         debug!("ProcessingPipeline stopped");
+    }
+
+    /// T62: Worker loop с batch recv + batch send.
+    fn worker_loop(
+        id: usize,
+        engine: Arc<PacketEngine>,
+        pipeline: Arc<Self>,
+        pool: Arc<PacketBufferPool>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let mut empty_spins: u32 = 0;
+
+        let mut forward_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> = Vec::with_capacity(64);
+        let mut inject_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> = Vec::with_capacity(64);
+
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+
+            // 1. Batch recv — до 64 пакетов за 1 syscall
+            let packets = match engine.recv_batch(&pool) {
+                Ok(pkts) => {
+                    if pkts.is_empty() {
+                        empty_spins += 1;
+                        if empty_spins < 100 {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_micros(100));
+                            empty_spins = 0;
+                        }
+                        continue;
+                    }
+                    empty_spins = 0;
+                    pkts
+                }
+                Err(e) => {
+                    if !engine.has_divert() {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    tracing::error!("recv_batch error: {}", e);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+            };
+
+            pipeline.stats.total_received.fetch_add(packets.len() as u64, Ordering::Relaxed);
+
+            // 2. Очищаем batch buffers
+            forward_batch.clear();
+            inject_batch.clear();
+
+            // 3. Обрабатываем каждый пакет
+            for (data, addr) in packets {
+                let captured = CapturedPacket { data: data.clone(), addr: addr.clone() };
+
+                match pipeline.process_one_sync(&captured) {
+                    Ok(decision) => {
+                        match decision {
+                            PacketDecision::Forward => {
+                                // Накапливаем для batch send (оригинальный буфер освободится в конце)
+                                forward_batch.push((data, addr));
+                            }
+                            PacketDecision::Modify(modified) => {
+                                // Исходный буфер больше не нужен — возвращаем в пул
+                                pool.release_bytes(data);
+                                forward_batch.push((modified, addr));
+                            }
+                            PacketDecision::Desync { inject, modified, inject_protocol, inter_delay_us } => {
+                                match inject_protocol {
+                                    InjectProtocol::Tcp => {
+                                        for (i, inject_pkt) in inject.iter().enumerate() {
+                                            if i > 0 && inter_delay_us > 0 {
+                                                if !inject_batch.is_empty() {
+                                                    let _ = engine.inject_batch_via_divert(&inject_batch);
+                                                    for (d, _) in &inject_batch {
+                                                        pool.release_bytes(d.clone());
+                                                    }
+                                                    inject_batch.clear();
+                                                }
+                                                std::thread::sleep(std::time::Duration::from_micros(inter_delay_us as u64));
+                                            }
+                                            inject_batch.push((inject_pkt.clone(), addr.clone()));
+                                        }
+                                    }
+                                    InjectProtocol::Udp => {
+                                        for (i, inject_pkt) in inject.iter().enumerate() {
+                                            if i > 0 && inter_delay_us > 0 {
+                                                std::thread::sleep(std::time::Duration::from_micros(inter_delay_us as u64));
+                                            }
+                                            if let Err(e) = engine.inject_raw_udp(inject_pkt) {
+                                                tracing::warn!("Failed to inject UDP desync packet: {}", e);
+                                            }
+                                            pool.release_bytes(inject_pkt.clone());
+                                            pipeline.stats.fake_ch_injected.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+
+                                // Обработка оригинального/модифицированного пакета
+                                if let Some(m) = modified {
+                                    forward_batch.push((m, addr));
+                                    pool.release_bytes(data);
+                                } else {
+                                    // Если модификации нет, то оригинальный пакет пробрасывается дальше
+                                    forward_batch.push((data, addr));
+                                }
+                            }
+                            PacketDecision::Drop => {
+                                pool.release_bytes(data);
+                                pipeline.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Packet processing error: {}", e);
+                        forward_batch.push((data, addr));
+                        pipeline.stats.errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            // 4. Batch send — все forward/modify пакеты за 1 syscall
+            if !forward_batch.is_empty() {
+                let sent = engine.send_batch(&forward_batch);
+                if let Ok(n) = sent {
+                    pipeline.stats.forwarded.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                // Возвращаем буферы в пул
+                for (data, _) in &forward_batch {
+                    pool.release_bytes(data.clone());
+                }
+            }
+
+            // 5. Batch inject — все impostor пакеты за 1 syscall
+            if !inject_batch.is_empty() {
+                let sent = engine.inject_batch_via_divert(&inject_batch);
+                if let Ok(n) = sent {
+                    pipeline.stats.fake_ch_injected.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                // Возвращаем буферы в пул
+                for (data, _) in &inject_batch {
+                    pool.release_bytes(data.clone());
+                }
+            }
+        }
+
+        tracing::debug!("Worker {} stopped", id);
     }
 
     // ──────────────────────────────────────────────
@@ -600,6 +804,7 @@ impl ProcessingPipeline {
 
     /// Sync version: send packet via WinDivert (no spawn_blocking).
     /// После отправки возвращает буфер в пул через release_bytes.
+    #[allow(dead_code)]
     fn send_packet_sync(&self, packet: bytes::Bytes, addr: &WinDivertAddress<NetworkLayer>) {
         let result = self.packet_engine.send_blocking(&packet, addr);
         match result {
@@ -616,12 +821,14 @@ impl ProcessingPipeline {
     }
 
     /// Sync version: forward original (same as send_packet_sync).
+    #[allow(dead_code)]
     fn forward_packet_sync(&self, captured: &CapturedPacket) {
         self.send_packet_sync(captured.data.clone(), &captured.addr);
     }
 
     /// Sync version: inject TCP fake via raw socket (no spawn_blocking).
     /// После инжекта возвращает буфер в пул.
+    #[allow(dead_code)]
     fn inject_tcp_packet_sync(&self, packet: bytes::Bytes, addr: &WinDivertAddress<NetworkLayer>) {
         let result = self.packet_engine.inject_via_divert(&packet, addr);
         match result {
@@ -638,9 +845,32 @@ impl ProcessingPipeline {
 
     /// Sync version: process_one (calls sync sub-methods directly).
     fn process_one_sync(&self, captured: &CapturedPacket) -> Result<PacketDecision, anyhow::Error> {
+        self.process_one_sync_dispatch(captured)
+    }
+
+    pub(crate) fn process_one_sync_dispatch(
+        &self,
+        captured: &CapturedPacket,
+    ) -> Result<PacketDecision, anyhow::Error> {
         let classification = Classifier::classify(&captured.data);
 
-        // T59: Перехватываем пакеты обратного пути от локального редиректора (src_port == 17650)
+        // 1. DNS (UDP:53) check
+        if let Classification::Dns(ref cp) = classification {
+            if cp.dst_port == 53 && cp.protocol == 17 {
+                let rt = crate::Runtime::global();
+                if let Some(resp_data) =
+                    rt.block_on(self.dns_proxy.handle_dns_query(&captured.data))
+                {
+                    let mut addr = captured.addr.clone();
+                    addr.set_outbound(false); // Reinject as inbound response
+                    let _ = self.packet_engine.inject_via_divert(&resp_data, &addr);
+                    self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    return Ok(PacketDecision::Drop); // Drop original query
+                }
+            }
+        }
+
+        // 2. Return path from SocksRedirector (loopback, src_port == 17650)
         if let Classification::Other(ref cp) = classification {
             if cp.src_port == 17650 {
                 if let Some(entry) = self.redirect_table.get(cp.dst_port) {
@@ -649,22 +879,152 @@ impl ProcessingPipeline {
                         entry.orig_dst_ip,
                         entry.orig_dst_port
                     );
-                    let modified = crate::desync::rewrite_src_addr(
+                    let modified = crate::proxy::rewrite::rewrite_src_addr(
                         &captured.data,
                         entry.orig_dst_ip,
                         entry.orig_dst_port,
                     )?;
-                    return Ok(PacketDecision::Modify(modified));
+                    return Ok(PacketDecision::Modify(modified.into()));
                 }
             }
         }
 
+        // 3. Fake IP traffic (destination is 10.x.x.x)
+        if let Classification::Other(ref cp) = classification {
+            if cp.protocol == 6 {
+                if let IpAddr::V4(v4) = cp.dst_ip {
+                    if crate::dns::fakeip::FakeIpManager::is_fake_ip(&v4) {
+                        return self.process_fake_ip_traffic(captured, cp);
+                    }
+                }
+            }
+        }
+        if let Classification::Tls(ref cp) | Classification::Http(ref cp) = classification {
+            if cp.protocol == 6 {
+                if let IpAddr::V4(v4) = cp.dst_ip {
+                    if crate::dns::fakeip::FakeIpManager::is_fake_ip(&v4) {
+                        return self.process_fake_ip_traffic(captured, cp);
+                    }
+                }
+            }
+        }
+
+        // 4. Opera IP protection (apply desync when connecting to Opera proxies)
+        if let Classification::Other(ref cp) = classification {
+            if cp.protocol == 6 {
+                let is_syn = if let Some(ip) = crate::desync::parse_ip_header(&captured.data) {
+                    let tcp_data = &captured.data[ip.header_len()..];
+                    if let Some(tcp) = crate::desync::parse_tcp_packet(tcp_data) {
+                        (tcp.flags & 0x02) != 0 && (tcp.flags & 0x10) == 0
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if is_syn && self.socks_redirector.proxy_pool.is_known_ip(&cp.dst_ip) {
+                    return self.process_generic_tcp(captured, cp);
+                }
+            }
+        }
+
+        // 5. Adaptive Routing decision
+        if let Classification::Tls(ref cp)
+        | Classification::Http(ref cp)
+        | Classification::Quic(ref cp)
+        | Classification::Other(ref cp) = classification
+        {
+            if cp.protocol == 6 || cp.protocol == 17 {
+                if self.config.only_outbound && !is_outbound_cached(cp.src_ip) {
+                    return Ok(PacketDecision::Forward);
+                }
+
+                let domain = self.fake_ip.lookup(&cp.dst_ip);
+                let is_blocked = if let Some(ref d) = domain {
+                    let route = self.geo_router.resolve(d, Some(cp.dst_ip));
+                    route.needs_desync()
+                } else {
+                    let route = self.geo_router.resolve("unknown", Some(cp.dst_ip));
+                    route.needs_desync()
+                };
+                let is_geo_blocked = if let Some(ref d) = domain {
+                    let region = self.geo_router.classify(d, Some(cp.dst_ip));
+                    matches!(
+                        region,
+                        crate::routing::GeoRegion::Europe | crate::routing::GeoRegion::UnitedStates
+                    )
+                } else {
+                    let region = self.geo_router.classify("unknown", Some(cp.dst_ip));
+                    matches!(
+                        region,
+                        crate::routing::GeoRegion::Europe | crate::routing::GeoRegion::UnitedStates
+                    )
+                };
+                let has_sni_or_host = match &classification {
+                    Classification::Tls(_) | Classification::Http(_) => true,
+                    _ => false,
+                };
+
+                let decision = self.adaptive_router.decide(
+                    domain.as_deref(),
+                    is_blocked,
+                    is_geo_blocked,
+                    has_sni_or_host,
+                    cp.protocol,
+                    &self.auto_tune.lock().unwrap(),
+                    "outbound_tls",
+                );
+
+                match decision {
+                    crate::routing::adaptive_router::RoutingDecision::Direct => {
+                        return Ok(PacketDecision::Forward);
+                    }
+                    crate::routing::adaptive_router::RoutingDecision::Drop => {
+                        self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                        return Ok(PacketDecision::Drop);
+                    }
+                    crate::routing::adaptive_router::RoutingDecision::Proxy => {
+                        if cp.protocol == 17 {
+                            // Drop UDP/QUIC to force TCP fallback
+                            self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                            return Ok(PacketDecision::Drop);
+                        }
+                        tracing::debug!(
+                            "AdaptiveRouter decided Proxy fallback for connection to {}:{}",
+                            cp.dst_ip,
+                            cp.dst_port
+                        );
+                        self.redirect_table.insert(
+                            cp.src_port,
+                            crate::desync::redirect_table::RedirectEntry {
+                                orig_dst_ip: cp.dst_ip,
+                                orig_dst_port: cp.dst_port,
+                                domain,
+                                created_at: std::time::Instant::now(),
+                            },
+                        );
+                        let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+                        let modified = crate::proxy::rewrite::rewrite_dst_addr(
+                            &captured.data,
+                            localhost,
+                            17650,
+                        )?;
+                        self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                        return Ok(PacketDecision::Modify(modified.into()));
+                    }
+                    crate::routing::adaptive_router::RoutingDecision::Desync => {
+                        // Continue to standard desync handling below
+                    }
+                }
+            }
+        }
+
+        // Fallback: run standard classification (TLS, HTTP, QUIC, generic TCP desync)
         match classification {
             Classification::Tls(cp) if cp.dst_port == self.config.desync_port => {
                 if self.config.only_outbound && !is_outbound_cached(cp.src_ip) {
                     return Ok(PacketDecision::Forward);
                 }
-                // Quick pre-filter: check and set desync_applied atomically using conntrack write lock
                 let conn_key = crate::conntrack::ConnKey::new(
                     cp.src_ip,
                     cp.dst_ip,
@@ -712,6 +1072,69 @@ impl ProcessingPipeline {
             }
             _ => Ok(PacketDecision::Forward),
         }
+    }
+
+    pub(crate) fn process_fake_ip_traffic(
+        &self,
+        captured: &CapturedPacket,
+        cp: &ClassifiedPacket,
+    ) -> Result<PacketDecision, anyhow::Error> {
+        let domain = match self.fake_ip.lookup(&cp.dst_ip) {
+            Some(d) => d,
+            None => return Ok(PacketDecision::Forward),
+        };
+
+        let is_syn = if let Some(ip) = crate::desync::parse_ip_header(&captured.data) {
+            let tcp_data = &captured.data[ip.header_len()..];
+            if let Some(tcp) = crate::desync::parse_tcp_packet(tcp_data) {
+                (tcp.flags & 0x02) != 0 && (tcp.flags & 0x10) == 0
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if is_syn {
+            // Fail-open check
+            if self.socks_redirector.proxy_pool.select_best().is_none()
+                && !self.socks_redirector.custom_proxy.read().unwrap().enabled
+            {
+                tracing::warn!(
+                    "FakeIP: no healthy proxies, falling back to direct connection for {}",
+                    domain
+                );
+                return Ok(PacketDecision::Forward);
+            }
+
+            tracing::debug!("FakeIP redirecting SYN for {} -> 127.0.0.1:17650", domain);
+            self.redirect_table.insert(
+                cp.src_port,
+                crate::desync::redirect_table::RedirectEntry {
+                    orig_dst_ip: cp.dst_ip,
+                    orig_dst_port: cp.dst_port,
+                    domain: Some(domain),
+                    created_at: std::time::Instant::now(),
+                },
+            );
+
+            let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            let modified =
+                crate::proxy::rewrite::rewrite_dst_addr(&captured.data, localhost, 17650)?;
+            self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(PacketDecision::Modify(modified.into()));
+        }
+
+        if cp.protocol == 17 {
+            tracing::debug!(
+                "FakeIP dropping QUIC payload to force TCP fallback for {}",
+                domain
+            );
+            self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(PacketDecision::Drop);
+        }
+
+        Ok(PacketDecision::Forward)
     }
 
     fn process_outbound_tls_sync(
@@ -1249,7 +1672,7 @@ impl ProcessingPipeline {
     ///
     /// Если профиль "socks5_fallback" активирован и целевой домен/IP направляется через SOCKS5
     /// (определяется через GeoRouter), пакет дропается (клиент должен использовать proxy).
-    fn process_socks5_redirect(
+    pub(crate) fn process_socks5_redirect(
         &self,
         captured: &CapturedPacket,
         cp: &ClassifiedPacket,
@@ -1257,6 +1680,13 @@ impl ProcessingPipeline {
         let socks5_active = self.is_profile_activated("socks5_fallback");
 
         if !socks5_active {
+            return Ok(PacketDecision::Forward);
+        }
+
+        // Fail-open check: if no healthy proxies, return Forward!
+        let has_custom = self.socks_redirector.custom_proxy.read().unwrap().enabled;
+        let has_opera = self.socks_redirector.proxy_pool.select_best().is_some();
+        if !has_custom && !has_opera {
             return Ok(PacketDecision::Forward);
         }
 
@@ -1294,20 +1724,21 @@ impl ProcessingPipeline {
 
             // Переписываем dst в самом пакете на Localhost:REDIRECTOR_PORT
             let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-            let modified = crate::desync::rewrite_dst_addr(
+            let modified = crate::proxy::rewrite::rewrite_dst_addr(
                 &captured.data,
                 localhost,
                 17650, // REDIRECTOR_PORT
             )?;
 
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            return Ok(PacketDecision::Modify(modified));
+            return Ok(PacketDecision::Modify(modified.into()));
         }
 
         Ok(PacketDecision::Forward)
     }
 
     /// Execute a PacketDecision synchronously from a worker thread.
+    #[allow(dead_code)]
     fn execute_decision_sync(&self, decision: PacketDecision, captured: &CapturedPacket) {
         match decision {
             PacketDecision::Forward => {
@@ -1323,6 +1754,19 @@ impl ProcessingPipeline {
                 inject_protocol,
                 inter_delay_us,
             } => {
+                // T60: Register RST for Circuit Breaker
+                for inject_pkt in inject.iter() {
+                    if let Some(ip) = crate::desync::parse_ip_header(inject_pkt) {
+                        let tcp_data = &inject_pkt[ip.header_len()..];
+                        if let Some(tcp) = crate::desync::parse_tcp_packet(tcp_data) {
+                            if (tcp.flags & 0x04) != 0 {
+                                // RST flag
+                                self.adaptive_router.record_rst();
+                            }
+                        }
+                    }
+                }
+
                 for (i, inject_pkt) in inject.iter().enumerate() {
                     if i > 0 && inter_delay_us > 0 {
                         std::thread::sleep(Duration::from_micros(inter_delay_us as u64));
@@ -1391,7 +1835,7 @@ impl ProcessingPipeline {
 }
 
 #[derive(Clone)]
-struct CapturedPacket {
+pub(crate) struct CapturedPacket {
     data: bytes::Bytes,
     addr: WinDivertAddress<NetworkLayer>,
 }

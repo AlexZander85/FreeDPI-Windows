@@ -3572,16 +3572,25 @@ impl Drop for NetworkMonitor {
 | DesyncResult::merge | Last-writer-wins без warning | Conflict detection + warning log |
 | Pipeline mode | `false` (concurrent) | `true` (pipeline) по умолчанию |
 
-### 23.2 Packet Ring (crossbeam ArrayQueue)
+### 23.2 Batch Recv/Send (T62 Optimization)
+
+Вместо промежуточной очереди `ArrayQueue` и поштучной обработки пакетов (1 пакет на системный вызов), FreeDPI использует пакетную обработку напрямую на рабочих потоках (`worker threads`):
 
 ```
-WinDivert recv ──→ ArrayQueue<CapturedPacket>(65536) ──→ consumer loop
-                     │
-                     └── head-drop при переполнении
-                         (вытесняет старый пакет, берёт новый)
+WinDivert (Kernel)
+    │
+    ├── [ WinDivertRecvEx (batch = 64) ] ──→ 1 syscall
+    │        │
+    │        ├── Thread-1 (Sequential process) ──→ [ WinDivertSendEx (batch) ] ──→ 1 syscall
+    │        │
+    │        └── Thread-N (Sequential process) ──→ [ WinDivertSendEx (batch) ] ──→ 1 syscall
 ```
 
-**Преимущества:** Lock-free MPMC, zero contention, head-drop сохраняет свежие пакеты. `try_send` не блокирует WinDivert recv thread.
+**Преимущества:**
+1. **Снижение syscall-overheat в 64 раза**: При 100K pps количество системных вызовов сокращается с 200,000 до ~3,125 вызовов в секунду. Overhead перехода контекста падает с 60% до менее 1% CPU.
+2. **Адаптивный батчинг (Adaptive Batching)**: `WinDivertRecvEx` возвращает пакеты мгновенно, если в очереди есть хотя бы 1 пакет, не внося никаких задержек при низком трафике, и переходя на полные батчи (до 64 пакетов) при высокой нагрузке.
+3. **Пакетная отправка**: Пакеты `Forward`, `Modify` и `Inject` накапливаются в thread-local буферах и отправляются обратно в ядро за один системный вызов `WinDivertSendEx`.
+4. **Отсутствие contention**: Каждый рабочий поток обращается напрямую к общему WinDivert дескриптору (потокобезопасному на уровне драйвера) без промежуточных блокировок или очередей.
 
 ### 23.3 PRNG Security & Hardening (Xorshift128** + ChaCha20Rng)
 

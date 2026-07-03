@@ -23,6 +23,7 @@
 //! ## Источник
 //! Адаптировано из [Nova](https://github.com/patrykkalinowski/nova) и [sing-box](https://github.com/SagerNet/sing-box).
 
+pub mod adaptive_router;
 pub mod chain;
 pub mod detect;
 pub mod domain_trie;

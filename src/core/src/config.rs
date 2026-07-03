@@ -149,6 +149,9 @@ pub struct Config {
     /// T60: Настройки SOCKS5 прокси и списков доменов
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// T60: Adaptive Multi-Path Router config
+    #[serde(default)]
+    pub adaptive_router: crate::routing::adaptive_router::AdaptiveRouterConfig,
 }
 
 /// Desync секция конфигурации.
@@ -227,6 +230,7 @@ impl Default for Config {
             desync: DesyncSection::default(),
             strategies: Vec::new(),
             proxy: ProxyConfig::default(),
+            adaptive_router: crate::routing::adaptive_router::AdaptiveRouterConfig::default(),
         }
     }
 }
@@ -268,6 +272,8 @@ impl Config {
             techniques,
             strategies: self.strategies.clone(),
             proxy_config: self.proxy.clone(),
+            dns_config: self.dns.clone(),
+            adaptive_router_config: self.adaptive_router.clone(),
         }
     }
 }

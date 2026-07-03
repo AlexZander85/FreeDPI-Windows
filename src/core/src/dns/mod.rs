@@ -13,6 +13,8 @@
 //! Адаптировано из [zapret2](https://github.com/bol-van/zapret-win-bundle)
 //! и [sing-box](https://github.com/SagerNet/sing-box).
 
+pub mod dns_proxy;
+pub mod dns_utils;
 pub mod fakeip;
 pub mod parallel_dial;
 pub mod txid_tracker;
