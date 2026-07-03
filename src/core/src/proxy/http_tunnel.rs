@@ -193,7 +193,8 @@ impl OperaTunnel {
             from_pool = false;
         }
 
-        let mut tls = tls.unwrap();
+        let mut tls = tls
+            .expect("tls stream must be Some at this point — either from pool or freshly created");
         let target = format!("{target_host}:{target_port}");
         let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
         if let Some(ref auth) = self.auth {

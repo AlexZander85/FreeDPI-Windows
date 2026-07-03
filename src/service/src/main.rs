@@ -573,6 +573,142 @@ impl EngineHandle for ServiceEngine {
 // Service logic (shared between foreground and service modes)
 // ---------------------------------------------------------------------------
 
+/// 1. Создаёт ProcessingPipeline и загружает домены из конфига.
+///    Возвращает `None`, если не удалось создать (например, нет прав админа).
+fn init_pipeline(config: &Config, engine: &Arc<ServiceEngine>) -> Option<Arc<ProcessingPipeline>> {
+    let proc_config = config.to_processing_config();
+    match ProcessingPipeline::new(
+        &config.windivert.filter,
+        proc_config,
+        Arc::new(GeoRouter::new_default()),
+        Arc::new(FakeIpManager::new(10_000)),
+        Arc::new(HopTab::new()),
+    ) {
+        Ok(p) => {
+            info!("Pipeline created");
+            let p = Arc::new(p);
+            let _ = engine.pipeline.set(p.clone());
+
+            // T60: Загрузка доменов из конфига / внешнего файла при старте
+            if config.proxy.enabled {
+                for domain in &config.proxy.proxy_domains {
+                    p.geo_router().add_user_domain(domain);
+                }
+                if let Some(ref path) = config.proxy.proxy_domains_file {
+                    if let Ok(domains) = freedpi_core::config::load_domains_from_file(path) {
+                        for domain in domains {
+                            p.geo_router().add_user_domain(&domain);
+                        }
+                    }
+                }
+            }
+
+            Some(p)
+        }
+        Err(e) => {
+            warn!("Pipeline failed (need admin?): {}", e);
+            None
+        }
+    }
+}
+
+/// 2. Запускает HTTP API сервер (tokio::spawn), если включён в конфиге.
+fn start_api(config: &Config, engine: Arc<ServiceEngine>) {
+    if !config.api.enabled {
+        return;
+    }
+    let api_key = config.api.api_key.clone();
+    let api_port = config.api.port;
+    info!("API at http://127.0.0.1:{}", api_port);
+    tokio::spawn(async move {
+        freedpi_api::serve(
+            engine as Arc<dyn EngineHandle + Send + Sync>,
+            api_key,
+            api_port,
+        )
+        .await;
+    });
+}
+
+/// 3. Запускает фоновые задачи: мониторинг файла доменов, авто-пробу
+///    и периодический вывод статистики (1 раз в 60 с) через info!.
+fn start_stats_loop(
+    config: &Config,
+    pipeline: Arc<ProcessingPipeline>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) {
+    // T60: Polling-watch внешнего файла со списком доменов на mtime
+    if config.proxy.enabled {
+        if let Some(ref path_str) = config.proxy.proxy_domains_file {
+            let path = path_str.clone();
+            let geo_router = pipeline.geo_router().clone();
+            tokio::spawn(async move {
+                let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if let Ok(mtime) = meta.modified() {
+                            if Some(mtime) != last_mtime {
+                                last_mtime = Some(mtime);
+                                if let Ok(domains) =
+                                    freedpi_core::config::load_domains_from_file(&path)
+                                {
+                                    geo_router.reload_user_domains(domains);
+                                    info!("T60: reloaded geoblock domains from file: {}", path);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // T60: Auto-probe при старте
+    if config.proxy.enabled && config.proxy.auto_probe {
+        let geo_router = pipeline.geo_router().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let candidates = vec![
+                "netflix.com".to_string(),
+                "spotify.com".to_string(),
+                "telegram.org".to_string(),
+            ];
+            let probe_module = freedpi_core::probe::ProbeModule::new();
+            for domain in candidates {
+                let result = probe_module.probe(&domain).await;
+                if result.verdict == freedpi_core::probe::classifier::ProbeVerdict::Blocked {
+                    info!(
+                        "T60: Auto-probe detected '{}' is blocked, routing via SOCKS5 redirect",
+                        domain
+                    );
+                    geo_router.add_user_domain(&domain);
+                }
+            }
+        });
+    }
+
+    // Периодический вывод статистики (1 раз в 60 с)
+    let stats = pipeline.stats_arc();
+    let mut shutdown_rx_stats = shutdown_rx.resubscribe();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let s = stats.snapshot();
+                    info!(
+                        "Stats: recv={} fwd={} inject={}",
+                        s.total_received, s.forwarded, s.fake_ch_injected
+                    );
+                }
+                _ = shutdown_rx_stats.recv() => break,
+            }
+        }
+    });
+}
+
 async fn run_service(
     config: Config,
     engine: Arc<ServiceEngine>,
@@ -581,143 +717,26 @@ async fn run_service(
     let conntrack = engine.conntrack.clone();
     let sentinel = engine.sentinel.clone();
 
-    // Build pipeline (inside scope so pipeline Arc is dropped properly)
-    let pipeline = {
-        let proc_config = config.to_processing_config();
-        match ProcessingPipeline::new(
-            &config.windivert.filter,
-            proc_config,
-            Arc::new(GeoRouter::new_default()),
-            Arc::new(FakeIpManager::new(10_000)),
-            Arc::new(HopTab::new()),
-        ) {
-            Ok(p) => {
-                info!("Pipeline created");
-                Some(p)
-            }
-            Err(e) => {
-                warn!("Pipeline failed (need admin?): {}", e);
-                None
-            }
-        }
-    };
+    // 1. Создать pipeline
+    let pipeline = init_pipeline(&config, &engine);
 
-    // Start API server
-    if config.api.enabled {
-        let api_key = config.api.api_key.clone();
-        let api_port = config.api.port;
-        let engine_clone = engine.clone();
-        info!("API at http://127.0.0.1:{}", api_port);
-        tokio::spawn(async move {
-            freedpi_api::serve(
-                engine_clone as Arc<dyn EngineHandle + Send + Sync>,
-                api_key,
-                api_port,
-            )
-            .await;
-        });
-    }
+    // 2. Запустить API
+    start_api(&config, engine.clone());
 
-    // Start conntrack GC
+    // 3. Фоновые службы (conntrack GC, sentinel)
     tokio::spawn(async move {
         conntrack.gc_loop().await;
     });
-
-    // Start sentinel monitor
     sentinel.start_monitor();
 
-    // Start pipeline
-    if let Some(pipeline) = pipeline {
-        let pipeline = std::sync::Arc::new(pipeline);
-        let _ = engine.pipeline.set(pipeline.clone());
-
-        // T60: Загрузка доменов из конфига / внешнего файла при старте
-        if config.proxy.enabled {
-            for domain in &config.proxy.proxy_domains {
-                pipeline.geo_router().add_user_domain(domain);
-            }
-            if let Some(ref path) = config.proxy.proxy_domains_file {
-                if let Ok(domains) = freedpi_core::config::load_domains_from_file(path) {
-                    for domain in domains {
-                        pipeline.geo_router().add_user_domain(&domain);
-                    }
-                }
-            }
-        }
-
-        // T60: Polling-watch внешнего файла со списком доменов на mtime
-        if config.proxy.enabled {
-            if let Some(ref path_str) = config.proxy.proxy_domains_file {
-                let path = path_str.clone();
-                let geo_router = pipeline.geo_router().clone();
-                tokio::spawn(async move {
-                    let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-                    loop {
-                        interval.tick().await;
-                        if let Ok(meta) = std::fs::metadata(&path) {
-                            if let Ok(mtime) = meta.modified() {
-                                if Some(mtime) != last_mtime {
-                                    last_mtime = Some(mtime);
-                                    if let Ok(domains) =
-                                        freedpi_core::config::load_domains_from_file(&path)
-                                    {
-                                        geo_router.reload_user_domains(domains);
-                                        info!("T60: reloaded geoblock domains from file: {}", path);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        }
-
-        // T60: Auto-probe при старте
-        if config.proxy.enabled && config.proxy.auto_probe {
-            let geo_router = pipeline.geo_router().clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                let candidates = vec![
-                    "netflix.com".to_string(),
-                    "spotify.com".to_string(),
-                    "telegram.org".to_string(),
-                ];
-                let probe_module = freedpi_core::probe::ProbeModule::new();
-                for domain in candidates {
-                    let result = probe_module.probe(&domain).await;
-                    if result.verdict == freedpi_core::probe::classifier::ProbeVerdict::Blocked {
-                        info!(
-                            "T60: Auto-probe detected '{}' is blocked, routing via SOCKS5 redirect",
-                            domain
-                        );
-                        geo_router.add_user_domain(&domain);
-                    }
-                }
-            });
-        }
-
-        let stats = pipeline.stats_arc();
+    // 4. Если pipeline создан — запустить его и сопутствующие задачи
+    if let Some(p) = pipeline {
+        let pipeline_for_stats = p.clone();
         let shutdown_rx_pipeline = shutdown_rx.resubscribe();
         tokio::spawn(async move {
-            pipeline.run(shutdown_rx_pipeline).await;
+            p.run(shutdown_rx_pipeline).await;
         });
-        let mut shutdown_rx_stats = shutdown_rx.resubscribe();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let s = stats.snapshot();
-                        info!(
-                            "Stats: recv={} fwd={} inject={}",
-                            s.total_received, s.forwarded, s.fake_ch_injected
-                        );
-                    }
-                    _ = shutdown_rx_stats.recv() => break,
-                }
-            }
-        });
+        start_stats_loop(&config, pipeline_for_stats, shutdown_rx);
     }
 }
 
