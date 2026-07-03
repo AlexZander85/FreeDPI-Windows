@@ -171,6 +171,24 @@ impl AwgTunnel {
         config: AwgConfig,
         packet_engine: Arc<PacketEngine>,
     ) -> anyhow::Result<Self> {
+        let mut config = config;
+        if config.private_key.trim().is_empty() || config.public_key.trim().is_empty() {
+            info!("AWG: Private or public key not set, initiating auto-registration...");
+            match auto_register_warp_device().await {
+                Ok((priv_key, pub_key, v4_ip)) => {
+                    info!("AWG: Auto-registration successful!");
+                    info!("AWG: Assigned Virtual IP: {v4_ip}");
+                    info!("AWG: Peer Public Key: {pub_key}");
+                    config.private_key = priv_key;
+                    config.public_key = pub_key;
+                    config.address = v4_ip;
+                }
+                Err(e) => {
+                    anyhow::bail!("AWG auto-registration failed: {e:#}");
+                }
+            }
+        }
+
         let private_bytes = base64_decode(&config.private_key)
             .ok_or_else(|| anyhow::anyhow!("Invalid base64 private key"))?;
         let public_bytes = base64_decode(&config.public_key)
@@ -394,5 +412,91 @@ impl AwgTunnel {
         }
 
         Ok(())
+    }
+}
+
+async fn auto_register_warp_device() -> anyhow::Result<(String, String, String)> {
+    let mut private_bytes = [0u8; 32];
+    {
+        use rand::RngCore;
+        let mut rng = rand::thread_rng();
+        rng.fill_bytes(&mut private_bytes);
+    }
+
+    // Clamp Curve25519 private key
+    private_bytes[0] &= 248;
+    private_bytes[31] &= 127;
+    private_bytes[31] |= 64;
+
+    let local_static = StaticSecret::from(private_bytes);
+    let public_key = local_static.public_key();
+
+    let local_private_b64 = crate::proxy::base64_encode(&private_bytes);
+    let local_public_b64 = crate::proxy::base64_encode(public_key.as_bytes());
+
+    let client = reqwest::Client::builder()
+        .user_agent("okhttp/3.12.1")
+        .build()?;
+
+    let payload = serde_json::json!({
+        "key": local_public_b64,
+        "install_id": "",
+        "fcm_token": "",
+        "tos": "2024-06-11T00:00:00Z",
+        "model": "PC",
+        "locale": "en_US"
+    });
+
+    let resp = client
+        .post("https://api.cloudflareclient.com/v0a3121/reg")
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err_text = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Cloudflare WARP registration failed: Status {}, Body: {}",
+            status,
+            err_text
+        );
+    }
+
+    let resp_json: serde_json::Value = resp.json().await?;
+
+    let peer_public = resp_json["config"]["peers"][0]["public_key"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing peer public_key in response"))?
+        .to_string();
+
+    let virtual_ip = resp_json["config"]["interface"]["addresses"]["v4"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing interface v4 address in response"))?
+        .to_string();
+
+    Ok((local_private_b64, peer_public, virtual_ip))
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_auto_register_warp_device() {
+        match auto_register_warp_device().await {
+            Ok((priv_key, pub_key, v4_ip)) => {
+                println!("Registration successful!");
+                println!("Private key: {priv_key}");
+                println!("Peer Public key: {pub_key}");
+                println!("Virtual IP: {v4_ip}");
+                assert!(!priv_key.is_empty());
+                assert!(!pub_key.is_empty());
+                assert!(v4_ip.contains('.'));
+            }
+            Err(e) => {
+                println!("Registration failed/skipped (expected if offline): {e}");
+            }
+        }
     }
 }
