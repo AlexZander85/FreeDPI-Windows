@@ -21,7 +21,7 @@
 
 ### Ключевые преимущества и возможности
 
-*   ⚡ **Экстремальная скорость**: Пропускная способность **5-10 Gbps** благодаря zero-copy конвейеру (подсчет ссылок `bytes::Bytes`), lock-free очередям `crossbeam::ArrayQueue` и выделенному пулу native OS воркеров.
+*   ⚡ **Экстремальная скорость**: Пропускная способность **5-10 Gbps** благодаря zero-copy конвейеру (подсчет ссылок `bytes::Bytes`), lock-free очередям `crossbeam::ArrayQueue`, выделенному пулу native OS воркеров, а также пакетному вводу-выводу (**Batch Recv/Send**) на базе `WinDivertRecvEx` и `WinDivertSendEx` (до 64 пакетов за один syscall).
 *   🧠 **Автотюнинг стратегий (AutoTune)**: Движок автоматически оценивает эффективность техник обхода на основе обратной связи от соединений (успех/таймаут/джиттер), используя алгоритм **Thompson Sampling** для динамического выбора наиболее стабильного профиля.
 *   🔍 **7-фазный DPI Probe**: Превентивное зондирование хостов (DNS Integrity → TCP Connect → TLS Handshake → HTTP Application → JA4 Fingerprinting → QUIC scan → Data-Volume), классификатор временных аномалий на базе машинного обучения (17 признаков, логистическая регрессия) и дискриминатор направления блокировки (Server-active vs Path-active).
 *   🛡️ **Dual-RNG архитектура**: Два независимых генератора: **ChaCha12Rng** (CSPRNG, 12 раундов, reseed каждые 8192 вызова) для всех wire-visible полей и GREASE; **Xoshiro256++** (BigCrush, ~2x быстрее) для невидимых DPI вычислений — TTL jitter, padding length, nonce. DPI видит только CSPRNG-выходы.
@@ -30,6 +30,8 @@
     *   **UDP DNS drop**: Автоматический сброс незащищенного DNS на порт 53 для форсирования перехода клиента на DoH (DNS-over-HTTPS).
     *   **TCP SYN Clamping**: Динамическое ограничение MSS/Window прямо в SYN-пакетах для предотвращения фрагментации/анализа.
     *   **SOCKS5 Redirect**: Прозрачный перехват и перенаправление входящих SYN-пакетов к заблокированным ресурсам на локальный редиректор, который туннелирует трафик через прокси-серверы Opera.
+    *   **Прозрачный DNS-прокси & Fake IP (T59)**: Перехват UDP-трафика на порт 53 на уровне ядра (WinDivert), локальный Split-DNS резолвер с генерацией Fake IP и бесшовная трансляция адресов через ProxyConnectionTable, исключающая утечки DNS и позволяющая проксировать QUIC и не-HTTP трафик.
+    *   **Adaptive Multi-Path Routing**: AutoTune отслеживает успешность десинхронизации (desync), автоматически переключаясь на прокси Opera SOCKS5 при сбоях. Включает механизм Circuit Breaker для защиты от массовых RST-пакетов, throughput-based маршрутизацию при троттлинге и protocol-specific роутинг для трафика без SNI.
 *   ⚙️ **TOML-стратегии**: Поддержка секции `[[strategies]]` для добавления пользовательских профилей десинхронизации, динамически сливаемых с реестром по умолчанию без перезапуска службы.
 *   💿 **Один файл — всё включено**: WinDivert статически слинкован в `freedpi-service.exe` — отдельный `WinDivert.dll` не требуется. Размер бинарника всего **~4.9 MB** (снижение на **38.5%**) благодаря LTO, strip и panic=abort.
 *   🌍 **Geo-unblocking через Custom SOCKS5 & Opera Proxy**: Прозрачный обход геоблокировок через кастомный пользовательский SOCKS5-прокси (с поддержкой авторизации RFC 1929 по логину/паролю) и бесплатные прокси-серверы Opera в качестве резервного канала (fallback). Трафик к геоблокированным ресурсам перехватывается автоматически на уровне ядра и перенаправляется через локальный редиректор без необходимости настройки прокси в браузере.
@@ -51,7 +53,7 @@
 
 ### Key Advantages & Features
 
-*   ⚡ **Extreme Performance**: Throughput of **5-10 Gbps** powered by a zero-copy pipeline (`bytes::Bytes` ref-counting), lock-free queues (`crossbeam::ArrayQueue`), and a dedicated pool of native OS workers.
+*   ⚡ **Extreme Performance**: Throughput of **5-10 Gbps** powered by a zero-copy pipeline (`bytes::Bytes` ref-counting), lock-free queues (`crossbeam::ArrayQueue`), a dedicated pool of native OS workers, and packet batching (**Batch Recv/Send**) utilizing `WinDivertRecvEx` and `WinDivertSendEx` syscalls (up to 64 packets per single syscall).
 *   🧠 **Auto-Tuning Engine (AutoTune)**: Automatically evaluates desync profile performance based on connection feedback (success/timeout/jitter), leveraging **Thompson Sampling** to select the most stable strategy dynamically.
 *   🔍 **7-Phase DPI Probe**: Preventive host scanning (DNS Integrity → TCP Connect → TLS Handshake → HTTP Application → JA4 Fingerprinting → QUIC scan → Data-Volume), ML-based temporal anomaly classification (logistic regression on 17 features), and direction discriminator (Server-active vs Path-active).
 *   🛡️ **Dual-RNG Architecture**: Two independent generators — **ChaCha12Rng** (CSPRNG, 12 rounds, reseed every 8192 calls) for all wire-visible fields and GREASE; **Xoshiro256++** (BigCrush, ~2x faster) for DPI-invisible internals — TTL jitter, padding length, nonce generation. DPI sees only CSPRNG outputs.
@@ -60,6 +62,8 @@
     *   **UDP DNS drop**: Drops unencrypted UDP/53 queries to force client fallback to DoH (DNS-over-HTTPS).
     *   **TCP SYN Clamping**: Dynamically clamps MSS and Window size in raw TCP SYN packets.
     *   **SOCKS5 Redirect**: Transparent interception and redirection of outbound SYN packets targeting blocked resources to a local redirector that tunnels traffic via Opera proxies.
+    *   **Transparent DNS Proxy & Fake IP (T59)**: Kernel-level UDP/53 interception (WinDivert), local Split-DNS resolver with Fake IP mapping, and translation through the ProxyConnectionTable. Prevents DNS Leaks and enables proxying for QUIC and non-HTTP applications.
+    *   **Adaptive Multi-Path Routing**: AutoTune monitors desync success rates, dynamically falling back to Opera SOCKS5 proxy upon failures. Incorporates a Circuit Breaker to mitigate massive RST storms, throughput-based routing for throttling mitigation, and protocol-specific routing for non-SNI flows.
 *   ⚙️ **TOML Custom Profiles**: Declaring custom strategies via the `[[strategies]]` section in `config.toml` with seamless registry merging and hot-reload.
 *   💿 **Single-file deployment**: WinDivert is statically linked into `freedpi-service.exe` — no separate `WinDivert.dll` required. Binary size only **~4.9 MB** (**38.5% reduction**) thanks to LTO, stripping, and `panic=abort`.
 *   🌍 **Geo-unblocking via Custom SOCKS5 & Opera Proxy**: Transparent geo-blocking bypass through a custom SOCKS5 proxy (supporting RFC 1929 username/password authentication) and free Opera SOCKS5 proxies as a backup channel (fallback). Traffic to geo-blocked hosts is intercepted at kernel level and routed via the local redirector. No browser configuration required.
