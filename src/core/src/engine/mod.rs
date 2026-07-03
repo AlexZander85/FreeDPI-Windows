@@ -599,14 +599,18 @@ impl ProcessingPipeline {
 
             let handle = std::thread::Builder::new()
                 .name(format!("fp-worker-{}", id))
-                .spawn(move || {
-                    loop {
-                        if shutdown_rx.try_recv().is_ok() || shutdown_flag.load(Ordering::Acquire) {
-                            shutdown_flag.store(true, Ordering::Release);
-                            break;
-                        }
-                        Self::worker_loop(id, engine.clone(), pipeline.clone(), pool.clone(), shutdown_flag.clone());
+                .spawn(move || loop {
+                    if shutdown_rx.try_recv().is_ok() || shutdown_flag.load(Ordering::Acquire) {
+                        shutdown_flag.store(true, Ordering::Release);
+                        break;
                     }
+                    Self::worker_loop(
+                        id,
+                        engine.clone(),
+                        pipeline.clone(),
+                        pool.clone(),
+                        shutdown_flag.clone(),
+                    );
                 })
                 .expect("spawn worker");
             worker_handles.push(handle);
@@ -633,8 +637,10 @@ impl ProcessingPipeline {
     ) {
         let mut empty_spins: u32 = 0;
 
-        let mut forward_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> = Vec::with_capacity(64);
-        let mut inject_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> = Vec::with_capacity(64);
+        let mut forward_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> =
+            Vec::with_capacity(64);
+        let mut inject_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> =
+            Vec::with_capacity(64);
 
         loop {
             if shutdown.load(Ordering::Acquire) {
@@ -668,7 +674,10 @@ impl ProcessingPipeline {
                 }
             };
 
-            pipeline.stats.total_received.fetch_add(packets.len() as u64, Ordering::Relaxed);
+            pipeline
+                .stats
+                .total_received
+                .fetch_add(packets.len() as u64, Ordering::Relaxed);
 
             // 2. Очищаем batch buffers
             forward_batch.clear();
@@ -676,7 +685,10 @@ impl ProcessingPipeline {
 
             // 3. Обрабатываем каждый пакет
             for (data, addr) in packets {
-                let captured = CapturedPacket { data: data.clone(), addr: addr.clone() };
+                let captured = CapturedPacket {
+                    data: data.clone(),
+                    addr: addr.clone(),
+                };
 
                 match pipeline.process_one_sync(&captured) {
                     Ok(decision) => {
@@ -690,19 +702,29 @@ impl ProcessingPipeline {
                                 pool.release_bytes(data);
                                 forward_batch.push((modified, addr));
                             }
-                            PacketDecision::Desync { inject, modified, inject_protocol, inter_delay_us } => {
+                            PacketDecision::Desync {
+                                inject,
+                                modified,
+                                inject_protocol,
+                                inter_delay_us,
+                            } => {
                                 match inject_protocol {
                                     InjectProtocol::Tcp => {
                                         for (i, inject_pkt) in inject.iter().enumerate() {
                                             if i > 0 && inter_delay_us > 0 {
                                                 if !inject_batch.is_empty() {
-                                                    let _ = engine.inject_batch_via_divert(&inject_batch);
+                                                    let _ = engine
+                                                        .inject_batch_via_divert(&inject_batch);
                                                     for (d, _) in &inject_batch {
                                                         pool.release_bytes(d.clone());
                                                     }
                                                     inject_batch.clear();
                                                 }
-                                                std::thread::sleep(std::time::Duration::from_micros(inter_delay_us as u64));
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_micros(
+                                                        inter_delay_us as u64,
+                                                    ),
+                                                );
                                             }
                                             inject_batch.push((inject_pkt.clone(), addr.clone()));
                                         }
@@ -710,13 +732,23 @@ impl ProcessingPipeline {
                                     InjectProtocol::Udp => {
                                         for (i, inject_pkt) in inject.iter().enumerate() {
                                             if i > 0 && inter_delay_us > 0 {
-                                                std::thread::sleep(std::time::Duration::from_micros(inter_delay_us as u64));
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_micros(
+                                                        inter_delay_us as u64,
+                                                    ),
+                                                );
                                             }
                                             if let Err(e) = engine.inject_raw_udp(inject_pkt) {
-                                                tracing::warn!("Failed to inject UDP desync packet: {}", e);
+                                                tracing::warn!(
+                                                    "Failed to inject UDP desync packet: {}",
+                                                    e
+                                                );
                                             }
                                             pool.release_bytes(inject_pkt.clone());
-                                            pipeline.stats.fake_ch_injected.fetch_add(1, Ordering::Relaxed);
+                                            pipeline
+                                                .stats
+                                                .fake_ch_injected
+                                                .fetch_add(1, Ordering::Relaxed);
                                         }
                                     }
                                 }
@@ -748,7 +780,10 @@ impl ProcessingPipeline {
             if !forward_batch.is_empty() {
                 let sent = engine.send_batch(&forward_batch);
                 if let Ok(n) = sent {
-                    pipeline.stats.forwarded.fetch_add(n as u64, Ordering::Relaxed);
+                    pipeline
+                        .stats
+                        .forwarded
+                        .fetch_add(n as u64, Ordering::Relaxed);
                 }
                 // Возвращаем буферы в пул
                 for (data, _) in &forward_batch {
@@ -760,7 +795,10 @@ impl ProcessingPipeline {
             if !inject_batch.is_empty() {
                 let sent = engine.inject_batch_via_divert(&inject_batch);
                 if let Ok(n) = sent {
-                    pipeline.stats.fake_ch_injected.fetch_add(n as u64, Ordering::Relaxed);
+                    pipeline
+                        .stats
+                        .fake_ch_injected
+                        .fetch_add(n as u64, Ordering::Relaxed);
                 }
                 // Возвращаем буферы в пул
                 for (data, _) in &inject_batch {
@@ -960,10 +998,7 @@ impl ProcessingPipeline {
                         crate::routing::GeoRegion::Europe | crate::routing::GeoRegion::UnitedStates
                     )
                 };
-                let has_sni_or_host = match &classification {
-                    Classification::Tls(_) | Classification::Http(_) => true,
-                    _ => false,
-                };
+                let has_sni_or_host = matches!(&classification, Classification::Tls(_) | Classification::Http(_));
 
                 let decision = self.adaptive_router.decide(
                     domain.as_deref(),

@@ -585,7 +585,9 @@ impl PacketEngine {
             }
         })?;
 
-        self.stats.packets_received.fetch_add(packets.len() as u64, Ordering::Relaxed);
+        self.stats
+            .packets_received
+            .fetch_add(packets.len() as u64, Ordering::Relaxed);
         Ok(packets)
     }
 
@@ -623,7 +625,9 @@ impl PacketEngine {
         match divert.send_ex(&wd_packets) {
             Ok(n) => {
                 total_sent = n as usize;
-                self.stats.packets_sent.fetch_add(total_sent as u64, Ordering::Relaxed);
+                self.stats
+                    .packets_sent
+                    .fetch_add(total_sent as u64, Ordering::Relaxed);
             }
             Err(e) => {
                 // Fallback: отправляем по одному
@@ -671,7 +675,9 @@ impl PacketEngine {
         match divert.send_ex(&wd_packets) {
             Ok(n) => {
                 let sent = n as usize;
-                self.stats.packets_injected.fetch_add(sent as u64, Ordering::Relaxed);
+                self.stats
+                    .packets_injected
+                    .fetch_add(sent as u64, Ordering::Relaxed);
                 Ok(sent)
             }
             Err(e) => {
@@ -689,7 +695,9 @@ impl PacketEngine {
                         sent += 1;
                     }
                 }
-                self.stats.packets_injected.fetch_add(sent as u64, Ordering::Relaxed);
+                self.stats
+                    .packets_injected
+                    .fetch_add(sent as u64, Ordering::Relaxed);
                 Ok(sent)
             }
         }
@@ -1030,10 +1038,12 @@ mod t62_tests {
     #[test]
     fn test_batch_buffers_capacity() {
         // Проверяем что Vec::with_capacity(64) не reallocates в типичном случае
-        let forward_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> = Vec::with_capacity(64);
+        let forward_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> =
+            Vec::with_capacity(64);
         assert_eq!(forward_batch.capacity(), 64);
 
-        let inject_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> = Vec::with_capacity(64);
+        let inject_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> =
+            Vec::with_capacity(64);
         assert_eq!(inject_batch.capacity(), 64);
     }
 

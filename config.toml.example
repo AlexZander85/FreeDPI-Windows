@@ -58,3 +58,18 @@ port = 1080
 # username = "user"
 # password = "password"
 use_opera_fallback = true
+
+# T60: Adaptive Multi-Path Routing
+[adaptive_router]
+# Если desync success_rate ниже 30% -> switch to proxy
+desync_failure_threshold = 0.30
+# Если throughput ниже 500 KB/s -> switch to proxy (throttling bypass)
+throttling_threshold_bps = 500000
+# Circuit Breaker: 50 RST за 60 сек -> OPEN (все через proxy)
+circuit_breaker_rst_threshold = 50
+circuit_breaker_window_secs = 60
+circuit_breaker_timeout_secs = 300
+# Протоколы без SNI/Host -> автоматически через proxy если домен заблокирован
+proxy_non_sni_blocked = true
+# Измерять throughput и переключаться на proxy при throttling
+throughput_aware_routing = true

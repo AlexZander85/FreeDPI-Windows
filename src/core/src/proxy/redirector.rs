@@ -255,8 +255,10 @@ mod tests {
         let table = Arc::new(RedirectTable::new());
         let pool = Arc::new(OperaProxyPool::new(vec![socks_addr]));
 
-        let mut custom_cfg = crate::config::CustomProxyConfig::default();
-        custom_cfg.enabled = false; // routing through Opera pool (which has our mock server)
+        let custom_cfg = crate::config::CustomProxyConfig {
+            enabled: false,
+            ..Default::default()
+        };
 
         let redirector = Arc::new(SocksRedirector::new(table.clone(), pool, custom_cfg));
         // Bind to a random port in REDIRECTOR_PORT_RANGE

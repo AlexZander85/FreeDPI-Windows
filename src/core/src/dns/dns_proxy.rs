@@ -211,8 +211,12 @@ impl DnsProxyEngine {
             }
         }
 
-        let config = self.config.read().unwrap();
-        for url in &config.doh_servers {
+        let (doh_servers, ttl_fallback) = {
+            let config = self.config.read().unwrap();
+            (config.doh_servers.clone(), config.ttl)
+        };
+
+        for url in &doh_servers {
             let full_url = if url.contains('?') {
                 format!(
                     "{}&name={}&type={}",
@@ -246,7 +250,7 @@ impl DnsProxyEngine {
                                         let ip_clean = ip_str.trim_end_matches('.');
                                         if let Ok(ip) = ip_clean.parse::<IpAddr>() {
                                             let ttl =
-                                                entry["TTL"].as_u64().unwrap_or(config.ttl as u64);
+                                                entry["TTL"].as_u64().unwrap_or(ttl_fallback as u64);
                                             self.cache.insert(
                                                 cache_key.clone(),
                                                 (ip, Instant::now() + Duration::from_secs(ttl)),
@@ -320,10 +324,12 @@ mod tests {
         let geo = Arc::new(GeoRouter::new_default());
         geo.add_user_domain("netflix.com");
 
-        let mut config = DnsProxyConfig::default();
-        config.adblock_enabled = true;
-        config.adblock_domains = vec!["adserver.com".to_string()];
-        config.censored_domains = vec!["blocked.com".to_string()];
+        let config = DnsProxyConfig {
+            adblock_enabled: true,
+            adblock_domains: vec!["adserver.com".to_string()],
+            censored_domains: vec!["blocked.com".to_string()],
+            ..Default::default()
+        };
 
         let engine = DnsProxyEngine::new(config, fake_ip, geo);
 
