@@ -44,14 +44,12 @@ Section "FreeDPI (required)" SecMain
     SetOutPath "$INSTDIR"
 
     ; Install files
-    File "target\release\FreeDPI-service.exe"
-    File "target\release\FreeDPI-ui.exe"
+    File "src\target\release\freedpi-service.exe"
+    File "src\ui\src-tauri\target\release\freedpi-ui.exe"
 
-    ; Install WinDivert
+    ; Install WinDivert driver (DLL is statically linked into service)
     SetOutPath "$INSTDIR\WinDivert"
-    File "vendor\WinDivert\WinDivert.dll"
-    File "vendor\WinDivert\WinDivert.lib"
-    File "vendor\WinDivert\WinDivert64.sys"
+    File "dist\WinDivert64.sys"
 
     ; Install config
     SetOutPath "$INSTDIR"
