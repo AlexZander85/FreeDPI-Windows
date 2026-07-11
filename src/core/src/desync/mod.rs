@@ -57,23 +57,7 @@ pub enum InjectDirection {
     DerivedFromPacketTuple,
 }
 
-/// P0-10: Пакет для инъекции с метаданными направления.
-#[derive(Debug, Clone)]
-pub struct InjectPacket {
-    /// Данные пакета.
-    pub data: bytes::Bytes,
-    /// Направление инъекции.
-    pub direction: InjectDirection,
-}
 
-impl From<bytes::Bytes> for InjectPacket {
-    fn from(data: bytes::Bytes) -> Self {
-        Self {
-            data,
-            direction: InjectDirection::PreserveOriginal,
-        }
-    }
-}
 
 /// Результат применения desync техники.
 ///

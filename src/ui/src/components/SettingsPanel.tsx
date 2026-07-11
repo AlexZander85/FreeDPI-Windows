@@ -14,10 +14,11 @@ interface Settings {
   dns_cache_ttl: number;
   zero_config_enabled: boolean;
   zero_config_auto_detect: boolean;
+  api_key: string;
 }
 
 const DEFAULT_SETTINGS: Settings = {
-  windivert_filter: "ip && (tcp.DstPort == 443 or tcp.SrcPort == 443 or udp.DstPort == 53 or udp.DstPort == 443)",
+  windivert_filter: "",
   split_size: 1,
   split_count: 3,
   fake_sni: "www.google.com",
@@ -28,6 +29,7 @@ const DEFAULT_SETTINGS: Settings = {
   dns_cache_ttl: 300,
   zero_config_enabled: true,
   zero_config_auto_detect: false,
+  api_key: "",
 };
 
 function parseTomlToSettings(raw: string): Partial<Settings> {
@@ -55,8 +57,9 @@ function parseTomlToSettings(raw: string): Partial<Settings> {
       val = Number(valStr);
     }
 
-    if (currentSection === "api" && key === "port") {
-      result.api_port = val as number;
+    if (currentSection === "api") {
+      if (key === "port") result.api_port = val as number;
+      if (key === "api_key") result.api_key = val as string;
     } else if (currentSection === "windivert" && key === "filter") {
       result.windivert_filter = val as string;
     } else if (currentSection === "dns") {
@@ -77,13 +80,23 @@ function parseTomlToSettings(raw: string): Partial<Settings> {
 }
 
 function settingsToToml(s: Settings): string {
-  return `[api]
+  let apiBlock = `[api]
 port = ${s.api_port}
 enabled = true
+`;
+  if (s.api_key) {
+    apiBlock += `api_key = "${s.api_key}"\n`;
+  }
 
-[windivert]
-filter = "${s.windivert_filter}"
+  let windivertBlock = `[windivert]\n`;
+  if (s.windivert_filter) {
+    windivertBlock += `filter = "${s.windivert_filter}"\n`;
+  } else {
+    windivertBlock += `# filter = "" # empty = dynamic safe filter\n`;
+  }
 
+  return `${apiBlock}
+${windivertBlock}
 [dns]
 doh_url = "${s.dns_doh_url}"
 dot_addr = "${s.dns_dot_addr}"
@@ -179,6 +192,7 @@ export default function SettingsPanel() {
             label={t("settings.windivert_filter")}
             value={settings.windivert_filter}
             onChange={(v) => update("windivert_filter", v)}
+            placeholder={t("settings.windivert_filter_placeholder")}
           />
           <div className="grid grid-cols-2 gap-3">
             <SettingNumber
@@ -253,10 +267,12 @@ function SettingInput({
   label,
   value,
   onChange,
+  placeholder,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
+  placeholder?: string;
 }) {
   return (
     <div>
@@ -267,6 +283,7 @@ function SettingInput({
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
         className="w-full px-3 py-1.5 text-sm rounded-md outline-none"
         style={{
           background: "var(--bg-muted)",

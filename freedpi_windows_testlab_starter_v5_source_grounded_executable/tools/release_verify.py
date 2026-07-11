@@ -167,6 +167,47 @@ def check_config_filter(config_path: Path) -> list:
     return findings
 
 
+def check_ui_defaults() -> list:
+    findings = []
+    # Locate SettingsPanel.tsx
+    ui_panel = Path(__file__).resolve().parent.parent.parent / "src" / "ui" / "src" / "components" / "SettingsPanel.tsx"
+    if not ui_panel.exists():
+        ui_panel = Path(__file__).resolve().parent.parent / "src" / "ui" / "src" / "components" / "SettingsPanel.tsx"
+
+    if not ui_panel.exists():
+        findings.append({"severity": "warn", "check": "ui_panel_exists",
+                          "message": f"SettingsPanel.tsx not found at {ui_panel}; skipped UI defaults validation."})
+        return findings
+
+    text = ui_panel.read_text(encoding="utf-8", errors="replace")
+    
+    # Check DEFAULT_SETTINGS in UI defaults
+    m = re.search(r'windivert_filter\s*:\s*"([^"]*)"', text)
+    if m:
+        filter_val = m.group(1)
+        if filter_val != "":
+            findings.append({
+                "severity": "fail",
+                "check": "ui_default_windivert_filter",
+                "message": f"UI SettingsPanel.tsx has a non-empty DEFAULT_SETTINGS windivert_filter: '{filter_val}'. "
+                           "It must be empty by default to allow dynamic safe filtering."
+            })
+        else:
+            findings.append({
+                "severity": "pass",
+                "check": "ui_default_windivert_filter",
+                "message": "UI SettingsPanel.tsx has an empty windivert_filter default."
+            })
+    else:
+        findings.append({
+            "severity": "fail",
+            "check": "ui_default_windivert_filter",
+            "message": "Could not parse windivert_filter from DEFAULT_SETTINGS in SettingsPanel.tsx"
+        })
+        
+    return findings
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=Path, required=True)
@@ -178,6 +219,7 @@ def main():
     findings = []
     findings += check_config_api_key(args.config)
     findings += check_config_filter(args.config)
+    findings += check_ui_defaults()
     findings += check_binary_feature_flags(args.binary)
     findings += check_qa_routes_absent(args.base_url, args.api_key)
 

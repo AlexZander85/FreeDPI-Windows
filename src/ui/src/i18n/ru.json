@@ -104,6 +104,7 @@
     "general": "Основные",
     "advanced": "Дополнительно",
     "windivert_filter": "Фильтр WinDivert",
+    "windivert_filter_placeholder": "пусто = динамический безопасный фильтр",
     "split_size": "Размер сплита",
     "split_count": "Количество сегментов",
     "fake_sni": "Fake SNI",

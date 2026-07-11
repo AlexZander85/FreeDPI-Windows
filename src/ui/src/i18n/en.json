@@ -104,6 +104,7 @@
     "general": "General",
     "advanced": "Advanced",
     "windivert_filter": "WinDivert Filter",
+    "windivert_filter_placeholder": "empty = dynamic safe filter",
     "split_size": "Split Size",
     "split_count": "Split Count",
     "fake_sni": "Fake SNI",

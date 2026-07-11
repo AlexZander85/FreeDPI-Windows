@@ -1539,25 +1539,39 @@ impl ProcessingPipeline {
                                     }
                                 };
 
-                                if i > 0 && inter_delay_us > 0 {
-                                    if !pipeline.delayed_inject.try_schedule(
-                                        inter_delay_us * i as u32,
-                                        inject_pkt.clone(),
-                                        inject_addr.clone(),
-                                    ) {
+                                if inject_addr.outbound() {
+                                    if i > 0 && inter_delay_us > 0 {
+                                        if !pipeline.delayed_inject.try_schedule(
+                                            inter_delay_us * i as u32,
+                                            inject_pkt.clone(),
+                                            inject_addr.clone(),
+                                        ) {
+                                            if let Err(e) = engine.inject_raw_udp(&inject_pkt) {
+                                                tracing::warn!(
+                                                    "Failed to inject UDP desync packet: {}",
+                                                    e
+                                                );
+                                            }
+                                            pool.release_bytes(inject_pkt);
+                                        }
+                                    } else {
                                         if let Err(e) = engine.inject_raw_udp(&inject_pkt) {
-                                            tracing::warn!(
-                                                "Failed to inject UDP desync packet: {}",
-                                                e
-                                            );
+                                            tracing::warn!("Failed to inject UDP desync packet: {}", e);
                                         }
                                         pool.release_bytes(inject_pkt);
                                     }
                                 } else {
-                                    if let Err(e) = engine.inject_raw_udp(&inject_pkt) {
-                                        tracing::warn!("Failed to inject UDP desync packet: {}", e);
+                                    if i > 0 && inter_delay_us > 0 {
+                                        if !pipeline.delayed_inject.try_schedule(
+                                            inter_delay_us * i as u32,
+                                            inject_pkt.clone(),
+                                            inject_addr.clone(),
+                                        ) {
+                                            tx_queue.push(TxAction::Inject(inject_pkt, inject_addr));
+                                        }
+                                    } else {
+                                        tx_queue.push(TxAction::Inject(inject_pkt, inject_addr));
                                     }
-                                    pool.release_bytes(inject_pkt);
                                 }
                                 pipeline
                                     .stats
