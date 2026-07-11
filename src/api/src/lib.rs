@@ -27,7 +27,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 // ─── Типы данных ───────────────────────────────────────────────────────────
 

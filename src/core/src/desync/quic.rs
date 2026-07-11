@@ -2328,7 +2328,8 @@ mod tests {
         // Skip IP header (20 bytes for IPv4) + UDP header (8 bytes)
         if packet.len() > 28 {
             let quic_layer = &packet[28..];
-            let (pn, dcid) = extract_quic_pn_unprotected_for_tests_only(quic_layer).expect("parse failed");
+            let (pn, dcid) =
+                extract_quic_pn_unprotected_for_tests_only(quic_layer).expect("parse failed");
             assert!(!dcid.is_empty(), "DCID must be extracted");
             assert!(pn <= 0xFFFFFFFF, "PN should fit in 32 bits, got 0x{:X}", pn);
         }

@@ -43,7 +43,9 @@ impl RedirectTable {
     }
 
     pub fn is_ip_active(&self, ip: &IpAddr) -> bool {
-        self.map.iter().any(|entry| entry.value().orig_dst_ip == *ip)
+        self.map
+            .iter()
+            .any(|entry| entry.value().orig_dst_ip == *ip)
     }
 }
 
