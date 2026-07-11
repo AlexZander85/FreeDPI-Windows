@@ -45,6 +45,7 @@ review/
 review2/
 
 # === Implementation plans (keep local) ===
+GPT-5.5_Thinking_patch_plan_v6_integrated_gemini.md
 IMPLEMENTATION_PLAN*.md
 add.md
 add_plan.md
