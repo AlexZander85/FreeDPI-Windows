@@ -2750,10 +2750,8 @@ impl ProcessingPipeline {
                 let latency_us = tune_start.elapsed().as_micros() as u64;
                 self.auto_tune.record_application_by_id(profile.id);
 
-                if result.inject.is_empty() && result.modified.is_none() {
-                    if result.drop {
-                        return Ok(PacketDecision::Drop);
-                    }
+                if result.inject.is_empty() && result.modified.is_none() && result.drop {
+                    return Ok(PacketDecision::Drop);
                 }
                 if let Some(modified) = result.modified {
                     if result.inject.is_empty() {
@@ -2800,10 +2798,8 @@ impl ProcessingPipeline {
                 let latency_us = tune_start.elapsed().as_micros() as u64;
                 self.auto_tune.record_application_by_id(profile.id);
 
-                if result.inject.is_empty() && result.modified.is_none() {
-                    if result.drop {
-                        return Ok(PacketDecision::Drop);
-                    }
+                if result.inject.is_empty() && result.modified.is_none() && result.drop {
+                    return Ok(PacketDecision::Drop);
                 }
                 if let Some(modified) = result.modified {
                     if result.inject.is_empty() {

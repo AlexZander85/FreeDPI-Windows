@@ -1802,6 +1802,7 @@ pub fn extract_quic_pn_unprotected_for_tests_only(packet: &[u8]) -> Option<(u64,
 /// Long Header: версия (4), DCID len (1), DCID (N), SCID len (1), ...
 /// PN находится после всех полей заголовка, в последних 1-4 байтах
 /// (зависит от PN Length из флагов).
+#[allow(dead_code)]
 fn extract_long_header_pn_dcid(packet: &[u8]) -> Option<(u64, Vec<u8>)> {
     if packet.len() < 6 {
         return None;
@@ -1893,6 +1894,7 @@ fn extract_long_header_pn_dcid(packet: &[u8]) -> Option<(u64, Vec<u8>)> {
 /// Для short header мы не знаем длину DCID, если нет контекста.
 /// По умолчанию пробуем все возможные длины DCID (8 байт,
 /// как самое частое значение для Initial-установленных соединений).
+#[allow(dead_code)]
 fn extract_short_header_pn_dcid(packet: &[u8]) -> Option<(u64, Vec<u8>)> {
     if packet.len() < 2 {
         return None;
