@@ -309,9 +309,9 @@ mod tests {
         let conntrack = Arc::new(crate::conntrack::Conntrack::new(std::time::Duration::from_secs(30)));
         let redirect_table = Arc::new(crate::desync::redirect_table::RedirectTable::new());
 
-        // Insert connection for ip2 in conntrack (to make it active)
+        // Insert connection for ip1 in conntrack (to make it active)
         let key = crate::conntrack::ConnKey::new(
-            std::net::IpAddr::V4(ip2),
+            std::net::IpAddr::V4(ip1),
             std::net::IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             12345,
             443,
@@ -329,11 +329,11 @@ mod tests {
 
         manager.register_active_checkers(conntrack, redirect_table);
 
-        // Allocate a 4th domain. "b.com" (ip2) is the oldest but is active, so we should skip it and evict "c.com" (ip3) instead!
+        // Allocate a 4th domain. "a.com" (ip1) is the oldest (tick 0) but is active, so we should skip it and evict "b.com" (ip2, tick 1) instead!
         let ip4 = manager.allocate("d.com").unwrap();
-        assert_eq!(ip4, ip3); // Recycled ip3 instead of ip2!
+        assert_eq!(ip4, ip2); // Recycled ip2 instead of ip1!
         assert_eq!(manager.lookup(&IpAddr::V4(ip1)), Some("a.com".to_string()));
-        assert_eq!(manager.lookup(&IpAddr::V4(ip2)), Some("b.com".to_string()));
-        assert_eq!(manager.lookup(&IpAddr::V4(ip3)), Some("d.com".to_string()));
+        assert_eq!(manager.lookup(&IpAddr::V4(ip2)), Some("d.com".to_string()));
+        assert_eq!(manager.lookup(&IpAddr::V4(ip3)), Some("c.com".to_string()));
     }
 }
