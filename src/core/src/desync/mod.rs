@@ -1551,4 +1551,234 @@ mod tests {
             );
         }
     }
+
+    fn make_test_tcp_packet(
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> Vec<u8> {
+        let mut pkt_data = vec![0u8; 40]; // 20 bytes IP, 20 bytes TCP
+        {
+            let mut ip = MutableIpv4Packet::new(&mut pkt_data[..20]).unwrap();
+            ip.set_version(4);
+            ip.set_header_length(5);
+            ip.set_total_length(40);
+            ip.set_next_level_protocol(pnet_packet::ip::IpNextHeaderProtocols::Tcp);
+            ip.set_source(src_ip);
+            ip.set_destination(dst_ip);
+        }
+        {
+            let mut tcp = pnet_packet::tcp::MutableTcpPacket::new(&mut pkt_data[20..]).unwrap();
+            tcp.set_source(src_port);
+            tcp.set_destination(dst_port);
+        }
+        pkt_data
+    }
+
+    #[test]
+    fn test_derive_direction_rules() {
+        let local_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let remote_ip = Ipv4Addr::new(8, 8, 8, 8);
+
+        let original_pkt = make_test_tcp_packet(local_ip, remote_ip, 50000, 443);
+        let parsed_original = parse_packet_tuple(&original_pkt).unwrap();
+
+        let ctx = DirectionDeriveContext {
+            original_tuple: parsed_original,
+            original_outbound: true,
+            original_loopback: false,
+        };
+
+        // 1. derive_outbound_from_original_outbound_same_tuple
+        let same_pkt = make_test_tcp_packet(local_ip, remote_ip, 50000, 443);
+        let res = derive_inject_direction_from_tuple(&same_pkt, &ctx).unwrap();
+        assert_eq!(res, InjectDirection::ForceOutbound);
+
+        // 2. derive_inbound_from_original_outbound_reverse_tuple
+        let rev_pkt = make_test_tcp_packet(remote_ip, local_ip, 443, 50000);
+        let res2 = derive_inject_direction_from_tuple(&rev_pkt, &ctx).unwrap();
+        assert_eq!(res2, InjectDirection::ForceInbound);
+
+        // 3. derive_outbound_from_original_inbound_reverse_tuple
+        let inbound_pkt = make_test_tcp_packet(remote_ip, local_ip, 443, 50000);
+        let parsed_inbound = parse_packet_tuple(&inbound_pkt).unwrap();
+        let ctx_inbound = DirectionDeriveContext {
+            original_tuple: parsed_inbound,
+            original_outbound: false,
+            original_loopback: false,
+        };
+        let outbound_inject = make_test_tcp_packet(local_ip, remote_ip, 50000, 443);
+        let res3 = derive_inject_direction_from_tuple(&outbound_inject, &ctx_inbound).unwrap();
+        assert_eq!(res3, InjectDirection::ForceOutbound);
+
+        // 4. derive_rejects_unrelated_tuple
+        let unrelated_pkt = make_test_tcp_packet(local_ip, Ipv4Addr::new(1, 1, 1, 1), 50000, 443);
+        let res4 = derive_inject_direction_from_tuple(&unrelated_pkt, &ctx);
+        assert!(res4.is_err());
+
+        // 5. derive_rejects_protocol_mismatch
+        let mut udp_pkt = vec![0u8; 28]; // 20 bytes IP, 8 bytes UDP
+        {
+            let mut ip = MutableIpv4Packet::new(&mut udp_pkt[..20]).unwrap();
+            ip.set_version(4);
+            ip.set_header_length(5);
+            ip.set_total_length(28);
+            ip.set_next_level_protocol(pnet_packet::ip::IpNextHeaderProtocols::Udp);
+            ip.set_source(local_ip);
+            ip.set_destination(remote_ip);
+        }
+        let res5 = derive_inject_direction_from_tuple(&udp_pkt, &ctx);
+        assert!(res5.is_err());
+
+        // 6. derived_direction_failure_drops_inject_not_original
+        let unrelated_pkt2 = make_test_tcp_packet(Ipv4Addr::new(1, 1, 1, 1), local_ip, 80, 50000);
+        let res6 = derive_inject_direction_from_tuple(&unrelated_pkt2, &ctx);
+        assert!(res6.is_err());
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedPacketTuple {
+    pub proto: u8,
+    pub src_ip: IpAddr,
+    pub dst_ip: IpAddr,
+    pub src_port: Option<u16>,
+    pub dst_port: Option<u16>,
+}
+
+pub fn parse_packet_tuple(packet: &[u8]) -> Option<ParsedPacketTuple> {
+    let ip = parse_ip_header(packet)?;
+    let (proto, src_ip, dst_ip, header_len) = match &ip {
+        ParsedIpHeader::V4(v4) => (
+            v4.protocol.0,
+            IpAddr::V4(v4.src),
+            IpAddr::V4(v4.dst),
+            v4.header_len,
+        ),
+        ParsedIpHeader::V6(v6) => (
+            v6.next_header.0,
+            IpAddr::V6(v6.src),
+            IpAddr::V6(v6.dst),
+            v6.header_len,
+        ),
+    };
+
+    if header_len >= packet.len() {
+        return None;
+    }
+    let transport = &packet[header_len..];
+
+    let (src_port, dst_port) = match proto {
+        6 => {
+            // TCP
+            let tcp = pnet_packet::tcp::TcpPacket::new(transport)?;
+            (Some(tcp.get_source()), Some(tcp.get_destination()))
+        }
+        17 => {
+            // UDP
+            let udp = pnet_packet::udp::UdpPacket::new(transport)?;
+            (Some(udp.get_source()), Some(udp.get_destination()))
+        }
+        _ => (None, None),
+    };
+
+    Some(ParsedPacketTuple {
+        proto,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct DirectionDeriveContext {
+    pub original_tuple: ParsedPacketTuple,
+    pub original_outbound: bool,
+    pub original_loopback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectionDeriveError {
+    UnparseableInjectedPacket,
+    ProtocolMismatch {
+        original: u8,
+        injected: u8,
+    },
+    TupleDoesNotMatchOriginalFlow {
+        injected: ParsedPacketTuple,
+        original: ParsedPacketTuple,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    pub ip: IpAddr,
+    pub port: Option<u16>,
+}
+
+fn endpoints_match(a: &Endpoint, b: &Endpoint) -> bool {
+    a.ip == b.ip && (a.port.is_none() || b.port.is_none() || a.port == b.port)
+}
+
+pub fn derive_inject_direction_from_tuple(
+    inject_packet: &[u8],
+    ctx: &DirectionDeriveContext,
+) -> Result<InjectDirection, DirectionDeriveError> {
+    let injected =
+        parse_packet_tuple(inject_packet).ok_or(DirectionDeriveError::UnparseableInjectedPacket)?;
+
+    if injected.proto != ctx.original_tuple.proto {
+        return Err(DirectionDeriveError::ProtocolMismatch {
+            original: ctx.original_tuple.proto,
+            injected: injected.proto,
+        });
+    }
+
+    let (local, remote) = if ctx.original_outbound {
+        (
+            Endpoint {
+                ip: ctx.original_tuple.src_ip,
+                port: ctx.original_tuple.src_port,
+            },
+            Endpoint {
+                ip: ctx.original_tuple.dst_ip,
+                port: ctx.original_tuple.dst_port,
+            },
+        )
+    } else {
+        (
+            Endpoint {
+                ip: ctx.original_tuple.dst_ip,
+                port: ctx.original_tuple.dst_port,
+            },
+            Endpoint {
+                ip: ctx.original_tuple.src_ip,
+                port: ctx.original_tuple.src_port,
+            },
+        )
+    };
+
+    let injected_src = Endpoint {
+        ip: injected.src_ip,
+        port: injected.src_port,
+    };
+    let injected_dst = Endpoint {
+        ip: injected.dst_ip,
+        port: injected.dst_port,
+    };
+
+    if endpoints_match(&injected_src, &local) && endpoints_match(&injected_dst, &remote) {
+        return Ok(InjectDirection::ForceOutbound);
+    }
+
+    if endpoints_match(&injected_src, &remote) && endpoints_match(&injected_dst, &local) {
+        return Ok(InjectDirection::ForceInbound);
+    }
+
+    Err(DirectionDeriveError::TupleDoesNotMatchOriginalFlow {
+        injected,
+        original: ctx.original_tuple.clone(),
+    })
 }

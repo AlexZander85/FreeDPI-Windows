@@ -5,10 +5,9 @@ release_verify.py
 Verifies a built release artifact does not carry QA/test-only surface or unsafe
 defaults. Grounded in actual source findings (see docs/known_limitations.md):
 
-  - dist/deploy.ps1 writes `api_key = ""` literally into the generated config,
-    defeating core/src/config.rs's working default_api_key() UUID generator. This
-    is the highest-value check this tool does — it's a real, confirmed bug in the
-    installer, not a hypothetical.
+  - Checks that deploy/config do not regress to empty api_key (previously,
+    dist/deploy.ps1 wrote `api_key = ""` literally, which has been fixed to
+    generate a random UUID). This ensures production deployments remain secure.
   - The api crate's `qa` Cargo feature (see patches/0001-qa-feature-and-routes.md)
     must not be present in a release build.
   - src/vendor/windivert/*.sys must not be user-writable in a packaged release
@@ -53,15 +52,10 @@ def check_config_api_key(config_path: Path) -> list:
             "severity": "fail",
             "check": "api_key_not_empty",
             "message": (
-                "api_key is literally empty in the deployed config. This is a known "
-                "bug: dist/deploy.ps1 writes `api_key = \"\"` explicitly, which "
-                "defeats config.rs's default_api_key() random-UUID generator (that "
-                "fallback only fires when the key is ABSENT, not empty-string-present). "
-                "Any client can control the API with X-API-Key: (empty) or by omitting "
-                "the header if auth_middleware's comparison treats missing-header as "
-                "empty-string too (see src/api/src/lib.rs auth_middleware: "
-                "`.unwrap_or(\"\")` — confirm this doesn't compare true against an "
-                "empty configured key)."
+                "api_key is literally empty in the deployed config. This is a regression: "
+                "dist/deploy.ps1 and config templates must not write empty keys, which "
+                "defeats config.rs's default_api_key() random-UUID generator. "
+                "Ensure a non-empty UUID api_key is configured to prevent unauthorized API access."
             ),
         })
     elif len(key) < 16:

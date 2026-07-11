@@ -188,6 +188,10 @@ pub struct ProcessingStats {
     pub invariant_udp_length_mismatch: PaddedCounter,
     pub invariant_quic_initial_too_small: PaddedCounter,
 
+    pub inject_direction_derive_failed: PaddedCounter,
+    pub inject_direction_derived_outbound: PaddedCounter,
+    pub inject_direction_derived_inbound: PaddedCounter,
+
     // References for dynamic stats
     pub buf_pool: std::sync::OnceLock<Arc<PacketBufferPool>>,
     pub shard_txs: std::sync::OnceLock<Arc<Vec<crossbeam::channel::Sender<CapturedPacket>>>>,
@@ -234,6 +238,10 @@ impl ProcessingStats {
             invariant_udp_header_too_short: PaddedCounter::new(0),
             invariant_udp_length_mismatch: PaddedCounter::new(0),
             invariant_quic_initial_too_small: PaddedCounter::new(0),
+
+            inject_direction_derive_failed: PaddedCounter::new(0),
+            inject_direction_derived_outbound: PaddedCounter::new(0),
+            inject_direction_derived_inbound: PaddedCounter::new(0),
 
             buf_pool: std::sync::OnceLock::new(),
             shard_txs: std::sync::OnceLock::new(),
@@ -1289,70 +1297,61 @@ impl ProcessingPipeline {
             tx_queue.clear();
 
             // 3. Process first packet
-            Self::shard_process_one(
-                first,
-                &mut tx_queue,
-                &engine,
-                &pipeline,
-                &pool,
-            );
+            Self::shard_process_one(first, &mut tx_queue, &engine, &pipeline, &pool);
 
             // 4. Drain remaining available packets (batch processing)
             while tx_queue.len() < 64 {
                 match rx.try_recv() {
-                    Ok(pkt) => Self::shard_process_one(
-                        pkt,
-                        &mut tx_queue,
-                        &engine,
-                        &pipeline,
-                        &pool,
-                    ),
+                    Ok(pkt) => {
+                        Self::shard_process_one(pkt, &mut tx_queue, &engine, &pipeline, &pool)
+                    }
                     Err(_) => break,
                 }
             }
 
             // 5. Send tx_queue actions while preserving wire order and batching adjacent ones
             if !tx_queue.is_empty() {
-                let mut i = 0;
-                while i < tx_queue.len() {
-                    match &tx_queue[i] {
-                        TxAction::Forward(_, _) => {
-                            let mut batch = Vec::new();
-                            while i < tx_queue.len() {
-                                if let TxAction::Forward(ref data, ref addr) = tx_queue[i] {
-                                    batch.push((data.clone(), addr.clone()));
-                                    i += 1;
-                                } else {
-                                    break;
+                let actions = std::mem::take(&mut tx_queue);
+                let mut iter = actions.into_iter().peekable();
+
+                while let Some(action) = iter.next() {
+                    match action {
+                        TxAction::Forward(data, addr) => {
+                            let mut batch = vec![(data, addr)];
+                            while let Some(TxAction::Forward(_, _)) = iter.peek() {
+                                if let Some(TxAction::Forward(d, a)) = iter.next() {
+                                    batch.push((d, a));
                                 }
                             }
                             if let Ok(n) = engine.send_batch(&batch) {
-                                pipeline.stats.forwarded.fetch_add(n as u64, Ordering::Relaxed);
+                                pipeline
+                                    .stats
+                                    .forwarded
+                                    .fetch_add(n as u64, Ordering::Relaxed);
                             }
-                            for (data, _) in batch {
-                                pool.release_bytes(data);
+                            for (d, _) in batch {
+                                pool.release_bytes(d);
                             }
                         }
-                        TxAction::Inject(_, _) => {
-                            let mut batch = Vec::new();
-                            while i < tx_queue.len() {
-                                if let TxAction::Inject(ref data, ref addr) = tx_queue[i] {
-                                    batch.push((data.clone(), addr.clone()));
-                                    i += 1;
-                                } else {
-                                    break;
+                        TxAction::Inject(data, addr) => {
+                            let mut batch = vec![(data, addr)];
+                            while let Some(TxAction::Inject(_, _)) = iter.peek() {
+                                if let Some(TxAction::Inject(d, a)) = iter.next() {
+                                    batch.push((d, a));
                                 }
                             }
                             if let Ok(n) = engine.inject_batch_via_divert(&batch) {
-                                pipeline.stats.fake_ch_injected.fetch_add(n as u64, Ordering::Relaxed);
+                                pipeline
+                                    .stats
+                                    .fake_ch_injected
+                                    .fetch_add(n as u64, Ordering::Relaxed);
                             }
-                            for (data, _) in batch {
-                                pool.release_bytes(data);
+                            for (d, _) in batch {
+                                pool.release_bytes(d);
                             }
                         }
                     }
                 }
-                tx_queue.clear();
             }
         }
 
@@ -1361,19 +1360,90 @@ impl ProcessingPipeline {
 
     /// P0-10: Apply the configured inject direction to the WinDivertAddress.
     fn apply_inject_direction(
-        original: &WinDivertAddress<NetworkLayer>,
+        original_addr: &WinDivertAddress<NetworkLayer>,
         direction: crate::desync::InjectDirection,
-    ) -> WinDivertAddress<NetworkLayer> {
-        let mut addr = original.clone();
+        inject_packet: &[u8],
+        derive_ctx: Option<&crate::desync::DirectionDeriveContext>,
+        stats: &ProcessingStats,
+    ) -> Option<WinDivertAddress<NetworkLayer>> {
+        let mut addr = original_addr.clone();
         match direction {
-            crate::desync::InjectDirection::ForceOutbound => addr.set_outbound(true),
-            crate::desync::InjectDirection::ForceInbound => addr.set_outbound(false),
-            crate::desync::InjectDirection::PreserveOriginal => {}
-            crate::desync::InjectDirection::DerivedFromPacketTuple => {
+            crate::desync::InjectDirection::PreserveOriginal => Some(addr),
+            crate::desync::InjectDirection::ForceOutbound => {
                 addr.set_outbound(true);
+                Some(addr)
+            }
+            crate::desync::InjectDirection::ForceInbound => {
+                addr.set_outbound(false);
+                Some(addr)
+            }
+            crate::desync::InjectDirection::DerivedFromPacketTuple => {
+                let ctx = match derive_ctx {
+                    Some(c) => c,
+                    None => {
+                        stats
+                            .inject_direction_derive_failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            "DerivedFromPacketTuple requested without DirectionDeriveContext"
+                        );
+                        return None;
+                    }
+                };
+
+                // For loopback, verify it matches same/reverse flow tuple
+                if ctx.original_loopback {
+                    match crate::desync::derive_inject_direction_from_tuple(inject_packet, ctx) {
+                        Ok(crate::desync::InjectDirection::ForceOutbound) => {
+                            addr.set_outbound(true);
+                            stats
+                                .inject_direction_derived_outbound
+                                .fetch_add(1, Ordering::Relaxed);
+                            Some(addr)
+                        }
+                        Ok(crate::desync::InjectDirection::ForceInbound) => {
+                            addr.set_outbound(false);
+                            stats
+                                .inject_direction_derived_inbound
+                                .fetch_add(1, Ordering::Relaxed);
+                            Some(addr)
+                        }
+                        _ => {
+                            stats
+                                .inject_direction_derive_failed
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                "loopback DerivedFromPacketTuple matches loopback check failure"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    match crate::desync::derive_inject_direction_from_tuple(inject_packet, ctx) {
+                        Ok(crate::desync::InjectDirection::ForceOutbound) => {
+                            addr.set_outbound(true);
+                            stats
+                                .inject_direction_derived_outbound
+                                .fetch_add(1, Ordering::Relaxed);
+                            Some(addr)
+                        }
+                        Ok(crate::desync::InjectDirection::ForceInbound) => {
+                            addr.set_outbound(false);
+                            stats
+                                .inject_direction_derived_inbound
+                                .fetch_add(1, Ordering::Relaxed);
+                            Some(addr)
+                        }
+                        _ => {
+                            stats
+                                .inject_direction_derive_failed
+                                .fetch_add(1, Ordering::Relaxed);
+                            None
+                        }
+                    }
+                }
             }
         }
-        addr
     }
 
     /// P1-00: Process a single packet in the shard worker context.
@@ -1387,6 +1457,13 @@ impl ProcessingPipeline {
     ) {
         let decision = pipeline.process_one_sync(&captured);
         let CapturedPacket { data, addr } = captured;
+
+        let original_tuple = crate::desync::parse_packet_tuple(&data);
+        let derive_ctx = original_tuple.map(|tuple| crate::desync::DirectionDeriveContext {
+            original_tuple: tuple,
+            original_outbound: addr.outbound(),
+            original_loopback: addr.loopback(),
+        });
 
         match decision {
             Ok(decision) => match decision {
@@ -1407,8 +1484,6 @@ impl ProcessingPipeline {
                     inject_direction,
                     drop_original,
                 } => {
-                    let inject_addr = Self::apply_inject_direction(&addr, inject_direction);
-
                     // 1. First inject decoy/fake segments (with appropriate delay)
                     match inject_protocol {
                         InjectProtocol::Tcp => {
@@ -1417,16 +1492,30 @@ impl ProcessingPipeline {
                                     pool.release_bytes(inject_pkt);
                                     continue;
                                 }
+                                let inject_addr = match Self::apply_inject_direction(
+                                    &addr,
+                                    inject_direction,
+                                    &inject_pkt,
+                                    derive_ctx.as_ref(),
+                                    &pipeline.stats,
+                                ) {
+                                    Some(a) => a,
+                                    None => {
+                                        pool.release_bytes(inject_pkt);
+                                        continue;
+                                    }
+                                };
+
                                 if i > 0 && inter_delay_us > 0 {
                                     if !pipeline.delayed_inject.try_schedule(
                                         inter_delay_us * i as u32,
                                         inject_pkt.clone(),
                                         inject_addr.clone(),
                                     ) {
-                                        tx_queue.push(TxAction::Inject(inject_pkt, inject_addr.clone()));
+                                        tx_queue.push(TxAction::Inject(inject_pkt, inject_addr));
                                     }
                                 } else {
-                                    tx_queue.push(TxAction::Inject(inject_pkt, inject_addr.clone()));
+                                    tx_queue.push(TxAction::Inject(inject_pkt, inject_addr));
                                 }
                             }
                         }
@@ -1436,6 +1525,20 @@ impl ProcessingPipeline {
                                     pool.release_bytes(inject_pkt);
                                     continue;
                                 }
+                                let inject_addr = match Self::apply_inject_direction(
+                                    &addr,
+                                    inject_direction,
+                                    &inject_pkt,
+                                    derive_ctx.as_ref(),
+                                    &pipeline.stats,
+                                ) {
+                                    Some(a) => a,
+                                    None => {
+                                        pool.release_bytes(inject_pkt);
+                                        continue;
+                                    }
+                                };
+
                                 if i > 0 && inter_delay_us > 0 {
                                     if !pipeline.delayed_inject.try_schedule(
                                         inter_delay_us * i as u32,
@@ -1443,7 +1546,10 @@ impl ProcessingPipeline {
                                         inject_addr.clone(),
                                     ) {
                                         if let Err(e) = engine.inject_raw_udp(&inject_pkt) {
-                                            tracing::warn!("Failed to inject UDP desync packet: {}", e);
+                                            tracing::warn!(
+                                                "Failed to inject UDP desync packet: {}",
+                                                e
+                                            );
                                         }
                                         pool.release_bytes(inject_pkt);
                                     }
@@ -1768,7 +1874,9 @@ impl ProcessingPipeline {
                     return Ok(PacketDecision::Drop); // Drop original query
                 } else {
                     // Queue full: fail-open (forward original query directly to network)
-                    tracing::warn!("DNS async queue full, fail-open: forwarding original DNS query");
+                    tracing::warn!(
+                        "DNS async queue full, fail-open: forwarding original DNS query"
+                    );
                     return Ok(PacketDecision::Forward);
                 }
             }
@@ -2388,7 +2496,8 @@ impl ProcessingPipeline {
                 );
                 let conn_id = crate::conntrack::compute_conn_id(&fk);
                 let quic_dcid = if cp.payload_offset < packet.len() {
-                    extract_quic_dcid_from_long_header(&packet[cp.payload_offset..]).unwrap_or_default()
+                    extract_quic_dcid_from_long_header(&packet[cp.payload_offset..])
+                        .unwrap_or_default()
                 } else {
                     vec![]
                 };
@@ -2800,8 +2909,6 @@ impl ProcessingPipeline {
         Ok(PacketDecision::Forward)
     }
 
-
-
     pub fn has_divert(&self) -> bool {
         self.packet_engine.has_divert()
     }
@@ -3116,5 +3223,59 @@ mod concurrency_tests {
         }];
         let pipeline = ProcessingPipeline::new_api_only(config);
         assert!(pipeline.is_profile_activated("socks5_fallback"));
+    }
+
+    #[test]
+    fn test_pool_reuse_ordered_tx_queue() {
+        let pool = Arc::new(PacketBufferPool::new(10));
+        let addr: WinDivertAddress<NetworkLayer> = unsafe { std::mem::zeroed() };
+
+        let mut tx_queue = Vec::new();
+
+        let buf1 = pool.acquire().freeze();
+        let buf2 = pool.acquire().freeze();
+        let buf3 = pool.acquire().freeze();
+        let buf4 = pool.acquire().freeze();
+
+        tx_queue.push(TxAction::Forward(buf1, addr.clone()));
+        tx_queue.push(TxAction::Inject(buf2, addr.clone()));
+        tx_queue.push(TxAction::Inject(buf3, addr.clone()));
+        tx_queue.push(TxAction::Forward(buf4, addr.clone()));
+
+        assert_eq!(pool.pool_release_success_total(), 0);
+        assert_eq!(pool.pool_release_refcount_failed_total(), 0);
+
+        let actions = std::mem::take(&mut tx_queue);
+        let mut iter = actions.into_iter().peekable();
+
+        while let Some(action) = iter.next() {
+            match action {
+                TxAction::Forward(data, addr) => {
+                    let mut batch = vec![(data, addr)];
+                    while let Some(TxAction::Forward(_, _)) = iter.peek() {
+                        if let Some(TxAction::Forward(d, a)) = iter.next() {
+                            batch.push((d, a));
+                        }
+                    }
+                    for (d, _) in batch {
+                        pool.release_bytes(d);
+                    }
+                }
+                TxAction::Inject(data, addr) => {
+                    let mut batch = vec![(data, addr)];
+                    while let Some(TxAction::Inject(_, _)) = iter.peek() {
+                        if let Some(TxAction::Inject(d, a)) = iter.next() {
+                            batch.push((d, a));
+                        }
+                    }
+                    for (d, _) in batch {
+                        pool.release_bytes(d);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(pool.pool_release_success_total(), 4);
+        assert_eq!(pool.pool_release_refcount_failed_total(), 0);
     }
 }

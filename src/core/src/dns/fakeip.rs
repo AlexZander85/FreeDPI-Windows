@@ -82,15 +82,24 @@ impl FakeIpManager {
                 false
             };
 
-            let mut candidates: Vec<(Ipv4Addr, u64)> = self.ip_to_domain.iter()
-                .map(|entry| (*entry.key(), entry.value().last_used.load(Ordering::Relaxed)))
+            let mut candidates: Vec<(Ipv4Addr, u64)> = self
+                .ip_to_domain
+                .iter()
+                .map(|entry| {
+                    (
+                        *entry.key(),
+                        entry.value().last_used.load(Ordering::Relaxed),
+                    )
+                })
                 .collect();
             candidates.sort_by_key(|&(_, t)| t);
 
-            let mut evicted = false;
             for (ip_to_evict, oldest_time) in candidates {
                 if is_active(&ip_to_evict) {
-                    debug!("FakeIP candidate {} is active, skipping eviction", ip_to_evict);
+                    debug!(
+                        "FakeIP candidate {} is active, skipping eviction",
+                        ip_to_evict
+                    );
                     continue;
                 }
 
@@ -113,15 +122,14 @@ impl FakeIpManager {
                             last_used: AtomicU64::new(now),
                         },
                     );
-                    evicted = true;
                     return Some(ip_to_evict);
                 }
             }
 
-            if !evicted {
-                tracing::warn!("FakeIP cache full, but all mappings are currently active. Eviction skipped.");
-                return None;
-            }
+            tracing::warn!(
+                "FakeIP cache full, but all mappings are currently active. Eviction skipped."
+            );
+            return None;
         }
 
         // 3. Выделяем новый IP (если лимит не превышен или не удалось вытеснить)
@@ -306,7 +314,9 @@ mod tests {
         let ip3 = manager.allocate("c.com").unwrap();
 
         // Register conntrack with mock active checks
-        let conntrack = Arc::new(crate::conntrack::Conntrack::new(std::time::Duration::from_secs(30)));
+        let conntrack = Arc::new(crate::conntrack::Conntrack::new(
+            std::time::Duration::from_secs(30),
+        ));
         let redirect_table = Arc::new(crate::desync::redirect_table::RedirectTable::new());
 
         // Insert connection for ip1 in conntrack (to make it active)
@@ -317,15 +327,31 @@ mod tests {
             443,
             6,
         );
-        conntrack.upsert(key, crate::conntrack::ConntrackEntry {
-            client_isn: 0, server_isn: 0, client_seq: 0, server_seq: 0,
-            client_ack: 0, server_ack: 0, rtt_us: 0,
-            state: crate::conntrack::ConnState::Established,
-            desync_applied: false, dscp_spoof: 0, strategy_id: 0,
-            last_activity: std::time::Instant::now(), dup_ack_count: 0,
-            rng: None, quic_pn: 0, quic_dcid: vec![], is_resumption: false,
-            applied_strategy: None, route_key: None, quic_dropped_initials: 0,
-        });
+        conntrack.upsert(
+            key,
+            crate::conntrack::ConntrackEntry {
+                client_isn: 0,
+                server_isn: 0,
+                client_seq: 0,
+                server_seq: 0,
+                client_ack: 0,
+                server_ack: 0,
+                rtt_us: 0,
+                state: crate::conntrack::ConnState::Established,
+                desync_applied: false,
+                dscp_spoof: 0,
+                strategy_id: 0,
+                last_activity: std::time::Instant::now(),
+                dup_ack_count: 0,
+                rng: None,
+                quic_pn: 0,
+                quic_dcid: vec![],
+                is_resumption: false,
+                applied_strategy: None,
+                route_key: None,
+                quic_dropped_initials: 0,
+            },
+        );
 
         manager.register_active_checkers(conntrack, redirect_table);
 
