@@ -42,21 +42,11 @@ pub enum PacketDecision {
     Forward,
     Modify(bytes::Bytes),
     Desync {
-        inject: smallvec::SmallVec<[bytes::Bytes; 4]>,
+        inject: smallvec::SmallVec<[crate::desync::InjectPacket; 4]>,
         modified: Option<bytes::Bytes>,
-        inject_protocol: InjectProtocol,
-        inter_delay_us: u32,
-        /// P0-10: Направление инъекции (PreserveOriginal, ForceOutbound, ForceInbound).
-        inject_direction: crate::desync::InjectDirection,
         drop_original: bool,
     },
     Drop,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum InjectProtocol {
-    Tcp,
-    Udp,
 }
 
 enum TxAction {
@@ -1479,106 +1469,94 @@ impl ProcessingPipeline {
                 PacketDecision::Desync {
                     inject,
                     modified,
-                    inject_protocol,
-                    inter_delay_us,
-                    inject_direction,
                     drop_original,
                 } => {
                     // 1. First inject decoy/fake segments (with appropriate delay)
-                    match inject_protocol {
-                        InjectProtocol::Tcp => {
-                            for (i, inject_pkt) in inject.into_iter().enumerate() {
-                                if !pipeline.validate_packet_and_log(&inject_pkt) {
-                                    pool.release_bytes(inject_pkt);
-                                    continue;
-                                }
-                                let inject_addr = match Self::apply_inject_direction(
-                                    &addr,
-                                    inject_direction,
-                                    &inject_pkt,
-                                    derive_ctx.as_ref(),
-                                    &pipeline.stats,
-                                ) {
-                                    Some(a) => a,
-                                    None => {
-                                        pool.release_bytes(inject_pkt);
-                                        continue;
-                                    }
-                                };
+                    for inject_pkt in inject {
+                        if !pipeline.validate_packet_and_log(&inject_pkt.bytes) {
+                            pool.release_bytes(inject_pkt.bytes);
+                            continue;
+                        }
+                        let inject_addr = match Self::apply_inject_direction(
+                            &addr,
+                            inject_pkt.direction,
+                            &inject_pkt.bytes,
+                            derive_ctx.as_ref(),
+                            &pipeline.stats,
+                        ) {
+                            Some(a) => a,
+                            None => {
+                                pool.release_bytes(inject_pkt.bytes);
+                                continue;
+                            }
+                        };
 
-                                if i > 0 && inter_delay_us > 0 {
+                        let delay_us = inject_pkt.delay_us;
+
+                        match inject_pkt.protocol {
+                            crate::desync::InjectProtocol::Tcp => {
+                                if delay_us > 0 {
                                     if !pipeline.delayed_inject.try_schedule(
-                                        inter_delay_us * i as u32,
-                                        inject_pkt.clone(),
+                                        delay_us,
+                                        inject_pkt.bytes.clone(),
                                         inject_addr.clone(),
                                     ) {
-                                        tx_queue.push(TxAction::Inject(inject_pkt, inject_addr));
+                                        tx_queue
+                                            .push(TxAction::Inject(inject_pkt.bytes, inject_addr));
                                     }
                                 } else {
-                                    tx_queue.push(TxAction::Inject(inject_pkt, inject_addr));
+                                    tx_queue.push(TxAction::Inject(inject_pkt.bytes, inject_addr));
                                 }
                             }
-                        }
-                        InjectProtocol::Udp => {
-                            for (i, inject_pkt) in inject.into_iter().enumerate() {
-                                if !pipeline.validate_packet_and_log(&inject_pkt) {
-                                    pool.release_bytes(inject_pkt);
-                                    continue;
-                                }
-                                let inject_addr = match Self::apply_inject_direction(
-                                    &addr,
-                                    inject_direction,
-                                    &inject_pkt,
-                                    derive_ctx.as_ref(),
-                                    &pipeline.stats,
-                                ) {
-                                    Some(a) => a,
-                                    None => {
-                                        pool.release_bytes(inject_pkt);
-                                        continue;
-                                    }
-                                };
-
+                            crate::desync::InjectProtocol::Udp => {
                                 if inject_addr.outbound() {
-                                    if i > 0 && inter_delay_us > 0 {
+                                    if delay_us > 0 {
                                         if !pipeline.delayed_inject.try_schedule(
-                                            inter_delay_us * i as u32,
-                                            inject_pkt.clone(),
+                                            delay_us,
+                                            inject_pkt.bytes.clone(),
                                             inject_addr.clone(),
                                         ) {
-                                            if let Err(e) = engine.inject_raw_udp(&inject_pkt) {
+                                            if let Err(e) = engine.inject_raw_udp(&inject_pkt.bytes)
+                                            {
                                                 tracing::warn!(
                                                     "Failed to inject UDP desync packet: {}",
                                                     e
                                                 );
                                             }
-                                            pool.release_bytes(inject_pkt);
+                                            pool.release_bytes(inject_pkt.bytes);
                                         }
                                     } else {
-                                        if let Err(e) = engine.inject_raw_udp(&inject_pkt) {
-                                            tracing::warn!("Failed to inject UDP desync packet: {}", e);
+                                        if let Err(e) = engine.inject_raw_udp(&inject_pkt.bytes) {
+                                            tracing::warn!(
+                                                "Failed to inject UDP desync packet: {}",
+                                                e
+                                            );
                                         }
-                                        pool.release_bytes(inject_pkt);
+                                        pool.release_bytes(inject_pkt.bytes);
                                     }
                                 } else {
-                                    if i > 0 && inter_delay_us > 0 {
+                                    if delay_us > 0 {
                                         if !pipeline.delayed_inject.try_schedule(
-                                            inter_delay_us * i as u32,
-                                            inject_pkt.clone(),
+                                            delay_us,
+                                            inject_pkt.bytes.clone(),
                                             inject_addr.clone(),
                                         ) {
-                                            tx_queue.push(TxAction::Inject(inject_pkt, inject_addr));
+                                            tx_queue.push(TxAction::Inject(
+                                                inject_pkt.bytes,
+                                                inject_addr,
+                                            ));
                                         }
                                     } else {
-                                        tx_queue.push(TxAction::Inject(inject_pkt, inject_addr));
+                                        tx_queue
+                                            .push(TxAction::Inject(inject_pkt.bytes, inject_addr));
                                     }
                                 }
-                                pipeline
-                                    .stats
-                                    .fake_ch_injected
-                                    .fetch_add(1, Ordering::Relaxed);
                             }
                         }
+                        pipeline
+                            .stats
+                            .fake_ch_injected
+                            .fetch_add(1, Ordering::Relaxed);
                     }
 
                     // 2. Then send modified or original packet (if drop_original is false)
@@ -2170,6 +2148,33 @@ impl ProcessingPipeline {
         }
     }
 
+    fn result_to_decision(result: crate::desync::DesyncResult) -> PacketDecision {
+        if result.inject.is_empty() && result.modified.is_none() {
+            if result.drop_original {
+                return PacketDecision::Drop;
+            } else {
+                return PacketDecision::Forward;
+            }
+        }
+
+        if let Some(modified) = result.modified {
+            if result.inject.is_empty() {
+                return PacketDecision::Modify(modified);
+            }
+            return PacketDecision::Desync {
+                inject: result.inject,
+                modified: Some(modified),
+                drop_original: result.drop_original,
+            };
+        }
+
+        PacketDecision::Desync {
+            inject: result.inject,
+            modified: None,
+            drop_original: result.drop_original,
+        }
+    }
+
     pub(crate) fn process_fake_ip_traffic(
         &self,
         captured: &CapturedPacket,
@@ -2454,38 +2459,7 @@ impl ProcessingPipeline {
             }
         }
 
-        if result.inject.is_empty() && result.modified.is_none() {
-            if result.drop {
-                return Ok(PacketDecision::Drop);
-            } else {
-                return Ok(PacketDecision::Forward);
-            }
-        }
-
-        let inter_delay = result.inter_delay_us;
-
-        if let Some(modified) = result.modified {
-            if result.inject.is_empty() {
-                return Ok(PacketDecision::Modify(modified));
-            }
-            return Ok(PacketDecision::Desync {
-                inject: result.inject,
-                modified: Some(modified),
-                inject_protocol: InjectProtocol::Tcp,
-                inter_delay_us: inter_delay,
-                inject_direction: result.inject_direction,
-                drop_original: result.drop,
-            });
-        }
-
-        Ok(PacketDecision::Desync {
-            inject: result.inject,
-            modified: None,
-            inject_protocol: InjectProtocol::Tcp,
-            inter_delay_us: inter_delay,
-            inject_direction: result.inject_direction,
-            drop_original: result.drop,
-        })
+        Ok(Self::result_to_decision(result))
     }
 
     fn process_quic_sync(
@@ -2580,35 +2554,7 @@ impl ProcessingPipeline {
                 );
             }
         }
-        if result.inject.is_empty() && result.modified.is_none() {
-            if result.drop {
-                return Ok(PacketDecision::Drop);
-            } else {
-                return Ok(PacketDecision::Forward);
-            }
-        }
-        let inter_delay = result.inter_delay_us;
-        if let Some(modified) = result.modified {
-            if result.inject.is_empty() {
-                return Ok(PacketDecision::Modify(modified));
-            }
-            return Ok(PacketDecision::Desync {
-                inject: result.inject,
-                modified: Some(modified),
-                inject_protocol: InjectProtocol::Udp,
-                inter_delay_us: inter_delay,
-                inject_direction: result.inject_direction,
-                drop_original: result.drop,
-            });
-        }
-        Ok(PacketDecision::Desync {
-            inject: result.inject,
-            modified: None,
-            inject_protocol: InjectProtocol::Udp,
-            inter_delay_us: inter_delay,
-            inject_direction: result.inject_direction,
-            drop_original: result.drop,
-        })
+        Ok(Self::result_to_decision(result))
     }
 
     fn process_http_sync(
@@ -2647,35 +2593,7 @@ impl ProcessingPipeline {
                 );
             }
         }
-        if result.inject.is_empty() && result.modified.is_none() {
-            if result.drop {
-                return Ok(PacketDecision::Drop);
-            } else {
-                return Ok(PacketDecision::Forward);
-            }
-        }
-        let inter_delay = result.inter_delay_us;
-        if let Some(modified) = result.modified {
-            if result.inject.is_empty() {
-                return Ok(PacketDecision::Modify(modified));
-            }
-            return Ok(PacketDecision::Desync {
-                inject: result.inject,
-                modified: Some(modified),
-                inject_protocol: InjectProtocol::Tcp,
-                inter_delay_us: inter_delay,
-                inject_direction: result.inject_direction,
-                drop_original: result.drop,
-            });
-        }
-        Ok(PacketDecision::Desync {
-            inject: result.inject,
-            modified: None,
-            inject_protocol: InjectProtocol::Tcp,
-            inter_delay_us: inter_delay,
-            inject_direction: result.inject_direction,
-            drop_original: result.drop,
-        })
+        Ok(Self::result_to_decision(result))
     }
 
     /// T57: Обработка DNS пакетов.
@@ -2764,31 +2682,9 @@ impl ProcessingPipeline {
                 let latency_us = tune_start.elapsed().as_micros() as u64;
                 self.auto_tune.record_application_by_id(profile.id);
 
-                if result.inject.is_empty() && result.modified.is_none() && result.drop {
-                    return Ok(PacketDecision::Drop);
-                }
-                if let Some(modified) = result.modified {
-                    if result.inject.is_empty() {
-                        return Ok(PacketDecision::Modify(modified));
-                    }
-                    return Ok(PacketDecision::Desync {
-                        inject: result.inject,
-                        modified: Some(modified),
-                        inject_protocol: InjectProtocol::Tcp,
-                        inter_delay_us: result.inter_delay_us,
-                        inject_direction: result.inject_direction,
-                        drop_original: result.drop,
-                    });
-                }
-                if !result.inject.is_empty() {
-                    return Ok(PacketDecision::Desync {
-                        inject: result.inject,
-                        modified: None,
-                        inject_protocol: InjectProtocol::Tcp,
-                        inter_delay_us: result.inter_delay_us,
-                        inject_direction: result.inject_direction,
-                        drop_original: result.drop,
-                    });
+                let decision = Self::result_to_decision(result);
+                if !matches!(decision, PacketDecision::Forward) {
+                    return Ok(decision);
                 }
             }
         } else if mss_clamp_active {
@@ -2812,31 +2708,9 @@ impl ProcessingPipeline {
                 let latency_us = tune_start.elapsed().as_micros() as u64;
                 self.auto_tune.record_application_by_id(profile.id);
 
-                if result.inject.is_empty() && result.modified.is_none() && result.drop {
-                    return Ok(PacketDecision::Drop);
-                }
-                if let Some(modified) = result.modified {
-                    if result.inject.is_empty() {
-                        return Ok(PacketDecision::Modify(modified));
-                    }
-                    return Ok(PacketDecision::Desync {
-                        inject: result.inject,
-                        modified: Some(modified),
-                        inject_protocol: InjectProtocol::Tcp,
-                        inter_delay_us: result.inter_delay_us,
-                        inject_direction: result.inject_direction,
-                        drop_original: result.drop,
-                    });
-                }
-                if !result.inject.is_empty() {
-                    return Ok(PacketDecision::Desync {
-                        inject: result.inject,
-                        modified: None,
-                        inject_protocol: InjectProtocol::Tcp,
-                        inter_delay_us: result.inter_delay_us,
-                        inject_direction: result.inject_direction,
-                        drop_original: result.drop,
-                    });
+                let decision = Self::result_to_decision(result);
+                if !matches!(decision, PacketDecision::Forward) {
+                    return Ok(decision);
                 }
             }
         }

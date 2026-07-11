@@ -36,7 +36,7 @@ pub struct PipelineState {
     pub packet: bytes::Bytes,
     cached_payload_offset: Option<usize>,
     cached_tcp_seq: Option<u32>,
-    pub injects: SmallVec<[bytes::Bytes; 4]>,
+    pub injects: SmallVec<[crate::desync::InjectPacket; 4]>,
     pub drop: bool,
     /// T43: флаг TLS 1.3 session resumption.
     /// Передаётся из engine в desync техники, чтобы fake CH
@@ -45,8 +45,6 @@ pub struct PipelineState {
     /// T44.5: per-connection RNG для техник, которым нужен non-deterministic random.
     /// Передаётся из engine; техники могут fork() для независимости.
     pub conn_rng: Option<crate::desync::rand::PerConnRng>,
-    /// T44.6: флаг что inject пакеты должны быть отправлены как outbound (от клиента к серверу).
-    pub inject_direction: crate::desync::InjectDirection,
     /// true только если хотя бы одна техника реально вернула modified packet.
     pub modified_dirty: bool,
     pub client_hello_shape: Option<crate::desync::tls::ClientHelloShape>,
@@ -62,7 +60,6 @@ impl PipelineState {
             drop: false,
             is_resumption: None,
             conn_rng: None,
-            inject_direction: crate::desync::InjectDirection::PreserveOriginal,
             modified_dirty: false,
             client_hello_shape: None,
         }
@@ -122,8 +119,7 @@ impl PipelineState {
             },
             inject: self.injects,
             inter_delay_us: 0,
-            drop: self.drop,
-            inject_direction: self.inject_direction,
+            drop_original: self.drop,
         }
     }
 }
@@ -138,15 +134,8 @@ impl DesyncGroup {
         for inject in result.inject {
             state.injects.push(inject);
         }
-        if result.drop {
+        if result.drop_original {
             state.drop = true;
-        }
-        // P0-10: Propagate inject_direction — ForceOutbound перезаписывает PreserveOriginal
-        if matches!(
-            result.inject_direction,
-            crate::desync::InjectDirection::ForceOutbound
-        ) {
-            state.inject_direction = crate::desync::InjectDirection::ForceOutbound;
         }
     }
 }
@@ -472,7 +461,7 @@ impl DesyncGroup {
                     .injects
                     .iter()
                     .flat_map(|pkt| {
-                        let result = ip::bad_checksum(pkt);
+                        let result = ip::bad_checksum(&pkt.bytes);
                         if result.inject.is_empty() {
                             // passthrough — keep original
                             smallvec::smallvec![pkt.clone()]
@@ -488,9 +477,9 @@ impl DesyncGroup {
             DesyncTechnique::TtlManipulation => {
                 let ttl_val = self.config.ttl_value;
                 for inject_pkt in &mut state.injects {
-                    let result = ip::ttl_manipulation(inject_pkt, ttl_val);
+                    let result = ip::ttl_manipulation(&inject_pkt.bytes, ttl_val);
                     if let Some(modified) = result.modified {
-                        *inject_pkt = modified;
+                        inject_pkt.bytes = modified;
                     }
                 }
                 if self.config.allow_real_ttl_manipulation {
@@ -957,8 +946,12 @@ impl DesyncGroup {
 
         match result {
             Ok(spoof_result) => {
-                state.injects.push(spoof_result.fake_packet);
-                state.inject_direction = crate::desync::InjectDirection::ForceOutbound;
+                state.injects.push(crate::desync::InjectPacket {
+                    bytes: spoof_result.fake_packet,
+                    protocol: crate::desync::InjectProtocol::Tcp,
+                    direction: crate::desync::InjectDirection::ForceOutbound,
+                    delay_us: 0,
+                });
                 tracing::debug!(
                     "SeqSpoof applied: fake_ttl={}, fake_seq_offset={}",
                     spoof_result.fake_ttl,
@@ -1013,7 +1006,7 @@ mod tests {
         let result = group.apply(&pkt, None, None, None);
         assert!(result.modified.is_none());
         assert!(result.inject.is_empty());
-        assert!(!result.drop);
+        assert!(!result.drop_original);
     }
 
     #[test]
@@ -1245,79 +1238,37 @@ mod tests {
     // === P0-12: Direction override propagation ===
 
     #[test]
-    fn test_merge_into_state_propagates_force_outbound() {
+    fn test_merge_into_state_propagates_inject_packets() {
         let pkt = bytes::Bytes::from(vec![0u8; 40]);
         let mut state = PipelineState::from_packet(pkt.clone());
-        assert_eq!(
-            state.inject_direction,
-            crate::desync::InjectDirection::PreserveOriginal
-        );
+        assert_eq!(state.injects.len(), 0);
 
         let result = crate::desync::DesyncResult {
             modified: None,
-            inject: smallvec::smallvec![],
+            inject: smallvec::smallvec![crate::desync::InjectPacket::tcp(
+                bytes::Bytes::from(vec![1, 2, 3]),
+                crate::desync::InjectDirection::ForceOutbound
+            )],
             inter_delay_us: 0,
-            drop: false,
-            inject_direction: crate::desync::InjectDirection::ForceOutbound,
+            drop_original: false,
         };
 
-        // Создаём группу с минимальной конфигурацией
         let config = DesyncConfig::default();
         let group = DesyncGroup::new(config);
-        let group_ref = &group; // borrow for merge_into_state
-        group_ref.merge_into_state(&mut state, result);
+        group.merge_into_state(&mut state, result);
 
+        assert_eq!(state.injects.len(), 1);
         assert_eq!(
-            state.inject_direction,
-            crate::desync::InjectDirection::ForceOutbound,
-            "merge_into_state должен пропагировать ForceOutbound"
+            state.injects[0].direction,
+            crate::desync::InjectDirection::ForceOutbound
         );
 
         // Проверка into_result
         let final_result = state.into_result();
+        assert_eq!(final_result.inject.len(), 1);
         assert_eq!(
-            final_result.inject_direction,
-            crate::desync::InjectDirection::ForceOutbound,
-            "into_result должен сохранять ForceOutbound"
-        );
-    }
-
-    #[test]
-    fn test_merge_into_state_preserve_original_overwritten_by_force_outbound() {
-        let pkt = bytes::Bytes::from(vec![0u8; 40]);
-        let mut state = PipelineState::from_packet(pkt.clone());
-        state.inject_direction = crate::desync::InjectDirection::PreserveOriginal;
-
-        // Сначала PreserveOriginal
-        let r1 = crate::desync::DesyncResult {
-            modified: None,
-            inject: smallvec::smallvec![],
-            inter_delay_us: 0,
-            drop: false,
-            inject_direction: crate::desync::InjectDirection::PreserveOriginal,
-        };
-        let config = DesyncConfig::default();
-        let group = DesyncGroup::new(config);
-        let group_ref = &group;
-        group_ref.merge_into_state(&mut state, r1);
-        assert_eq!(
-            state.inject_direction,
-            crate::desync::InjectDirection::PreserveOriginal
-        );
-
-        // Затем ForceOutbound перезаписывает
-        let r2 = crate::desync::DesyncResult {
-            modified: None,
-            inject: smallvec::smallvec![],
-            inter_delay_us: 0,
-            drop: false,
-            inject_direction: crate::desync::InjectDirection::ForceOutbound,
-        };
-        group_ref.merge_into_state(&mut state, r2);
-        assert_eq!(
-            state.inject_direction,
-            crate::desync::InjectDirection::ForceOutbound,
-            "ForceOutbound должен перезаписывать PreserveOriginal"
+            final_result.inject[0].direction,
+            crate::desync::InjectDirection::ForceOutbound
         );
     }
 

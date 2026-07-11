@@ -2147,7 +2147,7 @@ mod tests {
             1,
             &mut count,
         );
-        assert!(result.drop);
+        assert!(result.drop_original);
     }
 
     #[test]
@@ -2219,7 +2219,7 @@ mod tests {
                 &mut count,
             );
             assert!(result.inject.is_empty());
-            assert!(!result.drop);
+            assert!(!result.drop_original);
         }
     }
 

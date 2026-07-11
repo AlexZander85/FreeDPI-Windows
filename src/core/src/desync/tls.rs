@@ -237,7 +237,7 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
 
     // P0-11: Не пересылать оригинальный CH вместе с фрагментами — фрагменты уже несут все данные.
     let mut result = DesyncResult::inject_many(inject);
-    result.drop = true;
+    result.drop_original = true;
     result
 }
 
@@ -402,7 +402,7 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
     let src_port = tcp.get_source();
     let dst_port = tcp.get_destination();
 
-    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> =
+    let mut inject: smallvec::SmallVec<[crate::desync::InjectPacket; 4]> =
         smallvec::SmallVec::with_capacity(micro_count);
 
     for i in 0..micro_count {
@@ -423,7 +423,10 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
             fake_ttl,
             ip.identification().wrapping_add(i as u16 + 1),
         );
-        inject.push(frag);
+        inject.push(crate::desync::InjectPacket::tcp(
+            frag,
+            crate::desync::InjectDirection::PreserveOriginal,
+        ));
     }
 
     let remaining = &payload[micro_count..];
@@ -453,8 +456,7 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
         modified: Some(modified),
         inject,
         inter_delay_us: 0,
-        drop: false,
-        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
+        drop_original: false,
     }
 }
 
@@ -694,7 +696,7 @@ mod tests {
         let pkt = build_test_tls_packet();
         let result = tls_record_frag(&pkt, 5, 1);
         // P0-11: Фрагменты уже несут все данные — оригинал должен быть дропнут.
-        assert!(result.drop);
+        assert!(result.drop_original);
         assert_eq!(result.inject.len(), 3);
         assert!(result.modified.is_none());
     }

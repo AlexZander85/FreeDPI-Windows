@@ -57,7 +57,47 @@ pub enum InjectDirection {
     DerivedFromPacketTuple,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectProtocol {
+    Tcp,
+    Udp,
+}
 
+#[derive(Debug, Clone)]
+pub struct InjectPacket {
+    pub bytes: bytes::Bytes,
+    pub protocol: InjectProtocol,
+    pub direction: InjectDirection,
+    pub delay_us: u32,
+}
+
+impl InjectPacket {
+    #[inline]
+    pub fn new(bytes: bytes::Bytes, protocol: InjectProtocol, direction: InjectDirection) -> Self {
+        Self {
+            bytes,
+            protocol,
+            direction,
+            delay_us: 0,
+        }
+    }
+
+    #[inline]
+    pub fn tcp(bytes: bytes::Bytes, direction: InjectDirection) -> Self {
+        Self::new(bytes, InjectProtocol::Tcp, direction)
+    }
+
+    #[inline]
+    pub fn udp(bytes: bytes::Bytes, direction: InjectDirection) -> Self {
+        Self::new(bytes, InjectProtocol::Udp, direction)
+    }
+
+    #[inline]
+    pub fn with_delay_us(mut self, delay_us: u32) -> Self {
+        self.delay_us = delay_us;
+        self
+    }
+}
 
 /// Результат применения desync техники.
 ///
@@ -69,13 +109,11 @@ pub struct DesyncResult {
     /// Модифицированный оригинальный пакет (для отправки через WinDivert).
     pub modified: Option<bytes::Bytes>,
     /// Дополнительные пакеты для инъекции.
-    pub inject: SmallVec<[bytes::Bytes; 4]>,
+    pub inject: SmallVec<[InjectPacket; 4]>,
     /// Задержка между инъекциями (мкс). 0 = без задержки.
     pub inter_delay_us: u32,
-    /// Дропнуть пакет (не отправлять).
-    pub drop: bool,
-    /// P0-10: Направление инъекции для всех пакетов в `inject`.
-    pub inject_direction: InjectDirection,
+    /// Дропнуть оригинальный пакет (не отправлять).
+    pub drop_original: bool,
 }
 
 impl DesyncResult {
@@ -84,8 +122,7 @@ impl DesyncResult {
             modified: None,
             inject: SmallVec::new(),
             inter_delay_us: 0,
-            drop: false,
-            inject_direction: InjectDirection::PreserveOriginal,
+            drop_original: false,
         }
     }
 
@@ -94,18 +131,28 @@ impl DesyncResult {
             modified: Some(modified.into()),
             inject: SmallVec::new(),
             inter_delay_us: 0,
-            drop: false,
-            inject_direction: InjectDirection::PreserveOriginal,
+            drop_original: false,
         }
     }
 
     pub fn inject_only(inject: impl Into<bytes::Bytes>) -> Self {
+        let b = inject.into();
+        let proto = parse_packet_tuple(&b)
+            .map(|t| match t.proto {
+                6 => InjectProtocol::Tcp,
+                17 => InjectProtocol::Udp,
+                _ => InjectProtocol::Tcp,
+            })
+            .unwrap_or(InjectProtocol::Tcp);
         Self {
             modified: None,
-            inject: smallvec![inject.into()],
+            inject: smallvec![InjectPacket::new(
+                b,
+                proto,
+                InjectDirection::PreserveOriginal
+            )],
             inter_delay_us: 0,
-            drop: false,
-            inject_direction: InjectDirection::PreserveOriginal,
+            drop_original: false,
         }
     }
 
@@ -113,22 +160,47 @@ impl DesyncResult {
         modified: impl Into<bytes::Bytes>,
         inject: impl Into<bytes::Bytes>,
     ) -> Self {
+        let b = inject.into();
+        let proto = parse_packet_tuple(&b)
+            .map(|t| match t.proto {
+                6 => InjectProtocol::Tcp,
+                17 => InjectProtocol::Udp,
+                _ => InjectProtocol::Tcp,
+            })
+            .unwrap_or(InjectProtocol::Tcp);
         Self {
             modified: Some(modified.into()),
-            inject: smallvec![inject.into()],
+            inject: smallvec![InjectPacket::new(
+                b,
+                proto,
+                InjectDirection::PreserveOriginal
+            )],
             inter_delay_us: 0,
-            drop: false,
-            inject_direction: InjectDirection::PreserveOriginal,
+            drop_original: false,
         }
     }
 
     pub fn inject_many(inject: impl IntoIterator<Item = bytes::Bytes>) -> Self {
+        let mut packets = SmallVec::new();
+        for b in inject {
+            let proto = parse_packet_tuple(&b)
+                .map(|t| match t.proto {
+                    6 => InjectProtocol::Tcp,
+                    17 => InjectProtocol::Udp,
+                    _ => InjectProtocol::Tcp,
+                })
+                .unwrap_or(InjectProtocol::Tcp);
+            packets.push(InjectPacket::new(
+                b,
+                proto,
+                InjectDirection::PreserveOriginal,
+            ));
+        }
         Self {
             modified: None,
-            inject: inject.into_iter().collect(),
+            inject: packets,
             inter_delay_us: 0,
-            drop: false,
-            inject_direction: InjectDirection::PreserveOriginal,
+            drop_original: false,
         }
     }
 
@@ -137,8 +209,49 @@ impl DesyncResult {
             modified: None,
             inject: SmallVec::new(),
             inter_delay_us: 0,
-            drop: true,
-            inject_direction: InjectDirection::PreserveOriginal,
+            drop_original: true,
+        }
+    }
+
+    pub fn inject_one(packet: InjectPacket) -> Self {
+        let mut inject = SmallVec::new();
+        inject.push(packet);
+        Self {
+            modified: None,
+            inject,
+            inter_delay_us: 0,
+            drop_original: false,
+        }
+    }
+
+    pub fn inject_many_packets(inject: SmallVec<[InjectPacket; 4]>) -> Self {
+        Self {
+            modified: None,
+            inject,
+            inter_delay_us: 0,
+            drop_original: false,
+        }
+    }
+
+    pub fn replace_with_injects(
+        modified: Option<bytes::Bytes>,
+        inject: SmallVec<[InjectPacket; 4]>,
+    ) -> Self {
+        let drop_original = modified.is_none();
+        Self {
+            modified,
+            inject,
+            inter_delay_us: 0,
+            drop_original,
+        }
+    }
+
+    pub fn drop_original_with_injects(inject: SmallVec<[InjectPacket; 4]>) -> Self {
+        Self {
+            modified: None,
+            inject,
+            inter_delay_us: 0,
+            drop_original: true,
         }
     }
 
@@ -151,19 +264,14 @@ impl DesyncResult {
             self.modified = other.modified;
         }
         self.inject.extend(other.inject);
-        if other.drop {
-            self.drop = true;
+        if other.drop_original {
+            self.drop_original = true;
         }
     }
 
     /// Modified как &[u8] (zero-copy через Deref).
     pub fn modified_slice(&self) -> Option<&[u8]> {
         self.modified.as_ref().map(|b| b.as_ref())
-    }
-
-    /// Inject как срез Bytes (zero-copy через Deref).
-    pub fn inject_slices(&self) -> &[bytes::Bytes] {
-        &self.inject
     }
 }
 

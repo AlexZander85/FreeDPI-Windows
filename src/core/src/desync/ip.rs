@@ -601,7 +601,7 @@ mod tests {
         let out = dscp_random(&pkt, 0x0A);
         assert!(out.modified.is_none(), "Same DSCP must return passthrough");
         assert!(out.inject.is_empty());
-        assert!(!out.drop);
+        assert!(!out.drop_original);
     }
 
     /// Malformed packet не должен паниковать.

@@ -141,15 +141,23 @@ pub fn multisplit(
         inter_delay_us
     );
 
+    let inject_packets = inject
+        .into_iter()
+        .map(|b| {
+            crate::desync::InjectPacket::tcp(
+                bytes::Bytes::from(b),
+                crate::desync::InjectDirection::PreserveOriginal,
+            )
+        })
+        .enumerate()
+        .map(|(i, pkt)| pkt.with_delay_us(inter_delay_us * i as u32))
+        .collect();
+
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
-        inject: inject
-            .into_iter()
-            .map(bytes::Bytes::from)
-            .collect::<smallvec::SmallVec<[bytes::Bytes; 4]>>(),
-        inter_delay_us,
-        drop: false,
-        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
+        inject: inject_packets,
+        inter_delay_us: 0,
+        drop_original: false,
     }
 }
 
@@ -298,12 +306,21 @@ pub fn tcpseg(packet: &bytes::Bytes, max_seg_size: usize, _fake_ttl_offset: u8) 
         max_seg_size
     );
 
+    let inject_packets = inject
+        .into_iter()
+        .map(|b| {
+            crate::desync::InjectPacket::tcp(
+                bytes::Bytes::from(b),
+                crate::desync::InjectDirection::PreserveOriginal,
+            )
+        })
+        .collect();
+
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
-        inject: inject.into_iter().collect(),
+        inject: inject_packets,
         inter_delay_us: 0,
-        drop: false,
-        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
+        drop_original: false,
     }
 }
 
@@ -1332,7 +1349,7 @@ pub fn pkt_reorder(packet: &bytes::Bytes, swap_with_next: bool) -> DesyncResult 
     let fake_ttl = ip.ttl().saturating_sub(1).max(1);
     let decoy_count = 2 + (crate::desync::rand::random_range(0, 2) as usize); // 2-3 decoys
 
-    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> =
+    let mut inject: smallvec::SmallVec<[crate::desync::InjectPacket; 4]> =
         smallvec::SmallVec::with_capacity(decoy_count);
 
     for _i in 0..decoy_count {
@@ -1358,7 +1375,10 @@ pub fn pkt_reorder(packet: &bytes::Bytes, swap_with_next: bool) -> DesyncResult 
             fake_ttl,
             crate::desync::rand::random_range(0, 65535) as u16,
         );
-        inject.push(decoy);
+        inject.push(crate::desync::InjectPacket::tcp(
+            decoy,
+            crate::desync::InjectDirection::PreserveOriginal,
+        ));
     }
 
     // Original packet passes through unchanged
@@ -1371,8 +1391,7 @@ pub fn pkt_reorder(packet: &bytes::Bytes, swap_with_next: bool) -> DesyncResult 
         modified: Some(packet.clone()),
         inject,
         inter_delay_us: 0,
-        drop: false,
-        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
+        drop_original: false,
     }
 }
 
@@ -1422,13 +1441,10 @@ pub fn rst_selective(packet: &bytes::Bytes, fake_ttl_offset: u8) -> DesyncResult
 
     debug!("[W5] RstSelective: fake RST after SYN-ACK (outbound)");
 
-    DesyncResult {
-        modified: None,
-        inject: smallvec::smallvec![fake_rst],
-        inter_delay_us: 0,
-        drop: false,
-        inject_direction: crate::desync::InjectDirection::ForceOutbound,
-    }
+    DesyncResult::inject_one(crate::desync::InjectPacket::tcp(
+        fake_rst,
+        crate::desync::InjectDirection::ForceOutbound,
+    ))
 }
 
 /// [W6] SynFloodDecoy: SYN flood decoy.
@@ -1613,10 +1629,12 @@ pub fn disorder(packet: &bytes::Bytes, split_at: usize, fake_ttl_offset: u8) -> 
 
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
-        inject: smallvec::smallvec![bytes::Bytes::from(seg2)],
+        inject: smallvec::smallvec![crate::desync::InjectPacket::tcp(
+            bytes::Bytes::from(seg2),
+            crate::desync::InjectDirection::PreserveOriginal
+        )],
         inter_delay_us: 0,
-        drop: false,
-        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
+        drop_original: false,
     }
 }
 
@@ -1681,7 +1699,12 @@ pub fn multidisorder_new(
     // Last segment (first after reverse) — modified original
     let modified = segments.pop().unwrap_or_else(|| packet.clone());
 
-    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> = segments.into_iter().collect();
+    let mut inject: smallvec::SmallVec<[crate::desync::InjectPacket; 4]> = segments
+        .into_iter()
+        .map(|b| {
+            crate::desync::InjectPacket::tcp(b, crate::desync::InjectDirection::PreserveOriginal)
+        })
+        .collect();
 
     // 2. Add an overlapping low-TTL decoy if fake_ttl_offset > 0
     if fake_ttl_offset > 0 {
@@ -1700,7 +1723,10 @@ pub fn multidisorder_new(
             fake_ttl,
             generate_identification(ip.identification(), 999),
         );
-        inject.push(decoy);
+        inject.push(crate::desync::InjectPacket::tcp(
+            decoy,
+            crate::desync::InjectDirection::PreserveOriginal,
+        ));
     }
 
     debug!("[RP4] MultiDisorderNew: {} segments reversed", split_count);
@@ -1709,8 +1735,7 @@ pub fn multidisorder_new(
         modified: Some(bytes::Bytes::from(modified)),
         inject,
         inter_delay_us: 0,
-        drop: false,
-        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
+        drop_original: false,
     }
 }
 
@@ -1884,7 +1909,7 @@ pub fn byte_by_byte(packet: &bytes::Bytes, max_bytes: usize, fake_ttl_offset: u8
     let window = tcp.window;
     let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
 
-    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> =
+    let mut inject: smallvec::SmallVec<[crate::desync::InjectPacket; 4]> =
         smallvec::SmallVec::with_capacity(byte_count);
 
     for i in 0..byte_count {
@@ -1901,7 +1926,10 @@ pub fn byte_by_byte(packet: &bytes::Bytes, max_bytes: usize, fake_ttl_offset: u8
             fake_ttl,
             generate_identification(ip.identification(), i),
         );
-        inject.push(byte_seg);
+        inject.push(crate::desync::InjectPacket::tcp(
+            byte_seg,
+            crate::desync::InjectDirection::PreserveOriginal,
+        ));
     }
 
     // Остаток payload — нормальный сегмент
@@ -1927,10 +1955,9 @@ pub fn byte_by_byte(packet: &bytes::Bytes, max_bytes: usize, fake_ttl_offset: u8
 
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
-        inject: inject.into_iter().collect(),
+        inject,
         inter_delay_us: 0,
-        drop: false,
-        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
+        drop_original: false,
     }
 }
 
@@ -2009,7 +2036,7 @@ pub fn unidir_frag(packet: &bytes::Bytes, frag_size: usize, fake_ttl_offset: u8)
     // P0-11: Не пересылать оригинал — фрагменты (все, включая последний с нормальным TTL)
     // уже покрывают все данные оригинального TCP-сегмента.
     let mut result = DesyncResult::inject_many(inject);
-    result.drop = true;
+    result.drop_original = true;
     result
 }
 
@@ -2454,7 +2481,10 @@ mod tests {
         let result = unidir_frag(&pkt, 10, 1);
         assert_eq!(result.inject.len(), 5);
         // P0-12: unidir_frag must drop the original — fragments carry all data
-        assert!(result.drop, "unidir_frag must set drop=true (P0-11)");
+        assert!(
+            result.drop_original,
+            "unidir_frag must set drop=true (P0-11)"
+        );
         assert!(
             result.modified.is_none(),
             "unidir_frag must not set modified"
@@ -2492,7 +2522,7 @@ mod tests {
             "multisplit must have inject decoys"
         );
         assert!(
-            !result.drop,
+            !result.drop_original,
             "multisplit must NOT drop the original — real data is in modified"
         );
     }
@@ -2519,11 +2549,11 @@ mod tests {
         // 20 bytes payload, split_size=5, 3 splits, fake_ttl_offset=1
         let result = multisplit(&pkt, 5, 3, 1, 0);
         // The first injected segment is the decoy, which has fake TTL = 63
-        let decoy_ttl = result.inject[0][8];
+        let decoy_ttl = result.inject[0].bytes[8];
         assert_eq!(decoy_ttl, 63, "decoy segment must have fake TTL");
         // The remaining injected segments are real fragments, which have normal TTL = 64
         for seg in &result.inject[1..] {
-            let ttl = seg[8];
+            let ttl = seg.bytes[8];
             assert_eq!(ttl, 64, "real segments in inject must have normal TTL");
         }
         // Modified segment should have original TTL = 64
@@ -2668,9 +2698,17 @@ pub fn syn_ack_split(packet: &[u8]) -> DesyncResult {
     debug!("[SAS] SynAckSplit: SEQ={}", tcp.sequence);
     DesyncResult {
         modified: None,
-        inject: smallvec::smallvec![bytes::Bytes::from(syn_seg), bytes::Bytes::from(ack_seg)],
+        inject: smallvec::smallvec![
+            crate::desync::InjectPacket::tcp(
+                bytes::Bytes::from(syn_seg),
+                crate::desync::InjectDirection::PreserveOriginal
+            ),
+            crate::desync::InjectPacket::tcp(
+                bytes::Bytes::from(ack_seg),
+                crate::desync::InjectDirection::PreserveOriginal
+            ),
+        ],
         inter_delay_us: 0,
-        drop: false,
-        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
+        drop_original: false,
     }
 }

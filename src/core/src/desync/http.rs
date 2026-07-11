@@ -972,7 +972,8 @@ pub fn chunk_obfuscation(packet: &[u8], split_count: usize, fake_ttl_offset: u8)
     }
 
     let seg_size = tcp.payload.len() / split_count;
-    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> = smallvec::SmallVec::new();
+    let mut inject: smallvec::SmallVec<[crate::desync::InjectPacket; 4]> =
+        smallvec::SmallVec::new();
 
     for i in 0..split_count - 1 {
         let start = i * seg_size;
@@ -992,7 +993,10 @@ pub fn chunk_obfuscation(packet: &[u8], split_count: usize, fake_ttl_offset: u8)
             fake_ttl,
             ip.identification().wrapping_add(i as u16 + 1),
         );
-        inject.push(seg);
+        inject.push(crate::desync::InjectPacket::tcp(
+            seg,
+            crate::desync::InjectDirection::PreserveOriginal,
+        ));
     }
 
     // Последний сегмент — modified original
@@ -1019,8 +1023,7 @@ pub fn chunk_obfuscation(packet: &[u8], split_count: usize, fake_ttl_offset: u8)
         modified: Some(modified),
         inject,
         inter_delay_us: 0,
-        drop: false,
-        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
+        drop_original: false,
     }
 }
 
