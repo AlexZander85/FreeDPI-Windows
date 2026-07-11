@@ -1957,19 +1957,34 @@ pub fn unidir_frag(packet: &bytes::Bytes, frag_size: usize, fake_ttl_offset: u8)
     }
 
     let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> = smallvec::SmallVec::new();
+
+    // 1. Add overlapping decoy segment if fake_ttl_offset > 0
+    if fake_ttl_offset > 0 {
+        let decoy_payload = vec![0u8; frag_size];
+        let decoy_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
+        let decoy = build_tcp_segment_p3(
+            ip.src(),
+            ip.dst(),
+            tcp.src_port,
+            tcp.dst_port,
+            tcp.sequence,
+            tcp.acknowledgment,
+            TcpFlags::PSH | TcpFlags::ACK,
+            tcp.window,
+            &decoy_payload,
+            decoy_ttl,
+            generate_identification(ip.identification(), 999),
+        );
+        inject.push(decoy);
+    }
+
+    // 2. Generate all real fragments with normal TTL
     let mut pos = 0;
     let mut frag_index = 0;
 
     while pos < tcp.payload.len() {
         let end = (pos + frag_size).min(tcp.payload.len());
         let frag_payload = &tcp.payload[pos..end];
-        let is_last = end >= tcp.payload.len();
-
-        let frag_ttl = if is_last {
-            ip.ttl()
-        } else {
-            ip.ttl().saturating_sub(fake_ttl_offset)
-        };
 
         let seg = build_tcp_segment_p3(
             ip.src(),
@@ -1981,7 +1996,7 @@ pub fn unidir_frag(packet: &bytes::Bytes, frag_size: usize, fake_ttl_offset: u8)
             TcpFlags::PSH | TcpFlags::ACK,
             tcp.window,
             frag_payload,
-            frag_ttl,
+            ip.ttl(), // Normal TTL!
             generate_identification(ip.identification(), frag_index),
         );
         inject.push(seg);
@@ -2437,7 +2452,7 @@ mod tests {
         pkt[10..12].copy_from_slice(&csum.to_be_bytes());
         let pkt = bytes::Bytes::from(pkt);
         let result = unidir_frag(&pkt, 10, 1);
-        assert!(result.inject.len() >= 3);
+        assert_eq!(result.inject.len(), 5);
         // P0-12: unidir_frag must drop the original — fragments carry all data
         assert!(result.drop, "unidir_frag must set drop=true (P0-11)");
         assert!(

@@ -1,0 +1,170 @@
+openapi: 3.0.3
+info:
+  title: FreeDPI Windows QA Observer API
+  version: v6-blockers-closed
+  description: |
+    Minimal QA observer/debug API. Existing production /api/v1 routes remain the normal control path.
+    Service lifecycle is tested through Windows SCM, not HTTP. Forced strategy is forbidden in AutoTune tests.
+servers:
+  - url: http://127.0.0.1:11337
+security:
+  - ApiKeyAuth: []
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    UnsupportedReasons:
+      type: array
+      items: { type: string }
+    QaBase:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        unsupported:
+          $ref: '#/components/schemas/UnsupportedReasons'
+    LiveProfile:
+      type: object
+      required: [name, strategy_id, runtime_status]
+      properties:
+        name: { type: string }
+        strategy_id: { type: integer, format: uint32 }
+        category: { type: string }
+        techniques:
+          type: array
+          items: { type: string }
+        source: { type: string, enum: [builtin, custom_toml, unknown] }
+        runtime_status: { type: string, enum: [live, unsupported, unreachable] }
+        force_selectable: { type: boolean }
+        auto_selectable: { type: boolean }
+        unsupported_reasons:
+          $ref: '#/components/schemas/UnsupportedReasons'
+    StrategyInventory:
+      allOf:
+        - $ref: '#/components/schemas/QaBase'
+        - type: object
+          properties:
+            source: { type: string, enum: [runtime, source_fallback] }
+            live_profiles:
+              type: array
+              items: { $ref: '#/components/schemas/LiveProfile' }
+            probe_numeric_ids:
+              type: array
+              items:
+                type: object
+                properties:
+                  strategy_id: { type: integer, format: uint32 }
+                  mapped_profile_name: { type: string, nullable: true }
+                  status: { type: string, enum: [mapped, unresolved] }
+            dead_registry_entries:
+              type: array
+              items:
+                type: object
+                properties:
+                  name: { type: string }
+                  status: { type: string }
+                  unsupported_reasons:
+                    $ref: '#/components/schemas/UnsupportedReasons'
+            reconciliation: { type: object }
+    RuntimeStrategySnapshot:
+      allOf:
+        - $ref: '#/components/schemas/QaBase'
+        - type: object
+          properties:
+            generation: { type: integer, format: uint64 }
+            active_profiles: { type: object }
+            forced: { type: object }
+            auto_mode: { type: object }
+    FlowTelemetry:
+      allOf:
+        - $ref: '#/components/schemas/QaBase'
+        - type: object
+          properties:
+            generation: { type: integer, format: uint64 }
+            aggregate: { type: object }
+            flows:
+              type: array
+              items: { type: object }
+paths:
+  /qa/capabilities:
+    get:
+      summary: QA feature capabilities
+      responses:
+        '200': { description: flat JSON capabilities }
+  /qa/health:
+    get:
+      summary: QA surface health
+      responses:
+        '200': { description: flat JSON liveness }
+  /qa/reset_state:
+    post:
+      summary: Reset test state where real reset hooks exist
+      responses:
+        '200': { description: flat JSON reset result }
+  /qa/reset_telemetry:
+    post:
+      summary: Reset telemetry counters where reset hooks exist
+      responses:
+        '200': { description: flat JSON reset result }
+  /qa/strategy_inventory:
+    get:
+      summary: Reconcile live StrategyProfileRegistry, numeric probe IDs and dead StrategyRegistry entries
+      responses:
+        '200':
+          description: source-grounded strategy inventory reconciliation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StrategyInventory' }
+  /qa/runtime_strategy_snapshot:
+    get:
+      summary: Active runtime strategy/profile snapshot
+      responses:
+        '200':
+          description: runtime strategy snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuntimeStrategySnapshot' }
+  /qa/flow_telemetry:
+    get:
+      summary: Flow telemetry proving FreeDPI observed traffic
+      parameters:
+        - name: since_generation
+          in: query
+          schema: { type: integer, format: uint64 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 128 }
+      responses:
+        '200':
+          description: flow telemetry
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FlowTelemetry' }
+  /qa/autotune_state:
+    get:
+      summary: AutoTune state derived from real fields
+      responses:
+        '200': { description: flat JSON AutoTune state }
+  /qa/autotune_decision_log:
+    get:
+      summary: Observer-only decision log
+      responses:
+        '200': { description: flat JSON decision events }
+  /qa/windivert_stats:
+    get:
+      summary: PacketEngine/WinDivert stats snapshot
+      responses:
+        '200': { description: flat JSON stats }
+  /qa/driver_service_stats:
+    get:
+      summary: Driver/service diagnostics if available
+      responses:
+        '200': { description: flat JSON stats or unsupported reason }
+  /qa/export_test_report:
+    post:
+      summary: Export one local JSON report bundle
+      responses:
+        '200': { description: flat JSON report }

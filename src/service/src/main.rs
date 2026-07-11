@@ -604,6 +604,7 @@ fn init_pipeline(config: &Config, engine: &Arc<ServiceEngine>) -> Option<Arc<Pro
         info!("WinDivert filter dynamically built: {}", built);
         built
     } else {
+        info!("WinDivert filter user override is active: {}", config.windivert.filter);
         config.windivert.filter.clone()
     };
 

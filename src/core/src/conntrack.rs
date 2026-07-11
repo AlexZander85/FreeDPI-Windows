@@ -422,6 +422,15 @@ impl Conntrack {
     pub fn total_created(&self) -> u64 {
         self.inner.total_created.load(Ordering::Relaxed)
     }
+
+    pub fn is_ip_active(&self, ip: &std::net::IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        self.inner.map.iter().any(|entry| {
+            let key = entry.key();
+            let is_match = key.src_ip == *ip || key.dst_ip == *ip;
+            is_match && now.duration_since(entry.value().last_activity).as_secs() < 120
+        })
+    }
 }
 
 impl Default for Conntrack {

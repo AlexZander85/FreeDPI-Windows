@@ -1,0 +1,13 @@
+schema_version: 1
+name: provider_auto
+level: 2
+mode: auto_only
+privacy: no_raw_upload
+requires:
+  - physical_windows_host
+  - administrator
+  - explicit_user_consent
+  - provider_network
+forbidden:
+  - force_strategy_for_effectiveness_claim
+  - automatic_raw_artifact_upload

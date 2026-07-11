@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "control_domains": [
+    "example.com"
+  ],
+  "synthetic_domains": [
+    "clean.testlab.local",
+    "blocked.testlab.local",
+    "quic.testlab.local"
+  ],
+  "provider_domains": [
+    "REPLACE_WITH_USER_OPT_IN_DOMAINS_ONLY"
+  ],
+  "notes": "Do not commit real sensitive domains. Provider domains require explicit user opt-in."
+}

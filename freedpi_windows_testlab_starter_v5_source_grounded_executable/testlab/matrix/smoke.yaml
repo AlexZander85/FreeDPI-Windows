@@ -1,0 +1,10 @@
+schema_version: 1
+name: smoke
+level: 0
+cases:
+  - id: cargo_tests
+    kind: cargo
+    command: test
+  - id: api_health_if_running
+    kind: rest
+    endpoint: /api/v1/health

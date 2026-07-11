@@ -1,0 +1,12 @@
+schema_version: 3
+mode: auto_observer_only
+forbidden_actions:
+  - /qa/force_strategy
+  - /api/v1/strategies/tune_after_block_mode_known
+cases:
+  - id: auto_tls_timeout
+    synthetic_mode: TLS_HANDSHAKE_TIMEOUT
+    expected_block_class: TLS_HANDSHAKE_TIMEOUT
+    require_phases_from_app: true
+    require_runtime_snapshot_change: true
+    require_flow_telemetry: true

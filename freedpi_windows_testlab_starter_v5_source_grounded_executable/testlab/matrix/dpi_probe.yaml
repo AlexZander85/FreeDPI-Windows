@@ -1,0 +1,13 @@
+schema_version: 3
+mode: observer_only
+cases:
+  - id: tls_handshake_timeout
+    synthetic_mode: TLS_HANDSHAKE_TIMEOUT
+    expected_block_class: TLS_HANDSHAKE_TIMEOUT
+    confidence_min: 0.85
+    external_strategy_intervention_allowed: false
+  - id: quic_udp_drop
+    synthetic_mode: QUIC_UDP_DROP
+    expected_block_class: QUIC_UDP_DROP
+    confidence_min: 0.80
+    external_strategy_intervention_allowed: false

@@ -1,0 +1,13 @@
+schema_version: 1
+name: strategy_all
+source: qa_strategy_inventory
+mode: forced
+per_strategy:
+  reset_telemetry: true
+  force_strategy: true
+  verify_runtime_snapshot: true
+  verify_flow_observed: true
+  verify_no_crash: true
+  verify_no_packet_loop: true
+  verify_no_handle_leak: true
+  timeout_sec: 30

@@ -48,6 +48,7 @@ pub enum PacketDecision {
         inter_delay_us: u32,
         /// P0-10: Направление инъекции (PreserveOriginal, ForceOutbound, ForceInbound).
         inject_direction: crate::desync::InjectDirection,
+        drop_original: bool,
     },
     Drop,
 }
@@ -56,6 +57,11 @@ pub enum PacketDecision {
 pub enum InjectProtocol {
     Tcp,
     Udp,
+}
+
+enum TxAction {
+    Forward(bytes::Bytes, WinDivertAddress<NetworkLayer>),
+    Inject(bytes::Bytes, WinDivertAddress<NetworkLayer>),
 }
 
 use serde::{Deserialize, Serialize};
@@ -589,6 +595,7 @@ impl ProcessingPipeline {
         }
 
         let redirect_table = Arc::new(crate::desync::redirect_table::RedirectTable::new());
+        fake_ip.register_active_checkers(conntrack.clone(), redirect_table.clone());
         let redirect_table_clone = redirect_table.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -1245,7 +1252,8 @@ impl ProcessingPipeline {
                     Err(TrySendError::Full(pkt)) => {
                         stats.shard_queue_full.fetch_add(1, Ordering::Relaxed);
                         // Fail-open: forward directly, never block capture
-                        let _ = engine.send_batch(&[(pkt.data, pkt.addr)]);
+                        let _ = engine.send_batch(&[(pkt.data.clone(), pkt.addr)]);
+                        pool.release_bytes(pkt.data);
                     }
                     Err(TrySendError::Disconnected(_)) => return,
                 }
@@ -1263,10 +1271,7 @@ impl ProcessingPipeline {
         pool: Arc<PacketBufferPool>,
         shutdown: Arc<std::sync::atomic::AtomicBool>,
     ) {
-        let mut forward_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> =
-            Vec::with_capacity(64);
-        let mut inject_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> =
-            Vec::with_capacity(64);
+        let mut tx_queue: Vec<TxAction> = Vec::with_capacity(128);
 
         loop {
             if shutdown.load(Ordering::Acquire) {
@@ -1281,26 +1286,23 @@ impl ProcessingPipeline {
             };
 
             // 2. Prepare batches
-            forward_batch.clear();
-            inject_batch.clear();
+            tx_queue.clear();
 
             // 3. Process first packet
             Self::shard_process_one(
                 first,
-                &mut forward_batch,
-                &mut inject_batch,
+                &mut tx_queue,
                 &engine,
                 &pipeline,
                 &pool,
             );
 
             // 4. Drain remaining available packets (batch processing)
-            while forward_batch.len() < 64 {
+            while tx_queue.len() < 64 {
                 match rx.try_recv() {
                     Ok(pkt) => Self::shard_process_one(
                         pkt,
-                        &mut forward_batch,
-                        &mut inject_batch,
+                        &mut tx_queue,
                         &engine,
                         &pipeline,
                         &pool,
@@ -1309,32 +1311,48 @@ impl ProcessingPipeline {
                 }
             }
 
-            // 5. Send forward batch
-            if !forward_batch.is_empty() {
-                let sent = engine.send_batch(&forward_batch);
-                if let Ok(n) = sent {
-                    pipeline
-                        .stats
-                        .forwarded
-                        .fetch_add(n as u64, Ordering::Relaxed);
+            // 5. Send tx_queue actions while preserving wire order and batching adjacent ones
+            if !tx_queue.is_empty() {
+                let mut i = 0;
+                while i < tx_queue.len() {
+                    match &tx_queue[i] {
+                        TxAction::Forward(_, _) => {
+                            let mut batch = Vec::new();
+                            while i < tx_queue.len() {
+                                if let TxAction::Forward(ref data, ref addr) = tx_queue[i] {
+                                    batch.push((data.clone(), addr.clone()));
+                                    i += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            if let Ok(n) = engine.send_batch(&batch) {
+                                pipeline.stats.forwarded.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                            for (data, _) in batch {
+                                pool.release_bytes(data);
+                            }
+                        }
+                        TxAction::Inject(_, _) => {
+                            let mut batch = Vec::new();
+                            while i < tx_queue.len() {
+                                if let TxAction::Inject(ref data, ref addr) = tx_queue[i] {
+                                    batch.push((data.clone(), addr.clone()));
+                                    i += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            if let Ok(n) = engine.inject_batch_via_divert(&batch) {
+                                pipeline.stats.fake_ch_injected.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                            for (data, _) in batch {
+                                pool.release_bytes(data);
+                            }
+                        }
+                    }
                 }
-                for (data, _) in forward_batch.drain(..) {
-                    pool.release_bytes(data);
-                }
-            }
-
-            // 6. Send inject batch
-            if !inject_batch.is_empty() {
-                let sent = engine.inject_batch_via_divert(&inject_batch);
-                if let Ok(n) = sent {
-                    pipeline
-                        .stats
-                        .fake_ch_injected
-                        .fetch_add(n as u64, Ordering::Relaxed);
-                }
-                for (data, _) in inject_batch.drain(..) {
-                    pool.release_bytes(data);
-                }
+                tx_queue.clear();
             }
         }
 
@@ -1362,8 +1380,7 @@ impl ProcessingPipeline {
     /// Inline helper to avoid duplicating the match arms.
     fn shard_process_one(
         captured: CapturedPacket,
-        forward_batch: &mut Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)>,
-        inject_batch: &mut Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)>,
+        tx_queue: &mut Vec<TxAction>,
         engine: &PacketEngine,
         pipeline: &Self,
         pool: &PacketBufferPool,
@@ -1374,12 +1391,12 @@ impl ProcessingPipeline {
         match decision {
             Ok(decision) => match decision {
                 PacketDecision::Forward => {
-                    forward_batch.push((data, addr));
+                    tx_queue.push(TxAction::Forward(data, addr));
                 }
                 PacketDecision::Modify(modified) => {
                     pool.release_bytes(data);
                     if pipeline.validate_packet_and_log(&modified) {
-                        forward_batch.push((modified, addr));
+                        tx_queue.push(TxAction::Forward(modified, addr));
                     }
                 }
                 PacketDecision::Desync {
@@ -1388,13 +1405,16 @@ impl ProcessingPipeline {
                     inject_protocol,
                     inter_delay_us,
                     inject_direction,
+                    drop_original,
                 } => {
                     let inject_addr = Self::apply_inject_direction(&addr, inject_direction);
 
+                    // 1. First inject decoy/fake segments (with appropriate delay)
                     match inject_protocol {
                         InjectProtocol::Tcp => {
-                            for (i, inject_pkt) in inject.iter().enumerate() {
-                                if !pipeline.validate_packet_and_log(inject_pkt) {
+                            for (i, inject_pkt) in inject.into_iter().enumerate() {
+                                if !pipeline.validate_packet_and_log(&inject_pkt) {
+                                    pool.release_bytes(inject_pkt);
                                     continue;
                                 }
                                 if i > 0 && inter_delay_us > 0 {
@@ -1403,16 +1423,17 @@ impl ProcessingPipeline {
                                         inject_pkt.clone(),
                                         inject_addr.clone(),
                                     ) {
-                                        inject_batch.push((inject_pkt.clone(), inject_addr.clone()));
+                                        tx_queue.push(TxAction::Inject(inject_pkt, inject_addr.clone()));
                                     }
                                 } else {
-                                    inject_batch.push((inject_pkt.clone(), inject_addr.clone()));
+                                    tx_queue.push(TxAction::Inject(inject_pkt, inject_addr.clone()));
                                 }
                             }
                         }
                         InjectProtocol::Udp => {
-                            for (i, inject_pkt) in inject.iter().enumerate() {
-                                if !pipeline.validate_packet_and_log(inject_pkt) {
+                            for (i, inject_pkt) in inject.into_iter().enumerate() {
+                                if !pipeline.validate_packet_and_log(&inject_pkt) {
+                                    pool.release_bytes(inject_pkt);
                                     continue;
                                 }
                                 if i > 0 && inter_delay_us > 0 {
@@ -1421,19 +1442,16 @@ impl ProcessingPipeline {
                                         inject_pkt.clone(),
                                         inject_addr.clone(),
                                     ) {
-                                        if let Err(e) = engine.inject_raw_udp(inject_pkt) {
-                                            tracing::warn!(
-                                                "Failed to inject UDP desync packet: {}",
-                                                e
-                                            );
+                                        if let Err(e) = engine.inject_raw_udp(&inject_pkt) {
+                                            tracing::warn!("Failed to inject UDP desync packet: {}", e);
                                         }
-                                        pool.release_bytes(inject_pkt.clone());
+                                        pool.release_bytes(inject_pkt);
                                     }
                                 } else {
-                                    if let Err(e) = engine.inject_raw_udp(inject_pkt) {
+                                    if let Err(e) = engine.inject_raw_udp(&inject_pkt) {
                                         tracing::warn!("Failed to inject UDP desync packet: {}", e);
                                     }
-                                    pool.release_bytes(inject_pkt.clone());
+                                    pool.release_bytes(inject_pkt);
                                 }
                                 pipeline
                                     .stats
@@ -1443,14 +1461,16 @@ impl ProcessingPipeline {
                         }
                     }
 
-                    // Handle modified/original packet
+                    // 2. Then send modified or original packet (if drop_original is false)
                     if let Some(m) = modified {
                         if pipeline.validate_packet_and_log(&m) {
-                            forward_batch.push((m, addr));
+                            tx_queue.push(TxAction::Forward(m, addr));
                         }
                         pool.release_bytes(data);
+                    } else if !drop_original {
+                        tx_queue.push(TxAction::Forward(data, addr));
                     } else {
-                        forward_batch.push((data, addr));
+                        pool.release_bytes(data);
                     }
                 }
                 PacketDecision::Drop => {
@@ -1460,7 +1480,7 @@ impl ProcessingPipeline {
             },
             Err(e) => {
                 tracing::debug!("Packet processing error: {}", e);
-                forward_batch.push((data, addr));
+                tx_queue.push(TxAction::Forward(data, addr));
                 pipeline.stats.errors.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -2312,11 +2332,12 @@ impl ProcessingPipeline {
             }
         }
 
-        if result.inject.is_empty() && result.modified.is_none() && !result.drop {
-            return Ok(PacketDecision::Forward);
-        }
-        if result.drop {
-            return Ok(PacketDecision::Drop);
+        if result.inject.is_empty() && result.modified.is_none() {
+            if result.drop {
+                return Ok(PacketDecision::Drop);
+            } else {
+                return Ok(PacketDecision::Forward);
+            }
         }
 
         let inter_delay = result.inter_delay_us;
@@ -2331,15 +2352,17 @@ impl ProcessingPipeline {
                 inject_protocol: InjectProtocol::Tcp,
                 inter_delay_us: inter_delay,
                 inject_direction: result.inject_direction,
+                drop_original: result.drop,
             });
         }
 
         Ok(PacketDecision::Desync {
             inject: result.inject,
-            modified: result.modified,
+            modified: None,
             inject_protocol: InjectProtocol::Tcp,
             inter_delay_us: inter_delay,
             inject_direction: result.inject_direction,
+            drop_original: result.drop,
         })
     }
 
@@ -2350,10 +2373,10 @@ impl ProcessingPipeline {
     ) -> Result<PacketDecision, anyhow::Error> {
         let packet = captured.data.clone();
 
-        // Conntrack: извлекаем QUIC PN/DCID для PN gap detection
+        // Conntrack: извлекаем QUIC DCID для conntrack
         {
             use crate::conntrack::{ConnState, ConntrackEntry};
-            use crate::desync::quic::extract_quic_pn_and_dcid;
+            use crate::desync::quic::extract_quic_dcid_from_long_header;
 
             if self.conntrack.get(&cp.conn_key).is_none() {
                 let fk = crate::conntrack::FlowKey::new_bidirectional(
@@ -2365,9 +2388,7 @@ impl ProcessingPipeline {
                 );
                 let conn_id = crate::conntrack::compute_conn_id(&fk);
                 let quic_dcid = if cp.payload_offset < packet.len() {
-                    extract_quic_pn_and_dcid(&packet[cp.payload_offset..])
-                        .map(|(_, dcid)| dcid)
-                        .unwrap_or_default()
+                    extract_quic_dcid_from_long_header(&packet[cp.payload_offset..]).unwrap_or_default()
                 } else {
                     vec![]
                 };
@@ -2436,11 +2457,12 @@ impl ProcessingPipeline {
                 );
             }
         }
-        if result.inject.is_empty() && result.modified.is_none() && !result.drop {
-            return Ok(PacketDecision::Forward);
-        }
-        if result.drop {
-            return Ok(PacketDecision::Drop);
+        if result.inject.is_empty() && result.modified.is_none() {
+            if result.drop {
+                return Ok(PacketDecision::Drop);
+            } else {
+                return Ok(PacketDecision::Forward);
+            }
         }
         let inter_delay = result.inter_delay_us;
         if let Some(modified) = result.modified {
@@ -2453,6 +2475,7 @@ impl ProcessingPipeline {
                 inject_protocol: InjectProtocol::Udp,
                 inter_delay_us: inter_delay,
                 inject_direction: result.inject_direction,
+                drop_original: result.drop,
             });
         }
         Ok(PacketDecision::Desync {
@@ -2461,6 +2484,7 @@ impl ProcessingPipeline {
             inject_protocol: InjectProtocol::Udp,
             inter_delay_us: inter_delay,
             inject_direction: result.inject_direction,
+            drop_original: result.drop,
         })
     }
 
@@ -2500,11 +2524,12 @@ impl ProcessingPipeline {
                 );
             }
         }
-        if result.inject.is_empty() && result.modified.is_none() && !result.drop {
-            return Ok(PacketDecision::Forward);
-        }
-        if result.drop {
-            return Ok(PacketDecision::Drop);
+        if result.inject.is_empty() && result.modified.is_none() {
+            if result.drop {
+                return Ok(PacketDecision::Drop);
+            } else {
+                return Ok(PacketDecision::Forward);
+            }
         }
         let inter_delay = result.inter_delay_us;
         if let Some(modified) = result.modified {
@@ -2517,6 +2542,7 @@ impl ProcessingPipeline {
                 inject_protocol: InjectProtocol::Tcp,
                 inter_delay_us: inter_delay,
                 inject_direction: result.inject_direction,
+                drop_original: result.drop,
             });
         }
         Ok(PacketDecision::Desync {
@@ -2525,6 +2551,7 @@ impl ProcessingPipeline {
             inject_protocol: InjectProtocol::Tcp,
             inter_delay_us: inter_delay,
             inject_direction: result.inject_direction,
+            drop_original: result.drop,
         })
     }
 
@@ -2614,8 +2641,10 @@ impl ProcessingPipeline {
                 let latency_us = tune_start.elapsed().as_micros() as u64;
                 self.auto_tune.record_application_by_id(profile.id);
 
-                if result.drop {
-                    return Ok(PacketDecision::Drop);
+                if result.inject.is_empty() && result.modified.is_none() {
+                    if result.drop {
+                        return Ok(PacketDecision::Drop);
+                    }
                 }
                 if let Some(modified) = result.modified {
                     if result.inject.is_empty() {
@@ -2627,6 +2656,7 @@ impl ProcessingPipeline {
                         inject_protocol: InjectProtocol::Tcp,
                         inter_delay_us: result.inter_delay_us,
                         inject_direction: result.inject_direction,
+                        drop_original: result.drop,
                     });
                 }
                 if !result.inject.is_empty() {
@@ -2636,6 +2666,7 @@ impl ProcessingPipeline {
                         inject_protocol: InjectProtocol::Tcp,
                         inter_delay_us: result.inter_delay_us,
                         inject_direction: result.inject_direction,
+                        drop_original: result.drop,
                     });
                 }
             }
@@ -2660,8 +2691,10 @@ impl ProcessingPipeline {
                 let latency_us = tune_start.elapsed().as_micros() as u64;
                 self.auto_tune.record_application_by_id(profile.id);
 
-                if result.drop {
-                    return Ok(PacketDecision::Drop);
+                if result.inject.is_empty() && result.modified.is_none() {
+                    if result.drop {
+                        return Ok(PacketDecision::Drop);
+                    }
                 }
                 if let Some(modified) = result.modified {
                     if result.inject.is_empty() {
@@ -2673,6 +2706,7 @@ impl ProcessingPipeline {
                         inject_protocol: InjectProtocol::Tcp,
                         inter_delay_us: result.inter_delay_us,
                         inject_direction: result.inject_direction,
+                        drop_original: result.drop,
                     });
                 }
                 if !result.inject.is_empty() {
@@ -2682,6 +2716,7 @@ impl ProcessingPipeline {
                         inject_protocol: InjectProtocol::Tcp,
                         inter_delay_us: result.inter_delay_us,
                         inject_direction: result.inject_direction,
+                        drop_original: result.drop,
                     });
                 }
             }

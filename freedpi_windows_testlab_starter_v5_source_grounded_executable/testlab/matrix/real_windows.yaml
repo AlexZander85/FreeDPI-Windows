@@ -1,0 +1,16 @@
+schema_version: 1
+name: real_windows
+level: 1
+checks:
+  - scm_install_start_stop_restart_uninstall
+  - windivert_handle_open_close_cleanup
+  - no_orphaned_processes
+  - no_orphaned_driver_state
+  - windows_firewall_compatibility
+  - dns_client_service_compatibility
+  - ipv4_traffic
+  - ipv6_traffic_if_supported
+  - network_adapter_disable_enable_if_safe
+  - config_hot_reload
+  - api_auth
+  - ui_service_privilege_boundary_if_tauri_present

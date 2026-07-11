@@ -1,0 +1,20 @@
+schema_version: 1
+name: strategy_groups
+groups:
+  - seq_spoof
+  - split
+  - fake_packet
+  - disorder
+  - oob
+  - ttl
+  - padding
+  - tls_record_frag
+  - tls_parrot
+  - http_host_mangle
+  - quic_policy
+  - dns_drop_doh
+  - fake_ip
+  - proxy_redirect
+  - socks5_fallback
+  - ipv6
+  - custom_toml

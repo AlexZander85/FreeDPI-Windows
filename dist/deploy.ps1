@@ -74,18 +74,20 @@ function Install-FreeDPI {
     # 3. Create a sample config if not present
     $ConfigPath = Join-Path $InstallDir "config.toml"
     if (-not (Test-Path $ConfigPath)) {
+        $ApiKey = [guid]::NewGuid().ToString()
         @"
 # FreeDPI Configuration
 # See documentation for all available options.
 
 [windivert]
-filter = "(ip or ipv6) && tcp.DstPort == 443"
+# filter is dynamically generated based on active features. Comment/remove to let dynamic filtering work.
+# filter = "(ip or ipv6) && tcp.DstPort == 443"
 queue_length = 4096
 
 [api]
 enabled = true
 port = 11337
-api_key = ""
+api_key = "$ApiKey"
 
 [general]
 log_level = "info"

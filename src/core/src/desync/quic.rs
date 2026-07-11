@@ -1760,14 +1760,30 @@ pub fn parse_quic_varint(data: &[u8]) -> Option<(u64, usize)> {
     Some((value, consumed))
 }
 
+/// Извлекает только Destination Connection ID (DCID) из Long Header QUIC пакета.
+/// Это безопасно и не зависит от шифрования заголовков (Header Protection).
+pub fn extract_quic_dcid_from_long_header(packet: &[u8]) -> Option<Vec<u8>> {
+    if packet.len() < 6 {
+        return None;
+    }
+    let first = packet[0];
+    let is_long_header = (first & 0x80) != 0;
+    if !is_long_header {
+        return None;
+    }
+    let dcid_len = packet[5] as usize;
+    let dcid_end = 6 + dcid_len;
+    if packet.len() < dcid_end {
+        return None;
+    }
+    Some(packet[6..dcid_end].to_vec())
+}
+
 /// Извлечение QUIC Packet Number и Destination Connection ID.
 ///
-/// Поддерживает Long Header (Initial, Handshake, 0-RTT, Retry)
-/// и Short Header (1-RTT) пакеты.
-///
-/// Возвращает `(packet_number, dcid_bytes)` или `None`, если
-/// пакет не является корректным QUIC.
-pub fn extract_quic_pn_and_dcid(packet: &[u8]) -> Option<(u64, Vec<u8>)> {
+/// ВНИМАНИЕ: Не использовать в продакшене без Header Protection! Предназначен только для тестов.
+#[cfg(test)]
+pub fn extract_quic_pn_unprotected_for_tests_only(packet: &[u8]) -> Option<(u64, Vec<u8>)> {
     // Минимальная длина: 1 байт флагов
     if packet.is_empty() {
         return None;
@@ -2312,7 +2328,7 @@ mod tests {
         // Skip IP header (20 bytes for IPv4) + UDP header (8 bytes)
         if packet.len() > 28 {
             let quic_layer = &packet[28..];
-            let (pn, dcid) = extract_quic_pn_and_dcid(quic_layer).expect("parse failed");
+            let (pn, dcid) = extract_quic_pn_unprotected_for_tests_only(quic_layer).expect("parse failed");
             assert!(!dcid.is_empty(), "DCID must be extracted");
             assert!(pn <= 0xFFFFFFFF, "PN should fit in 32 bits, got 0x{:X}", pn);
         }

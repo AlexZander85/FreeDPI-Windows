@@ -1,5 +1,6 @@
 //! FakeIP DNS — аллокация fake IP адресов для доменов (из sing-box).
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -22,6 +23,8 @@ pub struct FakeIpManager {
     max_entries: usize,
     evictions: Arc<AtomicU64>,
     access_counter: Arc<AtomicU64>,
+    conntrack: ArcSwap<Option<Arc<crate::conntrack::Conntrack>>>,
+    redirect_table: ArcSwap<Option<Arc<crate::desync::redirect_table::RedirectTable>>>,
 }
 
 impl FakeIpManager {
@@ -33,7 +36,18 @@ impl FakeIpManager {
             max_entries,
             evictions: Arc::new(AtomicU64::new(0)),
             access_counter: Arc::new(AtomicU64::new(0)),
+            conntrack: ArcSwap::new(Arc::new(None)),
+            redirect_table: ArcSwap::new(Arc::new(None)),
         }
+    }
+
+    pub fn register_active_checkers(
+        &self,
+        conntrack: Arc<crate::conntrack::Conntrack>,
+        redirect_table: Arc<crate::desync::redirect_table::RedirectTable>,
+    ) {
+        self.conntrack.store(Arc::new(Some(conntrack)));
+        self.redirect_table.store(Arc::new(Some(redirect_table)));
     }
 
     pub fn allocate(&self, domain: &str) -> Option<Ipv4Addr> {
@@ -50,18 +64,36 @@ impl FakeIpManager {
 
         // 2. Если достигнут лимит, вытесняем старейшую запись (LRU)
         if self.domain_to_ip.len() >= self.max_entries {
-            let mut oldest_ip: Option<Ipv4Addr> = None;
-            let mut oldest_time = u64::MAX;
+            let conntrack_guard = self.conntrack.load();
+            let redirect_guard = self.redirect_table.load();
 
-            for entry in self.ip_to_domain.iter() {
-                let t = entry.value().last_used.load(Ordering::Relaxed);
-                if t < oldest_time {
-                    oldest_time = t;
-                    oldest_ip = Some(*entry.key());
+            let is_active = |ip: &Ipv4Addr| -> bool {
+                let ip_addr = IpAddr::V4(*ip);
+                if let Some(ct) = &**conntrack_guard {
+                    if ct.is_ip_active(&ip_addr) {
+                        return true;
+                    }
                 }
-            }
+                if let Some(rt) = &**redirect_guard {
+                    if rt.is_ip_active(&ip_addr) {
+                        return true;
+                    }
+                }
+                false
+            };
 
-            if let Some(ip_to_evict) = oldest_ip {
+            let mut candidates: Vec<(Ipv4Addr, u64)> = self.ip_to_domain.iter()
+                .map(|entry| (*entry.key(), entry.value().last_used.load(Ordering::Relaxed)))
+                .collect();
+            candidates.sort_by_key(|&(_, t)| t);
+
+            let mut evicted = false;
+            for (ip_to_evict, oldest_time) in candidates {
+                if is_active(&ip_to_evict) {
+                    debug!("FakeIP candidate {} is active, skipping eviction", ip_to_evict);
+                    continue;
+                }
+
                 if let Some((_, entry)) = self.ip_to_domain.remove(&ip_to_evict) {
                     self.domain_to_ip.remove(&entry.domain);
                     self.evictions.fetch_add(1, Ordering::Relaxed);
@@ -81,8 +113,14 @@ impl FakeIpManager {
                             last_used: AtomicU64::new(now),
                         },
                     );
+                    evicted = true;
                     return Some(ip_to_evict);
                 }
+            }
+
+            if !evicted {
+                tracing::warn!("FakeIP cache full, but all mappings are currently active. Eviction skipped.");
+                return None;
             }
         }
 
@@ -258,5 +296,44 @@ mod tests {
         assert_eq!(manager.lookup(&IpAddr::V4(ip3)), Some("c.com".to_string()));
         assert_eq!(manager.lookup(&IpAddr::V4(ip1)), Some("a.com".to_string()));
         assert_eq!(manager.evictions(), 1);
+    }
+
+    #[test]
+    fn test_fake_ip_manager_active_protection() {
+        let manager = FakeIpManager::new(3);
+        let ip1 = manager.allocate("a.com").unwrap();
+        let ip2 = manager.allocate("b.com").unwrap();
+        let ip3 = manager.allocate("c.com").unwrap();
+
+        // Register conntrack with mock active checks
+        let conntrack = Arc::new(crate::conntrack::Conntrack::new(std::time::Duration::from_secs(30)));
+        let redirect_table = Arc::new(crate::desync::redirect_table::RedirectTable::new());
+
+        // Insert connection for ip2 in conntrack (to make it active)
+        let key = crate::conntrack::ConnKey::new(
+            std::net::IpAddr::V4(ip2),
+            std::net::IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            12345,
+            443,
+            6,
+        );
+        conntrack.upsert(key, crate::conntrack::ConntrackEntry {
+            client_isn: 0, server_isn: 0, client_seq: 0, server_seq: 0,
+            client_ack: 0, server_ack: 0, rtt_us: 0,
+            state: crate::conntrack::ConnState::Established,
+            desync_applied: false, dscp_spoof: 0, strategy_id: 0,
+            last_activity: std::time::Instant::now(), dup_ack_count: 0,
+            rng: None, quic_pn: 0, quic_dcid: vec![], is_resumption: false,
+            applied_strategy: None, route_key: None, quic_dropped_initials: 0,
+        });
+
+        manager.register_active_checkers(conntrack, redirect_table);
+
+        // Allocate a 4th domain. "b.com" (ip2) is the oldest but is active, so we should skip it and evict "c.com" (ip3) instead!
+        let ip4 = manager.allocate("d.com").unwrap();
+        assert_eq!(ip4, ip3); // Recycled ip3 instead of ip2!
+        assert_eq!(manager.lookup(&IpAddr::V4(ip1)), Some("a.com".to_string()));
+        assert_eq!(manager.lookup(&IpAddr::V4(ip2)), Some("b.com".to_string()));
+        assert_eq!(manager.lookup(&IpAddr::V4(ip3)), Some("d.com".to_string()));
     }
 }

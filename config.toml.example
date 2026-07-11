@@ -2,11 +2,13 @@
 
 [api]
 port = 11337
-api_key = ""
+# api_key is generated automatically on first start if not configured
+# api_key = "some-random-uuid"
 enabled = true
 
 [windivert]
-filter = "ip && (tcp.DstPort == 443 or tcp.SrcPort == 443 or udp.DstPort == 53 or udp.DstPort == 443)"
+# filter is generated dynamically based on active features. If you need custom rules, override here:
+# filter = "ip && (tcp.DstPort == 443 or tcp.SrcPort == 443 or udp.DstPort == 53 or udp.DstPort == 443)"
 queue_length = 8192
 queue_time = 2000
 

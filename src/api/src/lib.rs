@@ -27,7 +27,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 
 // ─── Типы данных ───────────────────────────────────────────────────────────
 
@@ -206,6 +206,11 @@ async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    if state.api_key.is_empty() {
+        error!("FATAL CONFIG ERROR: API key is empty! Access disabled for security.");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     let key = req
         .headers()
         .get("X-API-Key")

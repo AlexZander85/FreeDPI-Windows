@@ -41,6 +41,10 @@ impl RedirectTable {
         self.map.retain(|_, e| e.created_at.elapsed() < max_age);
         before.saturating_sub(self.map.len())
     }
+
+    pub fn is_ip_active(&self, ip: &IpAddr) -> bool {
+        self.map.iter().any(|entry| entry.value().orig_dst_ip == *ip)
+    }
 }
 
 impl Default for RedirectTable {
