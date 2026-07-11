@@ -1,108 +1,92 @@
 //! FakeIP DNS — аллокация fake IP адресов для доменов (из sing-box).
-//!
-//! ## Принцип работы
-//! Когда DPI-обход изменяет SNI на белый домен, ответ сервера
-//! приходит с другим сертификатом. FakeIP позволяет сопоставить
-//! реальный домен с fake IP из резервированного диапазона 10.0.0.0/8.
-//!
-//! ## Бизнес-логика
-//! 1. Клиент делает DNS запрос → engine возвращает fake IP (10.x.x.x)
-//! 2. Клиент подключается к fake IP → engine видит fake IP
-//! 3. Engine подставляет реальный SNI из маппинга fake IP → domain
-//! 4. Сервер отвечает → engine конвертирует ответ обратно
-//!
-//! ## Диапазон
-//! 10.0.0.0 – 10.255.255.255 (16 777 216 адресов)
-//!
-//! ## Thread Safety
-//! DashMap для domain→IP и IP→domain маппингов. AtomicU32 для
-//! счётчика следующего свободного IP. Lock-free для всех операций.
-//!
-//! ## Источник
-//! Адаптировано из [sing-box](https://github.com/SagerNet/sing-box) —
-//! FakeIP DNS (dns.fakeip).
 
 use dashmap::DashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::debug;
 
-/// Базовый префикс FakeIP диапазона (10.0.0.0/8).
 const FAKEIP_BASE: u32 = 0x0A00_0000;
-/// Маска для 16M адресов (первые 8 бит фиксированы).
 const FAKEIP_MASK: u32 = 0x00FF_FFFF;
 
+pub struct FakeIpEntry {
+    pub domain: String,
+    pub last_used: AtomicU64,
+}
+
 /// FakeIP DNS Manager.
-///
-/// Выделяет виртуальные IP адреса из диапазона 10.0.0.0/8
-/// для доменов. Позволяет engine определить реальный домен
-/// по fake IP при обработке входящих пакетов.
-///
-/// # Пример
-/// ```rust
-/// use std::net::{IpAddr, Ipv4Addr};
-/// use freedpi_core::dns::fakeip::FakeIpManager;
-///
-/// let manager = FakeIpManager::new(10_000);
-/// let ip: Ipv4Addr = manager.allocate("example.com").unwrap();
-/// assert!(FakeIpManager::is_fake_ip(&ip));
-/// assert_eq!(manager.lookup(&IpAddr::V4(ip)), Some("example.com".to_string()));
-/// ```
 pub struct FakeIpManager {
-    /// Маппинг domain → fake IP
     domain_to_ip: Arc<DashMap<String, Ipv4Addr>>,
-    /// Маппинг fake IP → domain (обратный lookup)
-    ip_to_domain: Arc<DashMap<Ipv4Addr, String>>,
-    /// Следующий свободный IP в диапазоне (atomic, начиная с 1)
+    ip_to_domain: Arc<DashMap<Ipv4Addr, FakeIpEntry>>,
     next_ip: Arc<AtomicU32>,
-    /// Максимальное количество записей
     max_entries: usize,
+    evictions: Arc<AtomicU64>,
+    access_counter: Arc<AtomicU64>,
 }
 
 impl FakeIpManager {
-    /// Создаёт новый FakeIP менеджер.
-    ///
-    /// # Arguments
-    /// * `max_entries` — максимальное количество записей
-    ///   (по умолчанию 10 000, адресов 16M)
     pub fn new(max_entries: usize) -> Self {
         Self {
             domain_to_ip: Arc::new(DashMap::new()),
             ip_to_domain: Arc::new(DashMap::new()),
             next_ip: Arc::new(AtomicU32::new(1)),
             max_entries,
+            evictions: Arc::new(AtomicU64::new(0)),
+            access_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Выделяет (или возвращает существующий) fake IP для домена.
-    ///
-    /// Если домен уже имеет fake IP — возвращает его.
-    /// Если пул заполнен — возвращает None.
-    ///
-    /// # Arguments
-    /// * `domain` — доменное имя
-    ///
-    /// # Returns
-    /// `Some(Ipv4Addr)` — выделенный fake IP
-    /// `None` — пул заполнен
     pub fn allocate(&self, domain: &str) -> Option<Ipv4Addr> {
-        // Проверяем существующий маппинг
+        let now = self.access_counter.fetch_add(1, Ordering::Relaxed);
+
+        // 1. Проверяем существующий маппинг
         if let Some(ip) = self.domain_to_ip.get(domain) {
-            return Some(*ip);
+            let ip_addr = *ip;
+            if let Some(entry) = self.ip_to_domain.get(&ip_addr) {
+                entry.last_used.store(now, Ordering::Relaxed);
+            }
+            return Some(ip_addr);
         }
 
-        // Проверяем лимит
+        // 2. Если достигнут лимит, вытесняем старейшую запись (LRU)
         if self.domain_to_ip.len() >= self.max_entries {
-            tracing::warn!(
-                "FakeIP cache full ({} entries), cannot allocate for {}",
-                self.max_entries,
-                domain
-            );
-            return None;
+            let mut oldest_ip: Option<Ipv4Addr> = None;
+            let mut oldest_time = u64::MAX;
+
+            for entry in self.ip_to_domain.iter() {
+                let t = entry.value().last_used.load(Ordering::Relaxed);
+                if t < oldest_time {
+                    oldest_time = t;
+                    oldest_ip = Some(*entry.key());
+                }
+            }
+
+            if let Some(ip_to_evict) = oldest_ip {
+                if let Some((_, entry)) = self.ip_to_domain.remove(&ip_to_evict) {
+                    self.domain_to_ip.remove(&entry.domain);
+                    self.evictions.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        "FakeIP Cache full. Evicted domain '{}' (IP {}) with last use logical tick {}",
+                        entry.domain,
+                        ip_to_evict,
+                        oldest_time
+                    );
+
+                    // Реиспользуем освобождённый IP!
+                    self.domain_to_ip.insert(domain.to_string(), ip_to_evict);
+                    self.ip_to_domain.insert(
+                        ip_to_evict,
+                        FakeIpEntry {
+                            domain: domain.to_string(),
+                            last_used: AtomicU64::new(now),
+                        },
+                    );
+                    return Some(ip_to_evict);
+                }
+            }
         }
 
-        // Выделяем новый IP: 10.0.0.0 + atomic counter (mask to /8)
+        // 3. Выделяем новый IP (если лимит не превышен или не удалось вытеснить)
         let offset = self.next_ip.fetch_add(1, Ordering::Relaxed);
         if offset > FAKEIP_MASK {
             tracing::warn!("FakeIP pool exhausted (16M addresses)");
@@ -113,29 +97,32 @@ impl FakeIpManager {
 
         debug!("FakeIP allocated: {} → {}", domain, ip);
         self.domain_to_ip.insert(domain.to_string(), ip);
-        self.ip_to_domain.insert(ip, domain.to_string());
+        self.ip_to_domain.insert(
+            ip,
+            FakeIpEntry {
+                domain: domain.to_string(),
+                last_used: AtomicU64::new(now),
+            },
+        );
 
         Some(ip)
     }
 
-    /// Обратный lookup: fake IP → домен.
-    ///
-    /// # Arguments
-    /// * `fake_ip` — виртуальный IP адрес
-    ///
-    /// # Returns
-    /// `Some(String)` с доменом, если IP найден в маппинге
     pub fn lookup(&self, fake_ip: &IpAddr) -> Option<String> {
         match fake_ip {
-            IpAddr::V4(v4) => self.ip_to_domain.get(v4).map(|d| d.clone()),
+            IpAddr::V4(v4) => {
+                if let Some(entry) = self.ip_to_domain.get(v4) {
+                    let now = self.access_counter.fetch_add(1, Ordering::Relaxed);
+                    entry.last_used.store(now, Ordering::Relaxed);
+                    Some(entry.domain.clone())
+                } else {
+                    None
+                }
+            }
             IpAddr::V6(_) => None,
         }
     }
 
-    /// Удаляет маппинг для домена.
-    ///
-    /// # Arguments
-    /// * `domain` — домен для удаления
     pub fn remove(&self, domain: &str) {
         if let Some((_, ip)) = self.domain_to_ip.remove(domain) {
             self.ip_to_domain.remove(&ip);
@@ -143,35 +130,30 @@ impl FakeIpManager {
         }
     }
 
-    /// Очищает все маппинги и сбрасывает счётчик.
     pub fn clear(&self) {
         self.domain_to_ip.clear();
         self.ip_to_domain.clear();
         self.next_ip.store(1, Ordering::Relaxed);
+        self.evictions.store(0, Ordering::Relaxed);
+        self.access_counter.store(0, Ordering::Relaxed);
     }
 
-    /// Количество активных маппингов.
     pub fn len(&self) -> usize {
         self.domain_to_ip.len()
     }
 
-    /// Пуст ли менеджер.
     pub fn is_empty(&self) -> bool {
         self.domain_to_ip.is_empty()
     }
 
-    /// Проверяет, является ли IP fake IP (из диапазона 10.0.0.0/8).
-    ///
-    /// # Arguments
-    /// * `ip` — IP адрес для проверки
-    ///
-    /// # Returns
-    /// `true` если IP принадлежит диапазону 10.x.x.x
+    pub fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
+    }
+
     pub fn is_fake_ip(ip: &Ipv4Addr) -> bool {
         ip.octets()[0] == 10
     }
 
-    /// Возвращает снапшот всех записей (для API/debug).
     pub fn snapshot(&self) -> Vec<(String, Ipv4Addr)> {
         self.domain_to_ip
             .iter()
@@ -260,24 +242,21 @@ mod tests {
     }
 
     #[test]
-    fn test_max_entries() {
-        let manager = FakeIpManager::new(5);
-        for i in 0..5 {
-            assert!(manager.allocate(&format!("{}.com", i)).is_some());
-        }
-        // 6th should fail
-        assert!(manager.allocate("overflow.com").is_none());
-    }
-
-    #[test]
-    fn test_sequential_ips() {
-        let manager = FakeIpManager::new(10);
+    fn test_fake_ip_manager_ttl_eviction() {
+        let manager = FakeIpManager::new(3);
         let ip1 = manager.allocate("a.com").unwrap();
         let ip2 = manager.allocate("b.com").unwrap();
-        // 10.0.0.1, 10.0.0.2, ...
-        let expected1 = Ipv4Addr::new(10, 0, 0, 1);
-        let expected2 = Ipv4Addr::new(10, 0, 0, 2);
-        assert_eq!(ip1, expected1);
-        assert_eq!(ip2, expected2);
+        let ip3 = manager.allocate("c.com").unwrap();
+
+        // Access ip1, making it most recently used
+        assert_eq!(manager.lookup(&IpAddr::V4(ip1)), Some("a.com".to_string()));
+
+        // Allocate 4th domain, should trigger eviction of "b.com" (oldest unused)
+        let ip4 = manager.allocate("d.com").unwrap();
+        assert_eq!(ip4, ip2); // Recycled the IP of b.com
+        assert_eq!(manager.lookup(&IpAddr::V4(ip2)), Some("d.com".to_string()));
+        assert_eq!(manager.lookup(&IpAddr::V4(ip3)), Some("c.com".to_string()));
+        assert_eq!(manager.lookup(&IpAddr::V4(ip1)), Some("a.com".to_string()));
+        assert_eq!(manager.evictions(), 1);
     }
 }

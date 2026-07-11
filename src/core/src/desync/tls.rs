@@ -171,7 +171,27 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
 
     let mut inject: Vec<bytes::Bytes> = Vec::new();
 
-    // Фрагмент 1: начало до split_point (fake TTL)
+    // 1. Decoy: overlap first fragment with fake payload and low TTL
+    if fake_ttl_offset > 0 {
+        let decoy_payload = vec![0u8; split_point];
+        let decoy_frag1 = crate::desync::tcp::build_ip_tcp_packet_with_options(
+            packet,
+            src,
+            dst,
+            src_port,
+            dst_port,
+            seq,
+            ack,
+            TcpFlags::PSH | TcpFlags::ACK,
+            window,
+            &decoy_payload,
+            ip.ttl().saturating_sub(fake_ttl_offset),
+            ip.identification().wrapping_add(1),
+        );
+        inject.push(decoy_frag1);
+    }
+
+    // 2. Real Fragment 1: normal TTL
     let frag1_payload = &payload[..split_point];
     let frag1 = crate::desync::tcp::build_ip_tcp_packet_with_options(
         packet,
@@ -184,12 +204,12 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
         TcpFlags::PSH | TcpFlags::ACK,
         window,
         frag1_payload,
-        ip.ttl().saturating_sub(fake_ttl_offset),
-        ip.identification().wrapping_add(1),
+        ip.ttl(),
+        ip.identification().wrapping_add(2),
     );
     inject.push(frag1);
 
-    // Фрагмент 2: остаток (нормальный TTL)
+    // 3. Real Fragment 2: normal TTL
     let frag2_payload = &payload[split_point..];
     let new_seq = seq.wrapping_add(split_point as u32);
     let frag2 = crate::desync::tcp::build_ip_tcp_packet_with_options(
@@ -204,7 +224,7 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
         window,
         frag2_payload,
         ip.ttl(),
-        ip.identification().wrapping_add(2),
+        ip.identification().wrapping_add(3),
     );
     inject.push(frag2);
 
@@ -675,7 +695,7 @@ mod tests {
         let result = tls_record_frag(&pkt, 5, 1);
         // P0-11: Фрагменты уже несут все данные — оригинал должен быть дропнут.
         assert!(result.drop);
-        assert_eq!(result.inject.len(), 2);
+        assert_eq!(result.inject.len(), 3);
         assert!(result.modified.is_none());
     }
 

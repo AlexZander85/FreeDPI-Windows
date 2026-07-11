@@ -444,6 +444,7 @@ pub struct ProcessingPipeline {
     buf_pool: Arc<PacketBufferPool>,
     redirect_table: Arc<crate::desync::redirect_table::RedirectTable>,
     socks_redirector: Arc<crate::proxy::redirector::SocksRedirector>,
+    #[allow(dead_code)]
     dns_proxy: Arc<crate::dns::dns_proxy::DnsProxyEngine>,
     #[allow(dead_code)]
     zero_config: Arc<crate::proxy::zero_config::ZeroConfigEngine>,
@@ -1317,8 +1318,8 @@ impl ProcessingPipeline {
                         .forwarded
                         .fetch_add(n as u64, Ordering::Relaxed);
                 }
-                for (data, _) in &forward_batch {
-                    pool.release_bytes(data.clone());
+                for (data, _) in forward_batch.drain(..) {
+                    pool.release_bytes(data);
                 }
             }
 
@@ -1331,13 +1332,30 @@ impl ProcessingPipeline {
                         .fake_ch_injected
                         .fetch_add(n as u64, Ordering::Relaxed);
                 }
-                for (data, _) in &inject_batch {
-                    pool.release_bytes(data.clone());
+                for (data, _) in inject_batch.drain(..) {
+                    pool.release_bytes(data);
                 }
             }
         }
 
         tracing::debug!("Shard worker {} stopped", id);
+    }
+
+    /// P0-10: Apply the configured inject direction to the WinDivertAddress.
+    fn apply_inject_direction(
+        original: &WinDivertAddress<NetworkLayer>,
+        direction: crate::desync::InjectDirection,
+    ) -> WinDivertAddress<NetworkLayer> {
+        let mut addr = original.clone();
+        match direction {
+            crate::desync::InjectDirection::ForceOutbound => addr.set_outbound(true),
+            crate::desync::InjectDirection::ForceInbound => addr.set_outbound(false),
+            crate::desync::InjectDirection::PreserveOriginal => {}
+            crate::desync::InjectDirection::DerivedFromPacketTuple => {
+                addr.set_outbound(true);
+            }
+        }
+        addr
     }
 
     /// P1-00: Process a single packet in the shard worker context.
@@ -1350,11 +1368,8 @@ impl ProcessingPipeline {
         pipeline: &Self,
         pool: &PacketBufferPool,
     ) {
+        let decision = pipeline.process_one_sync(&captured);
         let CapturedPacket { data, addr } = captured;
-        let decision = pipeline.process_one_sync(&CapturedPacket {
-            data: data.clone(),
-            addr: addr.clone(),
-        });
 
         match decision {
             Ok(decision) => match decision {
@@ -1372,8 +1387,10 @@ impl ProcessingPipeline {
                     modified,
                     inject_protocol,
                     inter_delay_us,
-                    ..
+                    inject_direction,
                 } => {
+                    let inject_addr = Self::apply_inject_direction(&addr, inject_direction);
+
                     match inject_protocol {
                         InjectProtocol::Tcp => {
                             for (i, inject_pkt) in inject.iter().enumerate() {
@@ -1384,12 +1401,12 @@ impl ProcessingPipeline {
                                     if !pipeline.delayed_inject.try_schedule(
                                         inter_delay_us * i as u32,
                                         inject_pkt.clone(),
-                                        addr.clone(),
+                                        inject_addr.clone(),
                                     ) {
-                                        inject_batch.push((inject_pkt.clone(), addr.clone()));
+                                        inject_batch.push((inject_pkt.clone(), inject_addr.clone()));
                                     }
                                 } else {
-                                    inject_batch.push((inject_pkt.clone(), addr.clone()));
+                                    inject_batch.push((inject_pkt.clone(), inject_addr.clone()));
                                 }
                             }
                         }
@@ -1402,7 +1419,7 @@ impl ProcessingPipeline {
                                     if !pipeline.delayed_inject.try_schedule(
                                         inter_delay_us * i as u32,
                                         inject_pkt.clone(),
-                                        addr.clone(),
+                                        inject_addr.clone(),
                                     ) {
                                         if let Err(e) = engine.inject_raw_udp(inject_pkt) {
                                             tracing::warn!(
@@ -1555,47 +1572,6 @@ impl ProcessingPipeline {
         let elapsed = start.elapsed().as_micros() as u64;
         self.stats.desync_application_latency_us.observe_us(elapsed);
         res
-    }
-
-    /// Sync version: send packet via WinDivert (no spawn_blocking).
-    /// После отправки возвращает буфер в пул через release_bytes.
-    #[allow(dead_code)]
-    fn send_packet_sync(&self, packet: bytes::Bytes, addr: &WinDivertAddress<NetworkLayer>) {
-        let result = self.packet_engine.send_blocking(&packet, addr);
-        match result {
-            Ok(_) => {
-                self.stats.forwarded.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                error!("Failed to send packet: {}", e);
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        // Возвращаем буфер в пул независимо от результата send
-        self.buf_pool.release_bytes(packet);
-    }
-
-    /// Sync version: forward original (same as send_packet_sync).
-    #[allow(dead_code)]
-    fn forward_packet_sync(&self, captured: &CapturedPacket) {
-        self.send_packet_sync(captured.data.clone(), &captured.addr);
-    }
-
-    /// Sync version: inject TCP fake via raw socket (no spawn_blocking).
-    /// После инжекта возвращает буфер в пул.
-    #[allow(dead_code)]
-    fn inject_tcp_packet_sync(&self, packet: bytes::Bytes, addr: &WinDivertAddress<NetworkLayer>) {
-        let result = self.packet_engine.inject_via_divert(&packet, addr);
-        match result {
-            Ok(_) => {
-                self.stats.fake_ch_injected.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                warn!("Failed to inject TCP desync packet: {}", e);
-            }
-        }
-        // Возвращаем буфер в пул независимо от результата
-        self.buf_pool.release_bytes(packet);
     }
 
     /// Sync version: process_one (calls sync sub-methods directly).
@@ -1771,15 +1747,9 @@ impl ProcessingPipeline {
                     self.stats.dropped.fetch_add(1, Ordering::Relaxed);
                     return Ok(PacketDecision::Drop); // Drop original query
                 } else {
-                    // Fallback to synchronous block_on if the queue is full
-                    let rt = crate::Runtime::global();
-                    if let Some(resp_data) =
-                        rt.block_on(self.dns_proxy.handle_dns_query(&captured.data))
-                    {
-                        let _ = self.packet_engine.inject_via_divert(&resp_data, &addr);
-                        self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                        return Ok(PacketDecision::Drop);
-                    }
+                    // Queue full: fail-open (forward original query directly to network)
+                    tracing::warn!("DNS async queue full, fail-open: forwarding original DNS query");
+                    return Ok(PacketDecision::Forward);
                 }
             }
         }
@@ -2394,11 +2364,14 @@ impl ProcessingPipeline {
                     cp.protocol,
                 );
                 let conn_id = crate::conntrack::compute_conn_id(&fk);
-                let (quic_pn, quic_dcid) = if cp.payload_offset < packet.len() {
-                    extract_quic_pn_and_dcid(&packet[cp.payload_offset..]).unwrap_or((0, vec![]))
+                let quic_dcid = if cp.payload_offset < packet.len() {
+                    extract_quic_pn_and_dcid(&packet[cp.payload_offset..])
+                        .map(|(_, dcid)| dcid)
+                        .unwrap_or_default()
                 } else {
-                    (0, vec![])
+                    vec![]
                 };
+                let quic_pn = 0; // P3-02/P3-06: QUIC PN parsing is quarantined
                 let entry = ConntrackEntry {
                     client_isn: 0,
                     server_isn: 0,
@@ -2425,14 +2398,7 @@ impl ProcessingPipeline {
             } else {
                 if let Some(mut entry) = self.conntrack.get_mut(&cp.conn_key) {
                     entry.last_activity = std::time::Instant::now();
-                    // Обновляем PN, даже если не смогли распарсить (оставляем старый)
-                    if cp.payload_offset < packet.len() {
-                        if let Some((pn, _)) =
-                            extract_quic_pn_and_dcid(&packet[cp.payload_offset..])
-                        {
-                            entry.quic_pn = pn;
-                        }
-                    }
+                    // QUIC PN parsing is quarantined (P3-02/P3-06)
                     if entry.route_key.is_none() {
                         entry.route_key = self.fake_ip.lookup(&cp.dst_ip);
                     }
@@ -2799,112 +2765,7 @@ impl ProcessingPipeline {
         Ok(PacketDecision::Forward)
     }
 
-    /// Execute a PacketDecision synchronously from a worker thread.
-    #[allow(dead_code)]
-    fn execute_decision_sync(&self, decision: PacketDecision, captured: &CapturedPacket) {
-        match decision {
-            PacketDecision::Forward => {
-                self.forward_packet_sync(captured);
-            }
-            PacketDecision::Modify(modified) => {
-                self.send_packet_sync(modified, &captured.addr);
-                self.stats.forwarded.fetch_add(1, Ordering::Relaxed);
-            }
-            PacketDecision::Desync {
-                mut inject,
-                modified,
-                inject_protocol,
-                inter_delay_us,
-                inject_direction,
-            } => {
-                // T60: Register RST for Circuit Breaker
-                for inject_pkt in inject.iter() {
-                    if let Some(ip) = crate::desync::parse_ip_header(inject_pkt) {
-                        let tcp_data = &inject_pkt[ip.header_len()..];
-                        if let Some(tcp) = crate::desync::parse_tcp_packet(tcp_data) {
-                            if (tcp.flags & 0x04) != 0 {
-                                // RST flag
-                                self.adaptive_router.record_rst();
-                            }
-                        }
-                    }
-                }
 
-                for (i, inject_pkt) in inject.iter().enumerate() {
-                    let addr = match inject_direction {
-                        crate::desync::InjectDirection::ForceOutbound => {
-                            let mut a = captured.addr.clone();
-                            a.set_outbound(true);
-                            a
-                        }
-                        crate::desync::InjectDirection::ForceInbound => {
-                            let mut a = captured.addr.clone();
-                            a.set_outbound(false);
-                            a
-                        }
-                        _ => captured.addr.clone(), // PreserveOriginal / DerivedFromPacketTuple
-                    };
-
-                    if i > 0 && inter_delay_us > 0 {
-                        if !self.delayed_inject.try_schedule(
-                            inter_delay_us * i as u32,
-                            inject_pkt.clone(),
-                            addr.clone(),
-                        ) {
-                            match inject_protocol {
-                                InjectProtocol::Tcp => {
-                                    self.inject_tcp_packet_sync(inject_pkt.clone(), &addr);
-                                }
-                                InjectProtocol::Udp => {
-                                    let pkt_clone = inject_pkt.clone();
-                                    if let Err(e) = self.packet_engine.inject_raw_udp(&pkt_clone) {
-                                        warn!("Failed to inject UDP desync packet: {}", e);
-                                    }
-                                    self.buf_pool.release_bytes(pkt_clone);
-                                }
-                            }
-                        }
-                    } else {
-                        match inject_protocol {
-                            InjectProtocol::Tcp => {
-                                self.inject_tcp_packet_sync(inject_pkt.clone(), &addr);
-                            }
-                            InjectProtocol::Udp => {
-                                let pkt_clone = inject_pkt.clone();
-                                if let Err(e) = self.packet_engine.inject_raw_udp(&pkt_clone) {
-                                    warn!("Failed to inject UDP desync packet: {}", e);
-                                }
-                                self.buf_pool.release_bytes(pkt_clone);
-                            }
-                        }
-                    }
-                    self.stats.fake_ch_injected.fetch_add(1, Ordering::Relaxed);
-                }
-                // Возвращаем оставшиеся inject-буферы в пул (они не были consumed,
-                // потому что inject_pkt.clone() только увеличивал refcount).
-                for pkt in inject.drain(..) {
-                    self.buf_pool.release_bytes(pkt);
-                }
-                // Timing jitter
-                let delay_us = self.config.desync.inject_delay_us;
-                if delay_us > 0 {
-                    let jitter = crate::desync::rand::random_range(0, delay_us as u32);
-                    std::thread::sleep(Duration::from_micros(jitter as u64));
-                }
-                // Send modified original or forward original
-                // (send_packet_sync / forward_packet_sync уже делают release внутри)
-                if let Some(modified) = modified {
-                    self.send_packet_sync(modified, &captured.addr);
-                } else {
-                    self.forward_packet_sync(captured);
-                }
-            }
-            PacketDecision::Drop => {
-                self.packet_engine.drop_packet();
-                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
 
     pub fn has_divert(&self) -> bool {
         self.packet_engine.has_divert()

@@ -73,16 +73,34 @@ pub fn multisplit(
     }
 
     let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> =
-        smallvec::SmallVec::with_capacity(actual_count - 1);
+        smallvec::SmallVec::with_capacity(actual_count);
 
+    // 1. Decoy segment covering the first split_size bytes with fake TTL
+    if fake_ttl_offset > 0 {
+        let decoy_payload = vec![0u8; split_size];
+        let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
+        let decoy = build_tcp_segment(
+            ip.src(),
+            ip.dst(),
+            tcp.src_port,
+            tcp.dst_port,
+            tcp.sequence,
+            tcp.acknowledgment,
+            TcpFlags::PSH | TcpFlags::ACK,
+            tcp.window,
+            &decoy_payload,
+            fake_ttl,
+            generate_identification(ip.identification(), 999),
+        );
+        inject.push(decoy);
+    }
+
+    // 2. Real segments (except last) sent with normal TTL
     for i in 0..actual_count - 1 {
         let start = i * split_size;
         let end = start + split_size.min(tcp.payload.len() - start);
         let seg_payload = &tcp.payload[start..end];
 
-        let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
-
-        // Создаём TCP сегмент с флагом PSH
         let seg = build_tcp_segment(
             ip.src(),
             ip.dst(),
@@ -93,7 +111,7 @@ pub fn multisplit(
             TcpFlags::PSH | TcpFlags::ACK,
             tcp.window,
             seg_payload,
-            fake_ttl,
+            ip.ttl(), // Normal TTL!
             generate_identification(ip.identification(), i),
         );
         inject.push(seg);
@@ -1631,6 +1649,7 @@ pub fn multidisorder_new(
     let mut segments: smallvec::SmallVec<[bytes::Bytes; 4]> =
         smallvec::SmallVec::with_capacity(split_count);
 
+    // 1. All real segments are sent with normal TTL!
     for i in 0..split_count {
         let start = i * seg_size;
         let end = if i == split_count - 1 {
@@ -1639,11 +1658,6 @@ pub fn multidisorder_new(
             start + seg_size
         };
         let payload = &tcp.payload[start..end];
-        let ttl = if i == 0 {
-            ip.ttl()
-        } else {
-            ip.ttl().saturating_sub(fake_ttl_offset)
-        };
 
         let seg = build_tcp_segment_p3(
             ip.src(),
@@ -1655,7 +1669,7 @@ pub fn multidisorder_new(
             TcpFlags::PSH | TcpFlags::ACK,
             tcp.window,
             payload,
-            ttl,
+            ip.ttl(), // Normal TTL!
             generate_identification(ip.identification(), i),
         );
         segments.push(seg);
@@ -1667,11 +1681,33 @@ pub fn multidisorder_new(
     // Last segment (first after reverse) — modified original
     let modified = segments.pop().unwrap_or_else(|| packet.clone());
 
+    let mut inject: smallvec::SmallVec<[bytes::Bytes; 4]> = segments.into_iter().collect();
+
+    // 2. Add an overlapping low-TTL decoy if fake_ttl_offset > 0
+    if fake_ttl_offset > 0 {
+        let decoy_payload = vec![0u8; seg_size];
+        let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
+        let decoy = build_tcp_segment_p3(
+            ip.src(),
+            ip.dst(),
+            tcp.src_port,
+            tcp.dst_port,
+            tcp.sequence,
+            tcp.acknowledgment,
+            TcpFlags::PSH | TcpFlags::ACK,
+            tcp.window,
+            &decoy_payload,
+            fake_ttl,
+            generate_identification(ip.identification(), 999),
+        );
+        inject.push(decoy);
+    }
+
     debug!("[RP4] MultiDisorderNew: {} segments reversed", split_count);
 
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
-        inject: segments.into_iter().collect(),
+        inject,
         inter_delay_us: 0,
         drop: false,
         inject_direction: crate::desync::InjectDirection::PreserveOriginal,
@@ -2467,10 +2503,13 @@ mod tests {
         let pkt = bytes::Bytes::from(pkt);
         // 20 bytes payload, split_size=5, 3 splits, fake_ttl_offset=1
         let result = multisplit(&pkt, 5, 3, 1, 0);
-        // Injected decoys should have TTL = 64 - 1 = 63
-        for seg in &result.inject {
-            let ttl = seg[8]; // TTL is at offset 8 in IP header
-            assert_eq!(ttl, 63, "decoy segments must have fake TTL");
+        // The first injected segment is the decoy, which has fake TTL = 63
+        let decoy_ttl = result.inject[0][8];
+        assert_eq!(decoy_ttl, 63, "decoy segment must have fake TTL");
+        // The remaining injected segments are real fragments, which have normal TTL = 64
+        for seg in &result.inject[1..] {
+            let ttl = seg[8];
+            assert_eq!(ttl, 64, "real segments in inject must have normal TTL");
         }
         // Modified segment should have original TTL = 64
         if let Some(ref modified) = result.modified {
