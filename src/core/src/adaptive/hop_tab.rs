@@ -9,15 +9,15 @@ const NUM_SETS: usize = 1024;
 const NUM_WAYS: usize = 4;
 const SET_MASK: usize = NUM_SETS - 1;
 
-/// Pack entry: [ip:32][hops:8][gen:8] = 48 bits in u64.
-fn pack_entry(ip: u32, hops: u8, gen: u8) -> u64 {
+/// Pack entry: [ip:32][hops:8][gen:16] = 56 bits in u64.
+fn pack_entry(ip: u32, hops: u8, gen: u16) -> u64 {
     (ip as u64) | ((hops as u64) << 32) | ((gen as u64) << 40)
 }
 
-fn unpack_entry(val: u64) -> (u32, u8, u8) {
+fn unpack_entry(val: u64) -> (u32, u8, u16) {
     let ip = val as u32;
     let hops = (val >> 32) as u8;
-    let gen = (val >> 40) as u8;
+    let gen = (val >> 40) as u16;
     (ip, hops, gen)
 }
 
@@ -67,10 +67,12 @@ impl HopTab {
         match ip {
             IpAddr::V4(v4) => v4.to_bits(),
             IpAddr::V6(v6) => {
-                let bits = v6.to_bits() as u64;
-                let upper = (bits >> 32) as u32;
-                let lower = bits as u32;
-                upper ^ lower
+                let segments = v6.segments();
+                let s0 = ((segments[0] as u32) << 16) | (segments[1] as u32);
+                let s1 = ((segments[2] as u32) << 16) | (segments[3] as u32);
+                let s2 = ((segments[4] as u32) << 16) | (segments[5] as u32);
+                let s3 = ((segments[6] as u32) << 16) | (segments[7] as u32);
+                s0 ^ s1 ^ s2 ^ s3
             }
         }
     }
@@ -88,7 +90,7 @@ impl HopTab {
     /// Insert into set-associative cache: find empty way or replace oldest gen.
     pub fn insert(&self, dst_ip: u32, hops: u8) {
         let set = Self::hash(dst_ip);
-        let gen = self.gen_counters[set].fetch_add(1, Ordering::Relaxed) as u8;
+        let gen = self.gen_counters[set].fetch_add(1, Ordering::Relaxed) as u16;
 
         // Look for empty way
         for way in 0..NUM_WAYS {
@@ -99,13 +101,14 @@ impl HopTab {
             }
         }
 
-        // All ways occupied: replace entry with smallest generation (oldest)
-        let mut min_gen = u8::MAX;
+        // All ways occupied: replace entry with largest age (oldest)
+        let mut max_age = 0;
         let mut min_way = 0;
         for way in 0..NUM_WAYS {
             let (_, _, g) = unpack_entry(self.cache[set][way].load(Ordering::Relaxed));
-            if g < min_gen || g == u8::MAX {
-                min_gen = g;
+            let age = gen.wrapping_sub(g);
+            if age >= max_age {
+                max_age = age;
                 min_way = way;
             }
         }

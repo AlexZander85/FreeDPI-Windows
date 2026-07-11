@@ -5,7 +5,7 @@ members = [
     "api",
     "service",
 ]
-exclude = ["ui/src-tauri"]
+exclude = ["ui/src-tauri", "fuzz"]
 
 [workspace.package]
 version = "1.0.0"

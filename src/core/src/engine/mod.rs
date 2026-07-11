@@ -28,8 +28,14 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crossbeam::channel::{RecvTimeoutError, TrySendError};
 use tracing::{debug, error, warn};
 use windivert::prelude::{NetworkLayer, WinDivertAddress};
+
+pub mod awg_async;
+pub mod delayed_inject;
+pub mod dns_async;
+pub(crate) mod flow_affinity;
 
 #[derive(Debug)]
 pub enum PacketDecision {
@@ -40,6 +46,8 @@ pub enum PacketDecision {
         modified: Option<bytes::Bytes>,
         inject_protocol: InjectProtocol,
         inter_delay_us: u32,
+        /// P0-10: Направление инъекции (PreserveOriginal, ForceOutbound, ForceInbound).
+        inject_direction: crate::desync::InjectDirection,
     },
     Drop,
 }
@@ -48,6 +56,83 @@ pub enum PacketDecision {
 pub enum InjectProtocol {
     Tcp,
     Udp,
+}
+
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicU64;
+
+#[derive(Debug)]
+pub struct FixedLatencyHist {
+    buckets: [AtomicU64; 16],
+}
+
+impl FixedLatencyHist {
+    pub fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Default for FixedLatencyHist {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FixedLatencyHist {
+    pub fn observe_us(&self, v: u64) {
+        let idx = match v {
+            0..=9 => 0,
+            10..=24 => 1,
+            25..=49 => 2,
+            50..=99 => 3,
+            100..=249 => 4,
+            250..=499 => 5,
+            500..=999 => 6,
+            1_000..=2_499 => 7,
+            2_500..=4_999 => 8,
+            5_000..=9_999 => 9,
+            10_000..=24_999 => 10,
+            25_000..=49_999 => 11,
+            50_000..=99_999 => 12,
+            100_000..=249_999 => 13,
+            250_000..=999_999 => 14,
+            _ => 15,
+        };
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn estimate_percentiles(&self) -> (u64, u64, u64) {
+        let counts: Vec<u64> = self
+            .buckets
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .collect();
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return (0, 0, 0);
+        }
+
+        let midpoints = [
+            5, 17, 37, 75, 175, 375, 750, 1750, 3750, 7500, 17500, 37500, 75000, 175000, 625000,
+            1500000,
+        ];
+
+        let find_pct = |pct: f64| -> u64 {
+            let target = (total as f64 * pct) as u64;
+            let mut acc = 0u64;
+            for (i, &count) in counts.iter().enumerate() {
+                acc += count;
+                if acc >= target {
+                    return midpoints[i];
+                }
+            }
+            midpoints[15]
+        };
+
+        (find_pct(0.50), find_pct(0.95), find_pct(0.99))
+    }
 }
 
 #[derive(Debug)]
@@ -59,6 +144,47 @@ pub struct ProcessingStats {
     pub forwarded: PaddedCounter,
     pub dropped: PaddedCounter,
     pub errors: PaddedCounter,
+
+    // P4-02 Classification stats
+    pub capture_tls_ch: PaddedCounter,
+    pub capture_quic_initial: PaddedCounter,
+    pub capture_dns: PaddedCounter,
+    pub capture_other: PaddedCounter,
+
+    // Shard queue stats
+    pub shard_queue_full: PaddedCounter,
+
+    // Latency histogram
+    pub desync_application_latency_us: FixedLatencyHist,
+
+    // Proxy rewrite stats
+    pub rewrite_inplace_success: PaddedCounter,
+    pub rewrite_copy_fallback: PaddedCounter,
+    pub rewrite_errors: PaddedCounter,
+
+    // P5-01 Capture Governor stats
+    pub capture_mode: std::sync::atomic::AtomicU8,
+    pub capture_filter_update_failures_total: PaddedCounter,
+    pub capture_rx_pps: std::sync::atomic::AtomicU64,
+    pub capture_drop_ratio_ppm: std::sync::atomic::AtomicU64,
+    pub capture_other_udp443_pps: std::sync::atomic::AtomicU64,
+    pub capture_max_worker_queue_depth: std::sync::atomic::AtomicUsize,
+
+    // P5-02 Invariant Guard stats
+    pub invariant_too_short: PaddedCounter,
+    pub invariant_unsupported_ip_version: PaddedCounter,
+    pub invariant_ipv4_header_too_short: PaddedCounter,
+    pub invariant_ipv4_total_length_mismatch: PaddedCounter,
+    pub invariant_ipv4_bad_header_checksum: PaddedCounter,
+    pub invariant_ipv6_payload_length_mismatch: PaddedCounter,
+    pub invariant_tcp_header_too_short: PaddedCounter,
+    pub invariant_udp_header_too_short: PaddedCounter,
+    pub invariant_udp_length_mismatch: PaddedCounter,
+    pub invariant_quic_initial_too_small: PaddedCounter,
+
+    // References for dynamic stats
+    pub buf_pool: std::sync::OnceLock<Arc<PacketBufferPool>>,
+    pub shard_txs: std::sync::OnceLock<Arc<Vec<crossbeam::channel::Sender<CapturedPacket>>>>,
 }
 
 impl ProcessingStats {
@@ -71,10 +197,65 @@ impl ProcessingStats {
             forwarded: PaddedCounter::new(0),
             dropped: PaddedCounter::new(0),
             errors: PaddedCounter::new(0),
+
+            capture_tls_ch: PaddedCounter::new(0),
+            capture_quic_initial: PaddedCounter::new(0),
+            capture_dns: PaddedCounter::new(0),
+            capture_other: PaddedCounter::new(0),
+
+            shard_queue_full: PaddedCounter::new(0),
+
+            desync_application_latency_us: FixedLatencyHist::new(),
+
+            rewrite_inplace_success: PaddedCounter::new(0),
+            rewrite_copy_fallback: PaddedCounter::new(0),
+            rewrite_errors: PaddedCounter::new(0),
+
+            capture_mode: std::sync::atomic::AtomicU8::new(0), // Default Strict (0)
+            capture_filter_update_failures_total: PaddedCounter::new(0),
+            capture_rx_pps: std::sync::atomic::AtomicU64::new(0),
+            capture_drop_ratio_ppm: std::sync::atomic::AtomicU64::new(0),
+            capture_other_udp443_pps: std::sync::atomic::AtomicU64::new(0),
+            capture_max_worker_queue_depth: std::sync::atomic::AtomicUsize::new(0),
+
+            invariant_too_short: PaddedCounter::new(0),
+            invariant_unsupported_ip_version: PaddedCounter::new(0),
+            invariant_ipv4_header_too_short: PaddedCounter::new(0),
+            invariant_ipv4_total_length_mismatch: PaddedCounter::new(0),
+            invariant_ipv4_bad_header_checksum: PaddedCounter::new(0),
+            invariant_ipv6_payload_length_mismatch: PaddedCounter::new(0),
+            invariant_tcp_header_too_short: PaddedCounter::new(0),
+            invariant_udp_header_too_short: PaddedCounter::new(0),
+            invariant_udp_length_mismatch: PaddedCounter::new(0),
+            invariant_quic_initial_too_small: PaddedCounter::new(0),
+
+            buf_pool: std::sync::OnceLock::new(),
+            shard_txs: std::sync::OnceLock::new(),
         }
     }
 
     pub fn snapshot(&self) -> ProcessingStatsSnapshot {
+        let (pool_acq, pool_miss, pool_rel_ok, pool_rel_fail, pool_cap) =
+            if let Some(pool) = self.buf_pool.get() {
+                (
+                    pool.pool_acquire_total(),
+                    pool.pool_acquire_miss_total(),
+                    pool.pool_release_success_total(),
+                    pool.pool_release_refcount_failed_total(),
+                    pool.pool_capacity(),
+                )
+            } else {
+                (0, 0, 0, 0, 0)
+            };
+
+        let q_depth = if let Some(txs) = self.shard_txs.get() {
+            txs.iter().map(|tx| tx.len()).sum()
+        } else {
+            0
+        };
+
+        let (p50, p95, p99) = self.desync_application_latency_us.estimate_percentiles();
+
         ProcessingStatsSnapshot {
             total_received: self.total_received.load(Ordering::Relaxed),
             injected_skipped: self.injected_skipped.load(Ordering::Relaxed),
@@ -83,11 +264,69 @@ impl ProcessingStats {
             forwarded: self.forwarded.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+
+            capture_tls_ch: self.capture_tls_ch.load(Ordering::Relaxed),
+            capture_quic_initial: self.capture_quic_initial.load(Ordering::Relaxed),
+            capture_dns: self.capture_dns.load(Ordering::Relaxed),
+            capture_other: self.capture_other.load(Ordering::Relaxed),
+
+            shard_queue_full: self.shard_queue_full.load(Ordering::Relaxed),
+            shard_queue_depth_current: q_depth,
+
+            pool_acquire_total: pool_acq,
+            pool_acquire_miss: pool_miss,
+            pool_release_success: pool_rel_ok,
+            pool_release_refcount_failed: pool_rel_fail,
+            pool_capacity: pool_cap,
+
+            desync_application_latency_us_p50: p50,
+            desync_application_latency_us_p95: p95,
+            desync_application_latency_us_p99: p99,
+
+            capture_mode: self.capture_mode.load(Ordering::Relaxed),
+            capture_filter_update_failures_total: self
+                .capture_filter_update_failures_total
+                .load(Ordering::Relaxed),
+            capture_rx_pps: self.capture_rx_pps.load(Ordering::Relaxed),
+            capture_drop_ratio_ppm: self.capture_drop_ratio_ppm.load(Ordering::Relaxed),
+            capture_other_udp443_pps: self.capture_other_udp443_pps.load(Ordering::Relaxed),
+            capture_max_worker_queue_depth: self
+                .capture_max_worker_queue_depth
+                .load(Ordering::Relaxed),
+
+            invariant_too_short: self.invariant_too_short.load(Ordering::Relaxed),
+            invariant_unsupported_ip_version: self
+                .invariant_unsupported_ip_version
+                .load(Ordering::Relaxed),
+            invariant_ipv4_header_too_short: self
+                .invariant_ipv4_header_too_short
+                .load(Ordering::Relaxed),
+            invariant_ipv4_total_length_mismatch: self
+                .invariant_ipv4_total_length_mismatch
+                .load(Ordering::Relaxed),
+            invariant_ipv4_bad_header_checksum: self
+                .invariant_ipv4_bad_header_checksum
+                .load(Ordering::Relaxed),
+            invariant_ipv6_payload_length_mismatch: self
+                .invariant_ipv6_payload_length_mismatch
+                .load(Ordering::Relaxed),
+            invariant_tcp_header_too_short: self
+                .invariant_tcp_header_too_short
+                .load(Ordering::Relaxed),
+            invariant_udp_header_too_short: self
+                .invariant_udp_header_too_short
+                .load(Ordering::Relaxed),
+            invariant_udp_length_mismatch: self
+                .invariant_udp_length_mismatch
+                .load(Ordering::Relaxed),
+            invariant_quic_initial_too_small: self
+                .invariant_quic_initial_too_small
+                .load(Ordering::Relaxed),
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProcessingStatsSnapshot {
     pub total_received: u64,
     pub injected_skipped: u64,
@@ -96,6 +335,42 @@ pub struct ProcessingStatsSnapshot {
     pub forwarded: u64,
     pub dropped: u64,
     pub errors: u64,
+
+    pub capture_tls_ch: u64,
+    pub capture_quic_initial: u64,
+    pub capture_dns: u64,
+    pub capture_other: u64,
+
+    pub shard_queue_full: u64,
+    pub shard_queue_depth_current: usize,
+
+    pub pool_acquire_total: u64,
+    pub pool_acquire_miss: u64,
+    pub pool_release_success: u64,
+    pub pool_release_refcount_failed: u64,
+    pub pool_capacity: usize,
+
+    pub desync_application_latency_us_p50: u64,
+    pub desync_application_latency_us_p95: u64,
+    pub desync_application_latency_us_p99: u64,
+
+    pub capture_mode: u8,
+    pub capture_filter_update_failures_total: u64,
+    pub capture_rx_pps: u64,
+    pub capture_drop_ratio_ppm: u64,
+    pub capture_other_udp443_pps: u64,
+    pub capture_max_worker_queue_depth: usize,
+
+    pub invariant_too_short: u64,
+    pub invariant_unsupported_ip_version: u64,
+    pub invariant_ipv4_header_too_short: u64,
+    pub invariant_ipv4_total_length_mismatch: u64,
+    pub invariant_ipv4_bad_header_checksum: u64,
+    pub invariant_ipv6_payload_length_mismatch: u64,
+    pub invariant_tcp_header_too_short: u64,
+    pub invariant_udp_header_too_short: u64,
+    pub invariant_udp_length_mismatch: u64,
+    pub invariant_quic_initial_too_small: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +390,8 @@ pub struct ProcessingConfig {
     pub adaptive_router_config: crate::routing::adaptive_router::AdaptiveRouterConfig,
     pub zero_config: crate::config::ZeroConfigConfig,
     pub awg: crate::config::AwgConfig,
+    pub network_tuning: crate::config::NetworkTuningConfig,
+    pub capture_budget: crate::capture_budget::CaptureBudgetConfig,
 }
 
 impl Default for ProcessingConfig {
@@ -136,12 +413,15 @@ impl Default for ProcessingConfig {
             ),
             zero_config: crate::config::ZeroConfigConfig::default(),
             awg: crate::config::AwgConfig::default(),
+            network_tuning: crate::config::NetworkTuningConfig::default(),
+            capture_budget: crate::capture_budget::CaptureBudgetConfig::default(),
         }
     }
 }
 
 /// Ключ для отслеживания injected SEQ — 5-tuple (src_ip, dst_ip, src_port, dst_port, seq).
-type SeqKey = (u64, u64, u16, u16, u32);
+/// P0-09: key = (conn_id, tcp_sequence). conn_id — SipHash от FlowKey.
+type SeqKey = (u64, u32);
 
 pub struct ProcessingPipeline {
     packet_engine: Arc<PacketEngine>,
@@ -150,13 +430,15 @@ pub struct ProcessingPipeline {
     hop_tab: Arc<HopTab>,
     conntrack: Arc<Conntrack>,
     profile_registry: Arc<StrategyProfileRegistry>,
-    active_profile_tls: ArcSwap<String>,
-    active_profile_quic: ArcSwap<String>,
-    active_profile_http: ArcSwap<String>,
+    active_profile_tls: std::sync::atomic::AtomicU32,
+    active_profile_quic: std::sync::atomic::AtomicU32,
+    active_profile_http: std::sync::atomic::AtomicU32,
     config: ProcessingConfig,
     stats: Arc<ProcessingStats>,
-    injected_seqs: moka::sync::Cache<SeqKey, ()>,
-    auto_tune: std::sync::Mutex<AutoTune>,
+    /// P1-16: DashMap with atomic entry API — check-and-mark без TOCTOU race.
+    /// Значение = Instant::now() при вставке, используется periodic sweep для eviction.
+    injected_seqs: Arc<dashmap::DashMap<SeqKey, Instant>>,
+    auto_tune: AutoTune,
     /// Buffer pool для zero-alloc steady-state.
     /// Один пул на все workers (ArrayQueue — lock-free MPMC, безопасно для concurrent access).
     buf_pool: Arc<PacketBufferPool>,
@@ -166,13 +448,14 @@ pub struct ProcessingPipeline {
     #[allow(dead_code)]
     zero_config: Arc<crate::proxy::zero_config::ZeroConfigEngine>,
     adaptive_router: Arc<crate::routing::adaptive_router::AdaptiveRouter>,
-    awg_tunnel: ArcSwap<Option<Arc<crate::proxy::awg_tunnel::AwgTunnel>>>,
-    /// Флаг наличия non-empty session ticket от сервера.
-    /// Устанавливается после успешного TLS handshake, когда сервер
-    /// прислал session ticket. Используется для 0-RTT resumption
-    /// при генерации fake ClientHello (SeqSpoof).
-    #[allow(dead_code)]
-    has_non_empty_session_ticket: bool,
+    awg_tunnel: Arc<ArcSwap<Option<Arc<crate::proxy::awg_tunnel::AwgTunnel>>>>,
+    delayed_inject: Arc<delayed_inject::DelayedInject>,
+    dns_async: Arc<dns_async::DnsAsyncBridge>,
+    awg_async: Arc<ArcSwap<Option<Arc<awg_async::AwgAsyncWriter>>>>,
+    split_tunnel: Option<Arc<crate::split_tunnel::SplitTunnel>>,
+    fallback_chain: Arc<std::sync::Mutex<crate::adaptive::fallback::FallbackChain>>,
+    target_escalator: Arc<std::sync::Mutex<crate::adaptive::target_escalate::TargetEscalation>>,
+    tls_reassembler: Arc<crate::tls_reassembly::TlsReassembler>,
 }
 
 /// Проверяет, содержит ли TLS ClientHello non-empty session_ticket extension.
@@ -253,41 +536,39 @@ impl ProcessingPipeline {
         geo_router: Arc<GeoRouter>,
         fake_ip: Arc<FakeIpManager>,
         hop_tab: Arc<HopTab>,
+        split_tunnel: Option<Arc<crate::split_tunnel::SplitTunnel>>,
     ) -> Result<Self, anyhow::Error> {
-        let packet_engine = Arc::new(PacketEngine::new(filter)?);
+        let packet_engine = Arc::new(PacketEngine::new_with_tuning(
+            filter,
+            &config.network_tuning,
+        )?);
         let conntrack = Arc::new(Conntrack::new(Duration::from_secs(120)));
         let profile_registry = Arc::new(StrategyProfileRegistry::from_config(
             &config.desync,
             &config.strategies,
             &config.techniques,
         ));
-        let active_profile_tls = ArcSwap::from_pointee(
-            profile_registry
-                .get_default_for_category(StrategyCategory::Tls)
-                .expect("outbound_tls must be registered")
-                .name
-                .clone(),
-        );
-        let active_profile_quic = ArcSwap::from_pointee(
-            profile_registry
-                .get_default_for_category(StrategyCategory::Quic)
-                .expect("outbound_quic must be registered")
-                .name
-                .clone(),
-        );
-        let active_profile_http = ArcSwap::from_pointee(
-            profile_registry
-                .get_default_for_category(StrategyCategory::Http)
-                .expect("outbound_http must be registered")
-                .name
-                .clone(),
-        );
+        let default_tls = profile_registry
+            .get_default_for_category(StrategyCategory::Tls)
+            .expect("outbound_tls must be registered");
+        let active_profile_tls = std::sync::atomic::AtomicU32::new(default_tls.id.0);
 
-        // Buffer pool: capacity = workers * 4 (глубина на worker)
-        // Каждый буфер 2048 байт → pool = 4 * 4 * 2048 = ~32 KB
-        let buf_pool = Arc::new(PacketBufferPool::new(64));
+        let default_quic = profile_registry
+            .get_default_for_category(StrategyCategory::Quic)
+            .expect("outbound_quic must be registered");
+        let active_profile_quic = std::sync::atomic::AtomicU32::new(default_quic.id.0);
 
-        let mut auto_tune = AutoTune::new();
+        let default_http = profile_registry
+            .get_default_for_category(StrategyCategory::Http)
+            .expect("outbound_http must be registered");
+        let active_profile_http = std::sync::atomic::AtomicU32::new(default_http.id.0);
+
+        // Dynamically size the buffer pool
+        let worker_count = num_cpus::get().clamp(2, 16);
+        let pool_cap = crate::packet_engine::packet_pool_capacity(worker_count, 64);
+        let buf_pool = Arc::new(PacketBufferPool::new(pool_cap));
+
+        let auto_tune = AutoTune::new_with_registry(&profile_registry);
         for strategy_cfg in &config.strategies {
             if strategy_cfg.enabled == Some(true) {
                 auto_tune.set_override(
@@ -307,6 +588,17 @@ impl ProcessingPipeline {
         }
 
         let redirect_table = Arc::new(crate::desync::redirect_table::RedirectTable::new());
+        let redirect_table_clone = redirect_table.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let swept = redirect_table_clone.sweep_stale(std::time::Duration::from_secs(300));
+                if swept > 0 {
+                    tracing::debug!("P2-07: swept {} stale redirect_table entries", swept);
+                }
+            }
+        });
 
         // T63: Initialize and start ZeroConfigEngine background task
         let zero_config = Arc::new(crate::proxy::zero_config::ZeroConfigEngine::new(
@@ -394,17 +686,36 @@ impl ProcessingPipeline {
             config.adaptive_router_config.clone(),
         ));
 
+        let mut fallback = crate::adaptive::fallback::FallbackChain::new();
+        for t in &config.techniques {
+            fallback.add(*t);
+        }
+        let fallback_chain = Arc::new(std::sync::Mutex::new(fallback));
+
+        let target_escalator = Arc::new(std::sync::Mutex::new(
+            crate::adaptive::target_escalate::TargetEscalation::new(
+                config.adaptive_router_config.circuit_breaker_rst_threshold as usize,
+                config.adaptive_router_config.circuit_breaker_window_secs,
+                config.adaptive_router_config.circuit_breaker_timeout_secs,
+            ),
+        ));
+
         let awg_tunnel_state = Arc::new(ArcSwap::from_pointee(None));
+        let awg_async_writer = Arc::new(ArcSwap::from_pointee(None));
         if config.awg.enabled {
             let awg_config = config.awg.clone();
             let engine_clone = packet_engine.clone();
             let state_clone = awg_tunnel_state.clone();
+            let async_clone = awg_async_writer.clone();
             tokio::spawn(async move {
                 tracing::info!("AWG: Starting userspace AmneziaWG tunnel...");
                 match crate::proxy::awg_tunnel::AwgTunnel::start(awg_config, engine_clone).await {
                     Ok(tunnel) => {
                         tracing::info!("AWG: Userspace AmneziaWG tunnel started successfully!");
-                        state_clone.store(Arc::new(Some(Arc::new(tunnel))));
+                        let tunnel_arc = Arc::new(tunnel);
+                        state_clone.store(Arc::new(Some(tunnel_arc.clone())));
+                        let writer = awg_async::AwgAsyncWriter::start(tunnel_arc, 10000);
+                        async_clone.store(Arc::new(Some(writer)));
                     }
                     Err(e) => {
                         tracing::error!("AWG: Failed to start userspace AmneziaWG tunnel: {e:#}");
@@ -412,6 +723,24 @@ impl ProcessingPipeline {
                 }
             });
         }
+
+        let tls_reassembler = Arc::new(crate::tls_reassembly::TlsReassembler::new());
+        let tls_reassembler_clone = tls_reassembler.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                tls_reassembler_clone.gc();
+            }
+        });
+
+        let delayed_inject =
+            delayed_inject::DelayedInject::start(packet_engine.clone(), buf_pool.clone(), 10000);
+        let dns_async =
+            dns_async::DnsAsyncBridge::start(packet_engine.clone(), dns_proxy.clone(), 10000);
+
+        let stats = Arc::new(ProcessingStats::new());
+        let _ = stats.buf_pool.set(buf_pool.clone());
 
         Ok(Self {
             packet_engine,
@@ -424,20 +753,23 @@ impl ProcessingPipeline {
             active_profile_quic,
             active_profile_http,
             config,
-            stats: Arc::new(ProcessingStats::new()),
-            injected_seqs: moka::sync::Cache::builder()
-                .max_capacity(100_000)
-                .time_to_live(Duration::from_secs(30))
-                .build(),
-            auto_tune: std::sync::Mutex::new(auto_tune),
+            stats,
+            injected_seqs: Arc::new(dashmap::DashMap::with_capacity(100_000)),
+            auto_tune,
             buf_pool,
             redirect_table,
             socks_redirector: redirector,
             dns_proxy,
             zero_config,
             adaptive_router,
-            awg_tunnel: Arc::try_unwrap(awg_tunnel_state).unwrap(),
-            has_non_empty_session_ticket: false,
+            awg_tunnel: awg_tunnel_state,
+            delayed_inject,
+            dns_async,
+            awg_async: awg_async_writer,
+            split_tunnel,
+            fallback_chain,
+            target_escalator,
+            tls_reassembler,
         })
     }
 
@@ -448,31 +780,27 @@ impl ProcessingPipeline {
             &config.strategies,
             &config.techniques,
         ));
-        let active_profile_tls = ArcSwap::from_pointee(
-            profile_registry
-                .get_default_for_category(StrategyCategory::Tls)
-                .expect("outbound_tls must be registered")
-                .name
-                .clone(),
-        );
-        let active_profile_quic = ArcSwap::from_pointee(
-            profile_registry
-                .get_default_for_category(StrategyCategory::Quic)
-                .expect("outbound_quic must be registered")
-                .name
-                .clone(),
-        );
-        let active_profile_http = ArcSwap::from_pointee(
-            profile_registry
-                .get_default_for_category(StrategyCategory::Http)
-                .expect("outbound_http must be registered")
-                .name
-                .clone(),
-        );
+        let default_tls = profile_registry
+            .get_default_for_category(StrategyCategory::Tls)
+            .expect("outbound_tls must be registered");
+        let active_profile_tls = std::sync::atomic::AtomicU32::new(default_tls.id.0);
 
-        let buf_pool = Arc::new(PacketBufferPool::new(64));
+        let default_quic = profile_registry
+            .get_default_for_category(StrategyCategory::Quic)
+            .expect("outbound_quic must be registered");
+        let active_profile_quic = std::sync::atomic::AtomicU32::new(default_quic.id.0);
 
-        let mut auto_tune = AutoTune::new();
+        let default_http = profile_registry
+            .get_default_for_category(StrategyCategory::Http)
+            .expect("outbound_http must be registered");
+        let active_profile_http = std::sync::atomic::AtomicU32::new(default_http.id.0);
+
+        // Dynamically size the buffer pool in API-only mode as well
+        let worker_count = num_cpus::get().clamp(2, 16);
+        let pool_cap = crate::packet_engine::packet_pool_capacity(worker_count, 64);
+        let buf_pool = Arc::new(PacketBufferPool::new(pool_cap));
+
+        let auto_tune = AutoTune::new_with_registry(&profile_registry);
         for strategy_cfg in &config.strategies {
             if strategy_cfg.enabled == Some(true) {
                 auto_tune.set_override(
@@ -535,6 +863,16 @@ impl ProcessingPipeline {
             config.adaptive_router_config.clone(),
         ));
 
+        let delayed_inject =
+            delayed_inject::DelayedInject::start(packet_engine.clone(), buf_pool.clone(), 10);
+        let dns_async =
+            dns_async::DnsAsyncBridge::start(packet_engine.clone(), dns_proxy.clone(), 10);
+
+        let tls_reassembler = Arc::new(crate::tls_reassembly::TlsReassembler::new());
+
+        let stats = Arc::new(ProcessingStats::new());
+        let _ = stats.buf_pool.set(buf_pool.clone());
+
         Self {
             packet_engine,
             fake_ip,
@@ -546,20 +884,27 @@ impl ProcessingPipeline {
             active_profile_quic,
             active_profile_http,
             config,
-            stats: Arc::new(ProcessingStats::new()),
-            injected_seqs: moka::sync::Cache::builder()
-                .max_capacity(100_000)
-                .time_to_live(Duration::from_secs(30))
-                .build(),
-            auto_tune: std::sync::Mutex::new(auto_tune),
+            stats,
+            injected_seqs: Arc::new(dashmap::DashMap::with_capacity(100_000)),
+            auto_tune,
             buf_pool,
             redirect_table,
             socks_redirector: redirector,
             dns_proxy,
             zero_config,
             adaptive_router,
-            awg_tunnel: ArcSwap::from_pointee(None),
-            has_non_empty_session_ticket: false,
+            awg_tunnel: Arc::new(ArcSwap::from_pointee(None)),
+            delayed_inject,
+            dns_async,
+            awg_async: Arc::new(ArcSwap::from_pointee(None)),
+            split_tunnel: None,
+            fallback_chain: Arc::new(std::sync::Mutex::new(
+                crate::adaptive::fallback::FallbackChain::new(),
+            )),
+            target_escalator: Arc::new(std::sync::Mutex::new(
+                crate::adaptive::target_escalate::TargetEscalation::new(10, 30, 30),
+            )),
+            tls_reassembler,
         }
     }
 
@@ -576,17 +921,17 @@ impl ProcessingPipeline {
     }
 
     fn resolve_active_profile(&self, category: StrategyCategory) -> &StrategyProfile {
-        let active_name = match category {
-            StrategyCategory::Tls => self.active_profile_tls.load(),
-            StrategyCategory::Quic => self.active_profile_quic.load(),
-            StrategyCategory::Http => self.active_profile_http.load(),
+        let active_id = match category {
+            StrategyCategory::Tls => self.active_profile_tls.load(Ordering::Relaxed),
+            StrategyCategory::Quic => self.active_profile_quic.load(Ordering::Relaxed),
+            StrategyCategory::Http => self.active_profile_http.load(Ordering::Relaxed),
             other => unreachable!(
                 "resolve_active_profile вызван для категории {:?} без hot-path переключения",
                 other
             ),
         };
         self.profile_registry
-            .get(active_name.as_str())
+            .get_by_profile_id(crate::adaptive::strategy_profile::ProfileId(active_id))
             .unwrap_or_else(|| {
                 self.profile_registry
                     .get("outbound_tls")
@@ -605,13 +950,13 @@ impl ProcessingPipeline {
         match profile.category {
             StrategyCategory::Tls => self
                 .active_profile_tls
-                .store(Arc::new(profile.name.clone())),
+                .store(profile.id.0, Ordering::Relaxed),
             StrategyCategory::Quic => self
                 .active_profile_quic
-                .store(Arc::new(profile.name.clone())),
+                .store(profile.id.0, Ordering::Relaxed),
             StrategyCategory::Http => self
                 .active_profile_http
-                .store(Arc::new(profile.name.clone())),
+                .store(profile.id.0, Ordering::Relaxed),
             _ => {
                 tracing::info!(
                     "apply_strategy_tune: id={} (профиль='{}', категория={:?}) — только числовой override",
@@ -619,10 +964,7 @@ impl ProcessingPipeline {
                 );
             }
         }
-        self.auto_tune
-            .lock()
-            .unwrap()
-            .set_override(&profile.name, params);
+        self.auto_tune.set_override(&profile.name, params);
         tracing::info!(
             "apply_strategy_tune: id={} → активный профиль для {:?} = '{}'",
             strategy_id,
@@ -646,17 +988,17 @@ impl ProcessingPipeline {
             match profile.category {
                 StrategyCategory::Tls => self
                     .active_profile_tls
-                    .store(Arc::new(default_profile.name.clone())),
+                    .store(default_profile.id.0, Ordering::Relaxed),
                 StrategyCategory::Quic => self
                     .active_profile_quic
-                    .store(Arc::new(default_profile.name.clone())),
+                    .store(default_profile.id.0, Ordering::Relaxed),
                 StrategyCategory::Http => self
                     .active_profile_http
-                    .store(Arc::new(default_profile.name.clone())),
+                    .store(default_profile.id.0, Ordering::Relaxed),
                 _ => {}
             }
         }
-        self.auto_tune.lock().unwrap().clear_override(&profile.name);
+        self.auto_tune.clear_override(&profile.name);
         tracing::info!(
             "clear_strategy_tune: id={} — сброшен к default профилю категории",
             strategy_id
@@ -664,73 +1006,177 @@ impl ProcessingPipeline {
     }
 
     pub async fn run(self: Arc<Self>, shutdown: tokio::sync::broadcast::Receiver<()>) {
-        debug!("ProcessingPipeline started (T62 batch mode)");
+        debug!("ProcessingPipeline started (P1-00 flow-affinity mode)");
 
-        let n_workers = num_cpus::get().clamp(2, 16);
+        // P5-01: Capture Budget Governor background loop
+        {
+            let pipeline = self.clone();
+            let mut shutdown_rx = shutdown.resubscribe();
+            let mut governor = crate::capture_budget::CaptureBudgetGovernor::new(
+                pipeline.config.capture_budget.clone(),
+            );
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let total_received = pipeline.stats.total_received.load(Ordering::Relaxed);
+                            let total_dropped = pipeline.stats.dropped.load(Ordering::Relaxed);
+                            let total_other = pipeline.stats.capture_other.load(Ordering::Relaxed);
+
+                            let q_depth = if let Some(txs) = pipeline.stats.shard_txs.get() {
+                                txs.iter().map(|tx| tx.len()).max().unwrap_or(0)
+                            } else {
+                                0
+                            };
+
+                            let (next_mode, pressure) = governor.observe_window(
+                                total_received,
+                                total_dropped,
+                                total_other,
+                                std::time::Duration::from_secs(1),
+                                q_depth,
+                            );
+
+                            // Store pressure in stats
+                            pipeline.stats.capture_rx_pps.store(pressure.rx_pps, Ordering::Relaxed);
+                            pipeline.stats.capture_drop_ratio_ppm.store(pressure.drop_ratio_ppm, Ordering::Relaxed);
+                            pipeline.stats.capture_other_udp443_pps.store(pressure.other_udp443_pps, Ordering::Relaxed);
+                            pipeline.stats.capture_max_worker_queue_depth.store(pressure.max_worker_queue_depth, Ordering::Relaxed);
+
+                            if let Some(mode) = next_mode {
+                                let mode_val = match mode {
+                                    crate::capture_budget::CaptureMode::Strict => 0,
+                                    crate::capture_budget::CaptureMode::Balanced => 1,
+                                    crate::capture_budget::CaptureMode::SafeFallback => 2,
+                                };
+                                pipeline.stats.capture_mode.store(mode_val, Ordering::Relaxed);
+
+                                let enable_dns = true;
+                                let enable_quic = pipeline.config.techniques.iter().any(|t| {
+                                    let name = format!("{:?}", t);
+                                    name.starts_with("Quic") || name == "DoppelgangerGrease" || name == "UdpCoalescing"
+                                });
+
+                                let new_filter = crate::capture_budget::build_filter(mode, enable_dns, enable_quic);
+                                tracing::info!(
+                                    "Capture Budget Governor changed mode to {:?}. Rotating filter to: {}",
+                                    mode,
+                                    new_filter
+                                );
+
+                                if let Err(e) = pipeline.packet_engine.update_filter(&new_filter) {
+                                    tracing::error!("Capture Budget Governor failed to rotate filter: {}", e);
+                                    pipeline.stats.capture_filter_update_failures_total.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        _ = shutdown_rx.recv() => {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        let n_shards = num_cpus::get().clamp(2, 16);
         let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut worker_handles = Vec::with_capacity(n_workers);
+        let mut handles = Vec::with_capacity(n_shards + 2);
 
-        for id in 0..n_workers {
+        // Create per-shard bounded queues — depth 8192 prevents head-of-line blocking
+        let (shard_txs, shard_rxs): (Vec<_>, Vec<_>) = (0..n_shards)
+            .map(|_| crossbeam::channel::bounded::<CapturedPacket>(8192))
+            .unzip();
+        let shard_txs = Arc::new(shard_txs);
+        let _ = self.stats.shard_txs.set(shard_txs.clone());
+
+        // 1. Capture thread: exclusively reads WinDivert, classifies flow, dispatches to shard
+        {
+            let engine = self.packet_engine.clone();
+            let pool = self.buf_pool.clone();
+            let shutdown = shutdown_flag.clone();
+            let txs = shard_txs.clone();
+            let stats = self.stats.clone();
+            handles.push(
+                std::thread::Builder::new()
+                    .name("fp-capture".into())
+                    .spawn(move || {
+                        Self::capture_loop(engine, pool, shutdown, txs, stats);
+                    })
+                    .expect("spawn capture thread"),
+            );
+        }
+
+        // 2. Shard workers: process packets from their assigned queue, send/inject
+        for (id, rx) in shard_rxs.into_iter().enumerate() {
             let engine = self.packet_engine.clone();
             let pipeline = self.clone();
             let pool = self.buf_pool.clone();
-            let shutdown_flag = shutdown_flag.clone();
-            let mut shutdown_rx = shutdown.resubscribe();
-
-            let handle = std::thread::Builder::new()
-                .name(format!("fp-worker-{}", id))
-                .spawn(move || loop {
-                    if shutdown_rx.try_recv().is_ok() || shutdown_flag.load(Ordering::Acquire) {
-                        shutdown_flag.store(true, Ordering::Release);
-                        break;
-                    }
-                    Self::worker_loop(
-                        id,
-                        engine.clone(),
-                        pipeline.clone(),
-                        pool.clone(),
-                        shutdown_flag.clone(),
-                    );
-                })
-                .expect("spawn worker");
-            worker_handles.push(handle);
+            let shutdown = shutdown_flag.clone();
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("fp-shard-{}", id))
+                    .spawn(move || {
+                        Self::shard_worker_loop(id, rx, engine, pipeline, pool, shutdown);
+                    })
+                    .expect("spawn shard worker"),
+            );
         }
 
-        // Wait for shutdown
+        // 3. (P1-16) Periodic sweep: evict stale injected_seqs entries
+        {
+            let seqs = self.injected_seqs.clone();
+            let shutdown = shutdown_flag.clone();
+            handles.push(
+                std::thread::Builder::new()
+                    .name("fp-seq-evict".into())
+                    .spawn(move || {
+                        let evict_after = Duration::from_secs(30);
+                        loop {
+                            if shutdown.load(Ordering::Acquire) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_secs(5));
+                            let cutoff = Instant::now() - evict_after;
+                            seqs.retain(|_k, v| *v > cutoff);
+                        }
+                        tracing::debug!("Seq evict thread stopped");
+                    })
+                    .expect("spawn seq evict thread"),
+            );
+        }
+
+        // Wait for shutdown signal
         let mut shutdown_rx = shutdown.resubscribe();
         let _ = shutdown_rx.recv().await;
         shutdown_flag.store(true, Ordering::Release);
-        for handle in worker_handles {
+        for handle in handles {
             let _ = handle.join();
         }
 
         debug!("ProcessingPipeline stopped");
     }
 
-    /// T62: Worker loop с batch recv + batch send.
-    fn worker_loop(
-        id: usize,
+    /// P1-00: Capture loop — exclusively reads WinDivert, classifies flow,
+    /// dispatches each packet to the correct shard queue.
+    ///
+    /// Fail-open: if a shard queue is full, the packet is forwarded directly
+    /// (no backpressure on the capture thread).
+    fn capture_loop(
         engine: Arc<PacketEngine>,
-        pipeline: Arc<Self>,
         pool: Arc<PacketBufferPool>,
         shutdown: Arc<std::sync::atomic::AtomicBool>,
+        shard_txs: Arc<Vec<crossbeam::channel::Sender<CapturedPacket>>>,
+        stats: Arc<ProcessingStats>,
     ) {
         let mut empty_spins: u32 = 0;
+        let mut recv_buf = Vec::with_capacity(64);
 
-        let mut forward_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> =
-            Vec::with_capacity(64);
-        let mut inject_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> =
-            Vec::with_capacity(64);
-
-        loop {
-            if shutdown.load(Ordering::Acquire) {
-                break;
-            }
-
-            // 1. Batch recv — до 64 пакетов за 1 syscall
-            let packets = match engine.recv_batch(&pool) {
-                Ok(pkts) => {
-                    if pkts.is_empty() {
+        while !shutdown.load(Ordering::Acquire) {
+            let n = match engine.recv_batch_into(&pool, &mut recv_buf) {
+                Ok(n_pkts) => {
+                    if n_pkts == 0 {
                         empty_spins += 1;
                         if empty_spins < 100 {
                             std::hint::spin_loop();
@@ -741,122 +1187,128 @@ impl ProcessingPipeline {
                         continue;
                     }
                     empty_spins = 0;
-                    pkts
+                    n_pkts
                 }
                 Err(e) => {
                     if !engine.has_divert() {
                         std::thread::sleep(std::time::Duration::from_millis(10));
                         continue;
                     }
-                    tracing::error!("recv_batch error: {}", e);
+                    tracing::error!("capture_loop recv_batch error: {}", e);
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
             };
 
-            pipeline
-                .stats
-                .total_received
-                .fetch_add(packets.len() as u64, Ordering::Relaxed);
+            stats.total_received.fetch_add(n as u64, Ordering::Relaxed);
 
-            // 2. Очищаем batch buffers
+            for (data, addr) in recv_buf.drain(..) {
+                // Perform classification for stats
+                match crate::classifier::Classifier::classify(&data) {
+                    crate::classifier::Classification::Tls(ref cp) => {
+                        if let Some(payload) = data.get(cp.payload_offset..) {
+                            if crate::classifier::Classifier::is_client_hello(payload) {
+                                stats.capture_tls_ch.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                stats.capture_other.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else {
+                            stats.capture_other.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    crate::classifier::Classification::Quic(ref cp) => {
+                        if let Some(payload) = data.get(cp.payload_offset..) {
+                            if is_quic_initial_check(payload) {
+                                stats.capture_quic_initial.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                stats.capture_other.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else {
+                            stats.capture_other.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    crate::classifier::Classification::Dns(_) => {
+                        stats.capture_dns.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {
+                        stats.capture_other.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                // Classify flow for shard routing
+                let key = flow_affinity::classify_flow_key(&data);
+                let shard = flow_affinity::shard_for_flow(key, &data, shard_txs.len());
+                let pkt = CapturedPacket { data, addr };
+                match shard_txs[shard].try_send(pkt) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(pkt)) => {
+                        stats.shard_queue_full.fetch_add(1, Ordering::Relaxed);
+                        // Fail-open: forward directly, never block capture
+                        let _ = engine.send_batch(&[(pkt.data, pkt.addr)]);
+                    }
+                    Err(TrySendError::Disconnected(_)) => return,
+                }
+            }
+        }
+    }
+
+    /// P1-00: Shard worker loop — receives packets from its assigned queue,
+    /// processes them (classify, desync), and sends/injects in batches.
+    fn shard_worker_loop(
+        id: usize,
+        rx: crossbeam::channel::Receiver<CapturedPacket>,
+        engine: Arc<PacketEngine>,
+        pipeline: Arc<Self>,
+        pool: Arc<PacketBufferPool>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let mut forward_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> =
+            Vec::with_capacity(64);
+        let mut inject_batch: Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)> =
+            Vec::with_capacity(64);
+
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+
+            // 1. Wait for first packet with timeout (poll shutdown)
+            let first = match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(pkt) => pkt,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+
+            // 2. Prepare batches
             forward_batch.clear();
             inject_batch.clear();
 
-            // 3. Обрабатываем каждый пакет
-            for (data, addr) in packets {
-                let captured = CapturedPacket {
-                    data: data.clone(),
-                    addr: addr.clone(),
-                };
+            // 3. Process first packet
+            Self::shard_process_one(
+                first,
+                &mut forward_batch,
+                &mut inject_batch,
+                &engine,
+                &pipeline,
+                &pool,
+            );
 
-                match pipeline.process_one_sync(&captured) {
-                    Ok(decision) => {
-                        match decision {
-                            PacketDecision::Forward => {
-                                // Накапливаем для batch send (оригинальный буфер освободится в конце)
-                                forward_batch.push((data, addr));
-                            }
-                            PacketDecision::Modify(modified) => {
-                                // Исходный буфер больше не нужен — возвращаем в пул
-                                pool.release_bytes(data);
-                                forward_batch.push((modified, addr));
-                            }
-                            PacketDecision::Desync {
-                                inject,
-                                modified,
-                                inject_protocol,
-                                inter_delay_us,
-                            } => {
-                                match inject_protocol {
-                                    InjectProtocol::Tcp => {
-                                        for (i, inject_pkt) in inject.iter().enumerate() {
-                                            if i > 0 && inter_delay_us > 0 {
-                                                if !inject_batch.is_empty() {
-                                                    let _ = engine
-                                                        .inject_batch_via_divert(&inject_batch);
-                                                    for (d, _) in &inject_batch {
-                                                        pool.release_bytes(d.clone());
-                                                    }
-                                                    inject_batch.clear();
-                                                }
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_micros(
-                                                        inter_delay_us as u64,
-                                                    ),
-                                                );
-                                            }
-                                            inject_batch.push((inject_pkt.clone(), addr.clone()));
-                                        }
-                                    }
-                                    InjectProtocol::Udp => {
-                                        for (i, inject_pkt) in inject.iter().enumerate() {
-                                            if i > 0 && inter_delay_us > 0 {
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_micros(
-                                                        inter_delay_us as u64,
-                                                    ),
-                                                );
-                                            }
-                                            if let Err(e) = engine.inject_raw_udp(inject_pkt) {
-                                                tracing::warn!(
-                                                    "Failed to inject UDP desync packet: {}",
-                                                    e
-                                                );
-                                            }
-                                            pool.release_bytes(inject_pkt.clone());
-                                            pipeline
-                                                .stats
-                                                .fake_ch_injected
-                                                .fetch_add(1, Ordering::Relaxed);
-                                        }
-                                    }
-                                }
-
-                                // Обработка оригинального/модифицированного пакета
-                                if let Some(m) = modified {
-                                    forward_batch.push((m, addr));
-                                    pool.release_bytes(data);
-                                } else {
-                                    // Если модификации нет, то оригинальный пакет пробрасывается дальше
-                                    forward_batch.push((data, addr));
-                                }
-                            }
-                            PacketDecision::Drop => {
-                                pool.release_bytes(data);
-                                pipeline.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Packet processing error: {}", e);
-                        forward_batch.push((data, addr));
-                        pipeline.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    }
+            // 4. Drain remaining available packets (batch processing)
+            while forward_batch.len() < 64 {
+                match rx.try_recv() {
+                    Ok(pkt) => Self::shard_process_one(
+                        pkt,
+                        &mut forward_batch,
+                        &mut inject_batch,
+                        &engine,
+                        &pipeline,
+                        &pool,
+                    ),
+                    Err(_) => break,
                 }
             }
 
-            // 4. Batch send — все forward/modify пакеты за 1 syscall
+            // 5. Send forward batch
             if !forward_batch.is_empty() {
                 let sent = engine.send_batch(&forward_batch);
                 if let Ok(n) = sent {
@@ -865,13 +1317,12 @@ impl ProcessingPipeline {
                         .forwarded
                         .fetch_add(n as u64, Ordering::Relaxed);
                 }
-                // Возвращаем буферы в пул
                 for (data, _) in &forward_batch {
                     pool.release_bytes(data.clone());
                 }
             }
 
-            // 5. Batch inject — все impostor пакеты за 1 syscall
+            // 6. Send inject batch
             if !inject_batch.is_empty() {
                 let sent = engine.inject_batch_via_divert(&inject_batch);
                 if let Ok(n) = sent {
@@ -880,14 +1331,194 @@ impl ProcessingPipeline {
                         .fake_ch_injected
                         .fetch_add(n as u64, Ordering::Relaxed);
                 }
-                // Возвращаем буферы в пул
                 for (data, _) in &inject_batch {
                     pool.release_bytes(data.clone());
                 }
             }
         }
 
-        tracing::debug!("Worker {} stopped", id);
+        tracing::debug!("Shard worker {} stopped", id);
+    }
+
+    /// P1-00: Process a single packet in the shard worker context.
+    /// Inline helper to avoid duplicating the match arms.
+    fn shard_process_one(
+        captured: CapturedPacket,
+        forward_batch: &mut Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)>,
+        inject_batch: &mut Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)>,
+        engine: &PacketEngine,
+        pipeline: &Self,
+        pool: &PacketBufferPool,
+    ) {
+        let CapturedPacket { data, addr } = captured;
+        let decision = pipeline.process_one_sync(&CapturedPacket {
+            data: data.clone(),
+            addr: addr.clone(),
+        });
+
+        match decision {
+            Ok(decision) => match decision {
+                PacketDecision::Forward => {
+                    forward_batch.push((data, addr));
+                }
+                PacketDecision::Modify(modified) => {
+                    pool.release_bytes(data);
+                    if pipeline.validate_packet_and_log(&modified) {
+                        forward_batch.push((modified, addr));
+                    }
+                }
+                PacketDecision::Desync {
+                    inject,
+                    modified,
+                    inject_protocol,
+                    inter_delay_us,
+                    ..
+                } => {
+                    match inject_protocol {
+                        InjectProtocol::Tcp => {
+                            for (i, inject_pkt) in inject.iter().enumerate() {
+                                if !pipeline.validate_packet_and_log(inject_pkt) {
+                                    continue;
+                                }
+                                if i > 0 && inter_delay_us > 0 {
+                                    if !pipeline.delayed_inject.try_schedule(
+                                        inter_delay_us * i as u32,
+                                        inject_pkt.clone(),
+                                        addr.clone(),
+                                    ) {
+                                        inject_batch.push((inject_pkt.clone(), addr.clone()));
+                                    }
+                                } else {
+                                    inject_batch.push((inject_pkt.clone(), addr.clone()));
+                                }
+                            }
+                        }
+                        InjectProtocol::Udp => {
+                            for (i, inject_pkt) in inject.iter().enumerate() {
+                                if !pipeline.validate_packet_and_log(inject_pkt) {
+                                    continue;
+                                }
+                                if i > 0 && inter_delay_us > 0 {
+                                    if !pipeline.delayed_inject.try_schedule(
+                                        inter_delay_us * i as u32,
+                                        inject_pkt.clone(),
+                                        addr.clone(),
+                                    ) {
+                                        if let Err(e) = engine.inject_raw_udp(inject_pkt) {
+                                            tracing::warn!(
+                                                "Failed to inject UDP desync packet: {}",
+                                                e
+                                            );
+                                        }
+                                        pool.release_bytes(inject_pkt.clone());
+                                    }
+                                } else {
+                                    if let Err(e) = engine.inject_raw_udp(inject_pkt) {
+                                        tracing::warn!("Failed to inject UDP desync packet: {}", e);
+                                    }
+                                    pool.release_bytes(inject_pkt.clone());
+                                }
+                                pipeline
+                                    .stats
+                                    .fake_ch_injected
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+
+                    // Handle modified/original packet
+                    if let Some(m) = modified {
+                        if pipeline.validate_packet_and_log(&m) {
+                            forward_batch.push((m, addr));
+                        }
+                        pool.release_bytes(data);
+                    } else {
+                        forward_batch.push((data, addr));
+                    }
+                }
+                PacketDecision::Drop => {
+                    pool.release_bytes(data);
+                    pipeline.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            Err(e) => {
+                tracing::debug!("Packet processing error: {}", e);
+                forward_batch.push((data, addr));
+                pipeline.stats.errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn validate_packet_and_log(&self, pkt: &[u8]) -> bool {
+        match crate::packet_invariants::validate_before_send(
+            pkt,
+            crate::packet_invariants::ValidationMode::Fast,
+        ) {
+            Ok(()) => true,
+            Err(reason) => {
+                tracing::warn!(
+                    ?reason,
+                    len = pkt.len(),
+                    "dropping malformed generated/modified packet before wire"
+                );
+                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+
+                // Increment specific invariant metric
+                match reason {
+                    crate::packet_invariants::PacketInvalidReason::TooShort => {
+                        self.stats
+                            .invariant_too_short
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::packet_invariants::PacketInvalidReason::UnsupportedIpVersion(_) => {
+                        self.stats
+                            .invariant_unsupported_ip_version
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::packet_invariants::PacketInvalidReason::Ipv4HeaderTooShort => {
+                        self.stats
+                            .invariant_ipv4_header_too_short
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::packet_invariants::PacketInvalidReason::Ipv4TotalLengthMismatch => {
+                        self.stats
+                            .invariant_ipv4_total_length_mismatch
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::packet_invariants::PacketInvalidReason::Ipv4BadHeaderChecksum => {
+                        self.stats
+                            .invariant_ipv4_bad_header_checksum
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::packet_invariants::PacketInvalidReason::Ipv6PayloadLengthMismatch => {
+                        self.stats
+                            .invariant_ipv6_payload_length_mismatch
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::packet_invariants::PacketInvalidReason::TcpHeaderTooShort => {
+                        self.stats
+                            .invariant_tcp_header_too_short
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::packet_invariants::PacketInvalidReason::UdpHeaderTooShort => {
+                        self.stats
+                            .invariant_udp_header_too_short
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::packet_invariants::PacketInvalidReason::UdpLengthMismatch => {
+                        self.stats
+                            .invariant_udp_length_mismatch
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::packet_invariants::PacketInvalidReason::QuicInitialTooSmall => {
+                        self.stats
+                            .invariant_quic_initial_too_small
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                false
+            }
+        }
     }
 
     // ──────────────────────────────────────────────
@@ -906,18 +1537,24 @@ impl ProcessingPipeline {
         tune_params: Option<TuneParams>,
         is_resumption: Option<bool>,
         conn_rng_fork: Option<crate::desync::rand::PerConnRng>,
+        client_hello_shape: Option<crate::desync::tls::ClientHelloShape>,
     ) -> crate::desync::DesyncResult {
+        let start = Instant::now();
         let override_params: Option<crate::desync::group::ConfigOverride> =
             tune_params.map(Into::into);
-        let mut group_clone = group.clone();
-        group_clone.set_context(self.hop_tab.clone(), self.conntrack.clone());
-        group_clone.apply_with_rng(
+        let res = group.apply_with_runtime_context(
             &packet,
             dscp_value,
             override_params,
             is_resumption,
             conn_rng_fork,
-        )
+            Some(&self.hop_tab),
+            Some(&self.conntrack),
+            client_hello_shape,
+        );
+        let elapsed = start.elapsed().as_micros() as u64;
+        self.stats.desync_application_latency_us.observe_us(elapsed);
+        res
     }
 
     /// Sync version: send packet via WinDivert (no spawn_blocking).
@@ -966,24 +1603,183 @@ impl ProcessingPipeline {
         self.process_one_sync_dispatch(captured)
     }
 
+    /// P0-07: Наблюдает сетевые исходы для соединений, к которым применялся desync.
+    /// Вызывается для каждого TCP-пакета. Если conntrack знает `applied_strategy`,
+    /// то RST → record_outcome(fail), SYN-ACK → record_outcome(success).
+    fn observe_connection_outcome(&self, packet: &[u8], cp: &ClassifiedPacket) {
+        if cp.protocol != 6 {
+            return; // только TCP
+        }
+        let ip = match crate::desync::parse_ip_header(packet) {
+            Some(h) => h,
+            None => return,
+        };
+        let tcp_data = &packet[ip.header_len()..];
+        let tcp = match crate::desync::parse_tcp_packet(tcp_data) {
+            Some(t) => t,
+            None => return,
+        };
+
+        let flags = tcp.flags;
+        let is_rst = (flags & 0x04) != 0;
+        let is_syn = (flags & 0x02) != 0;
+        let is_ack = (flags & 0x10) != 0;
+
+        // P2-04: CircuitBreaker & ThroughputTracker integration
+        let is_inbound = !is_outbound_cached(cp.src_ip);
+        if is_inbound {
+            let rev_key = crate::conntrack::ConnKey::new(
+                cp.dst_ip,
+                cp.src_ip,
+                cp.dst_port,
+                cp.src_port,
+                cp.protocol,
+            );
+            if let Some(entry) = self.conntrack.get(&rev_key) {
+                if let Some(ref route_key) = entry.route_key {
+                    if is_rst {
+                        self.adaptive_router.record_rst();
+                        debug!(
+                            "P2-04: recorded inbound RST (CircuitBreaker) for domain {}",
+                            route_key
+                        );
+                    } else if (is_syn && is_ack) || cp.payload_len > 0 {
+                        self.adaptive_router.record_success();
+                        if cp.payload_len > 0 {
+                            self.adaptive_router
+                                .record_bytes(route_key, cp.payload_len as u64);
+                            debug!(
+                                "P2-04: recorded inbound success & {} bytes for domain {}",
+                                cp.payload_len, route_key
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Если conntrack не знает `applied_strategy` — не наш случай
+        let applied_strategy = match self.conntrack.get(&cp.conn_key) {
+            Some(e) => e.applied_strategy.clone(),
+            None => return,
+        };
+        let strategy_name = match applied_strategy {
+            Some(ref name) => name.clone(),
+            None => return,
+        };
+
+        if is_rst {
+            // RST = fail (соединение было сброшено)
+            self.auto_tune.record_outcome(&strategy_name, false, 0);
+            debug!("P0-07: outcome=Fail(RST) strategy={}", strategy_name);
+
+            // P2-05: FallbackChain & TargetEscalation recording failure
+            self.fallback_chain.lock().unwrap().record_failure();
+
+            let target_key = format!("{}:{}", cp.dst_ip, cp.dst_port);
+            self.target_escalator
+                .lock()
+                .unwrap()
+                .record_rst(&target_key);
+
+            // Advance fallback chain
+            if let Some(entry) = self.fallback_chain.lock().unwrap().current() {
+                if let Some(profile) = self.profile_registry.find_by_technique(entry.technique) {
+                    let mut params = crate::adaptive::auto_tune::TuneParams {
+                        split_size: None,
+                        split_count: None,
+                        fake_ttl_offset: None,
+                        max_seg_size: None,
+                    };
+                    if self
+                        .target_escalator
+                        .lock()
+                        .unwrap()
+                        .should_escalate(&target_key)
+                    {
+                        params.fake_ttl_offset = Some(2); // increase aggressiveness
+                    }
+                    self.apply_strategy_tune(profile.strategy_id, params);
+                    tracing::info!(
+                        "P2-05: Fallback advanced to strategy '{}' (technique: {:?}) for {}",
+                        profile.name,
+                        entry.technique,
+                        target_key
+                    );
+                }
+            }
+        } else if is_syn && is_ack {
+            // SYN-ACK = success (сервер ответил, соединение устанавливается)
+            self.auto_tune.record_outcome(&strategy_name, true, 0);
+            debug!("P0-07: outcome=Success(SYN-ACK) strategy={}", strategy_name);
+
+            // P2-05: FallbackChain record success
+            self.fallback_chain.lock().unwrap().record_success(0);
+        }
+    }
+
     pub(crate) fn process_one_sync_dispatch(
         &self,
         captured: &CapturedPacket,
     ) -> Result<PacketDecision, anyhow::Error> {
         let classification = Classifier::classify(&captured.data);
 
+        // P0-07: Наблюдаем исходы для TCP-соединений с применённым desync
+        if let Classification::Tls(ref cp) = classification {
+            self.observe_connection_outcome(&captured.data, cp);
+        } else if let Classification::Http(ref cp) = classification {
+            self.observe_connection_outcome(&captured.data, cp);
+        } else if let Classification::Other(ref cp) = classification {
+            self.observe_connection_outcome(&captured.data, cp);
+        }
+
+        let cp_opt = match &classification {
+            Classification::Tls(cp) => Some(cp),
+            Classification::Quic(cp) => Some(cp),
+            Classification::Dns(cp) => Some(cp),
+            Classification::Http(cp) => Some(cp),
+            Classification::Other(cp) => Some(cp),
+            Classification::Unknown => None,
+        };
+
+        if let Some(ref st) = self.split_tunnel {
+            if let Some(cp) = cp_opt {
+                if cp.dst_port != 53 && cp.src_port != 17650 {
+                    if st.should_bypass_ip(&cp.dst_ip) {
+                        return Ok(PacketDecision::Forward);
+                    }
+                    if let Some(domain) = self.fake_ip.lookup(&cp.dst_ip) {
+                        if st.should_bypass_domain(&domain) {
+                            return Ok(PacketDecision::Forward);
+                        }
+                    }
+                }
+            }
+        }
+
         // 1. DNS (UDP:53) check
         if let Classification::Dns(ref cp) = classification {
             if cp.dst_port == 53 && cp.protocol == 17 {
-                let rt = crate::Runtime::global();
-                if let Some(resp_data) =
-                    rt.block_on(self.dns_proxy.handle_dns_query(&captured.data))
+                let mut addr = captured.addr.clone();
+                addr.set_outbound(false); // Reinject as inbound response
+
+                // P1-05: DNS async queue offload bridge
+                if self
+                    .dns_async
+                    .try_offload(captured.data.clone(), addr.clone())
                 {
-                    let mut addr = captured.addr.clone();
-                    addr.set_outbound(false); // Reinject as inbound response
-                    let _ = self.packet_engine.inject_via_divert(&resp_data, &addr);
                     self.stats.dropped.fetch_add(1, Ordering::Relaxed);
                     return Ok(PacketDecision::Drop); // Drop original query
+                } else {
+                    // Fallback to synchronous block_on if the queue is full
+                    let rt = crate::Runtime::global();
+                    if let Some(resp_data) =
+                        rt.block_on(self.dns_proxy.handle_dns_query(&captured.data))
+                    {
+                        let _ = self.packet_engine.inject_via_divert(&resp_data, &addr);
+                        self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                        return Ok(PacketDecision::Drop);
+                    }
                 }
             }
         }
@@ -997,12 +1793,13 @@ impl ProcessingPipeline {
                         entry.orig_dst_ip,
                         entry.orig_dst_port
                     );
-                    let modified = crate::proxy::rewrite::rewrite_src_addr(
-                        &captured.data,
+                    let modified = crate::proxy::rewrite::rewrite_src_addr_cow(
+                        captured.data.clone(),
                         entry.orig_dst_ip,
                         entry.orig_dst_port,
+                        &self.stats,
                     )?;
-                    return Ok(PacketDecision::Modify(modified.into()));
+                    return Ok(PacketDecision::Modify(modified));
                 }
             }
         }
@@ -1089,7 +1886,7 @@ impl ProcessingPipeline {
                     is_geo_blocked,
                     has_sni_or_host,
                     cp.protocol,
-                    &self.auto_tune.lock().unwrap(),
+                    &self.auto_tune,
                     "outbound_tls",
                 );
 
@@ -1105,19 +1902,41 @@ impl ProcessingPipeline {
                         if cp.protocol == 17 {
                             let awg_guard = self.awg_tunnel.load();
                             if let Some(ref awg) = **awg_guard {
-                                debug!(
-                                    "AdaptiveRouter decided Proxy: routing UDP/QUIC packet to {}:{} via Userspace AmneziaWG",
-                                    cp.dst_ip, cp.dst_port
-                                );
-                                let awg_clone = Arc::clone(awg);
-                                let data_copy = captured.data.clone().to_vec();
-                                crate::Runtime::global().io.spawn(async move {
-                                    if let Err(e) = awg_clone.send_ip_packet(data_copy).await {
-                                        error!("AWG: failed to send packet: {e:#}");
+                                let awg_async_guard = self.awg_async.load();
+                                if let Some(ref writer) = **awg_async_guard {
+                                    debug!(
+                                        "AdaptiveRouter decided Proxy: routing UDP/QUIC packet to {}:{} via Userspace AmneziaWG (async offload)",
+                                        cp.dst_ip, cp.dst_port
+                                    );
+                                    if writer.try_send(captured.data.clone()) {
+                                        self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                                        return Ok(PacketDecision::Drop);
+                                    } else {
+                                        let awg_clone = Arc::clone(awg);
+                                        let data_copy = captured.data.clone();
+                                        crate::Runtime::global().io.spawn(async move {
+                                            if let Err(e) = awg_clone.send_ip_packet(data_copy).await {
+                                                error!("AWG: failed to send packet (spawn fallback): {e:#}");
+                                            }
+                                        });
+                                        self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                                        return Ok(PacketDecision::Drop);
                                     }
-                                });
-                                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                                return Ok(PacketDecision::Drop);
+                                } else {
+                                    debug!(
+                                        "AdaptiveRouter decided Proxy: routing UDP/QUIC packet to {}:{} via Userspace AmneziaWG (legacy spawn)",
+                                        cp.dst_ip, cp.dst_port
+                                    );
+                                    let awg_clone = Arc::clone(awg);
+                                    let data_copy = captured.data.clone();
+                                    crate::Runtime::global().io.spawn(async move {
+                                        if let Err(e) = awg_clone.send_ip_packet(data_copy).await {
+                                            error!("AWG: failed to send packet: {e:#}");
+                                        }
+                                    });
+                                    self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                                    return Ok(PacketDecision::Drop);
+                                }
                             }
 
                             // Drop UDP/QUIC to force TCP fallback if AWG is not enabled/active
@@ -1139,13 +1958,14 @@ impl ProcessingPipeline {
                             },
                         );
                         let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-                        let modified = crate::proxy::rewrite::rewrite_dst_addr(
-                            &captured.data,
+                        let modified = crate::proxy::rewrite::rewrite_dst_addr_cow(
+                            captured.data.clone(),
                             localhost,
                             17650,
+                            &self.stats,
                         )?;
                         self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                        return Ok(PacketDecision::Modify(modified.into()));
+                        return Ok(PacketDecision::Modify(modified));
                     }
                     crate::routing::adaptive_router::RoutingDecision::Desync => {
                         // Continue to standard desync handling below
@@ -1168,17 +1988,46 @@ impl ProcessingPipeline {
                     cp.protocol,
                 );
 
-                let mut should_desync = false;
-                if Classifier::is_client_hello(&captured.data[cp.payload_offset..])
-                    && captured.data.len() - cp.payload_offset >= 50
-                {
-                    should_desync = self.conntrack.check_and_apply_desync(conn_key, || {
-                        ip_to_u64(cp.src_ip)
-                            ^ (ip_to_u64(cp.dst_ip) << 32)
-                            ^ ((cp.src_port as u64) << 48)
-                            ^ (cp.dst_port as u64)
-                    });
-                }
+                let payload = match captured.data.get(cp.payload_offset..) {
+                    Some(p) => p,
+                    None => return Ok(PacketDecision::Forward),
+                };
+                let should_desync = if Classifier::is_client_hello(payload) && payload.len() >= 50 {
+                    self.conntrack.check_and_apply_desync(conn_key, || {
+                        let fk = crate::conntrack::FlowKey::new_bidirectional(
+                            cp.src_ip,
+                            cp.dst_ip,
+                            cp.src_port,
+                            cp.dst_port,
+                            cp.protocol,
+                        );
+                        crate::conntrack::compute_conn_id(&fk)
+                    })
+                } else {
+                    match self.tls_reassembler.observe(conn_key, payload).0 {
+                        crate::tls_reassembly::ReassemblyState::Complete => {
+                            self.conntrack.check_and_apply_desync(conn_key, || {
+                                let fk = crate::conntrack::FlowKey::new_bidirectional(
+                                    cp.src_ip,
+                                    cp.dst_ip,
+                                    cp.src_port,
+                                    cp.dst_port,
+                                    cp.protocol,
+                                );
+                                crate::conntrack::compute_conn_id(&fk)
+                            })
+                        }
+                        crate::tls_reassembly::ReassemblyState::NeedMore => {
+                            return Ok(PacketDecision::Forward)
+                        }
+                        crate::tls_reassembly::ReassemblyState::NotTls => {
+                            return Ok(PacketDecision::Forward)
+                        }
+                        crate::tls_reassembly::ReassemblyState::TooLarge => {
+                            return Ok(PacketDecision::Forward)
+                        }
+                    }
+                };
 
                 if !should_desync {
                     return Ok(PacketDecision::Forward);
@@ -1254,10 +2103,14 @@ impl ProcessingPipeline {
             );
 
             let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-            let modified =
-                crate::proxy::rewrite::rewrite_dst_addr(&captured.data, localhost, 17650)?;
+            let modified = crate::proxy::rewrite::rewrite_dst_addr_cow(
+                captured.data.clone(),
+                localhost,
+                17650,
+                &self.stats,
+            )?;
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            return Ok(PacketDecision::Modify(modified.into()));
+            return Ok(PacketDecision::Modify(modified));
         }
 
         if cp.protocol == 17 {
@@ -1281,20 +2134,31 @@ impl ProcessingPipeline {
 
         let original_packet = &captured.data;
 
-        // 0. Skip retransmits
+        // 0. Skip retransmits — P1-16: atomic check-and-mark
         {
             if let Some(ip) = crate::desync::parse_ip_header(original_packet) {
                 let tcp_data = &original_packet[ip.header_len()..];
                 if let Some(tcp) = pnet_packet::tcp::TcpPacket::new(tcp_data) {
-                    let key = (
-                        ip_to_u64(cp.src_ip),
-                        ip_to_u64(cp.dst_ip),
+                    let fk = crate::conntrack::FlowKey::new_bidirectional(
+                        cp.src_ip,
+                        cp.dst_ip,
                         cp.src_port,
                         cp.dst_port,
-                        tcp.get_sequence(),
+                        cp.protocol,
                     );
-                    if self.injected_seqs.contains_key(&key) {
-                        return Ok(PacketDecision::Forward);
+                    let conn_id = crate::conntrack::compute_conn_id(&fk);
+                    let key = (conn_id, tcp.get_sequence());
+                    // P1-16: DashMap entry API — атомарный check-and-mark.
+                    // Только первый поток, вставивший key, проходит дальше.
+                    // Если desync не сработает (no inject), запись останется
+                    // в таблице и будет очищена periodic sweep — это лучше,
+                    // чем TOCTOU double injection.
+                    use dashmap::mapref::entry::Entry;
+                    match self.injected_seqs.entry(key) {
+                        Entry::Occupied(_) => return Ok(PacketDecision::Forward),
+                        Entry::Vacant(entry) => {
+                            entry.insert(Instant::now());
+                        }
                     }
                 }
             }
@@ -1329,18 +2193,31 @@ impl ProcessingPipeline {
             cp.dst_port,
             cp.protocol,
         );
+        let mut is_syn = false;
+        let mut tcp_seq = 0;
+        if let Some(ip) = crate::desync::parse_ip_header(original_packet) {
+            let tcp_data = &original_packet[ip.header_len()..];
+            if let Some(tcp) = pnet_packet::tcp::TcpPacket::new(tcp_data) {
+                is_syn = (tcp.get_flags() & pnet_packet::tcp::TcpFlags::SYN) != 0;
+                tcp_seq = tcp.get_sequence();
+            }
+        }
         {
             use crate::conntrack::{ConnState, ConntrackEntry};
 
             if self.conntrack.get(&conn_key).is_none() {
-                let conn_id = ip_to_u64(cp.src_ip)
-                    ^ (ip_to_u64(cp.dst_ip) << 32)
-                    ^ ((cp.src_port as u64) << 48)
-                    ^ (cp.dst_port as u64);
+                let fk = crate::conntrack::FlowKey::new_bidirectional(
+                    cp.src_ip,
+                    cp.dst_ip,
+                    cp.src_port,
+                    cp.dst_port,
+                    cp.protocol,
+                );
+                let conn_id = crate::conntrack::compute_conn_id(&fk);
                 let entry = ConntrackEntry {
-                    client_isn: 0,
+                    client_isn: if is_syn { tcp_seq } else { 0 },
                     server_isn: 0,
-                    client_seq: 0,
+                    client_seq: if is_syn { tcp_seq } else { 0 },
                     server_seq: 0,
                     client_ack: 0,
                     server_ack: 0,
@@ -1355,19 +2232,40 @@ impl ProcessingPipeline {
                     quic_pn: 0,
                     quic_dcid: vec![],
                     is_resumption: false,
+                    applied_strategy: None,
+                    route_key: domain.clone(),
+                    quic_dropped_initials: 0,
                 };
                 self.conntrack.insert(conn_key, entry);
             } else {
                 if let Some(mut entry) = self.conntrack.get_mut(&conn_key) {
                     entry.last_activity = Instant::now();
+                    if is_syn && entry.client_isn == 0 {
+                        entry.client_isn = tcp_seq;
+                        entry.client_seq = tcp_seq;
+                    }
+                    if entry.route_key.is_none() {
+                        entry.route_key = domain.clone();
+                    }
                 }
             }
         }
 
         // 4.5. T43: Определяем is_resumption по ClientHello и сохраняем в conntrack
-        let is_resumption = {
-            let payload = &captured.data;
+        let tls_payload = if cp.payload_offset < captured.data.len() {
+            Some(&captured.data[cp.payload_offset..])
+        } else {
+            None
+        };
+        let is_resumption = if let Some(payload) = tls_payload {
             has_non_empty_session_ticket(payload)
+        } else {
+            false
+        };
+        let ch_shape = if let Some(payload) = tls_payload {
+            crate::desync::tls::parse_client_hello_shape(payload)
+        } else {
+            None
         };
         if let Some(mut entry) = self.conntrack.get_mut(&conn_key) {
             entry.is_resumption = is_resumption;
@@ -1387,7 +2285,7 @@ impl ProcessingPipeline {
             (None, None)
         };
         let tune_start = Instant::now();
-        let auto_tune_override = self.auto_tune.lock().unwrap().recommend(&profile.name);
+        let auto_tune_override = self.auto_tune.recommend_by_id(profile.id);
         let mut tune_params = profile.merged_params(&auto_tune_override);
         if self.config.hop_tab_enabled && tune_params.fake_ttl_offset.is_none() {
             tune_params.fake_ttl_offset = self.hop_tab.fake_ttl_for_ip(&cp.dst_ip);
@@ -1399,15 +2297,23 @@ impl ProcessingPipeline {
             Some(tune_params),
             Some(is_resumption),
             conn_rng_fork,
+            ch_shape,
         );
 
-        // 5.0. AutoTune — записываем под именем АКТИВНОГО профиля, не хардкод "outbound_tls"
+        // P0-07: сохраняем имя стратегии в conntrack для record_outcome
+        if !result.inject.is_empty() || result.modified.is_some() {
+            if let Some(mut entry) = self.conntrack.get_mut(&conn_key) {
+                if entry.applied_strategy.is_none() {
+                    entry.applied_strategy = Some(profile.name.clone());
+                }
+            }
+        }
+
+        // 5.0. AutoTune — P0-07: только record_application (локальная генерация, не исход)
         {
             let latency_us = tune_start.elapsed().as_micros() as u64;
-            let success = !result.inject.is_empty() || result.modified.is_some();
-            let mut tune = self.auto_tune.lock().unwrap();
-            tune.record(&profile.name, success, latency_us);
-            if tune.should_escalate(&profile.name) {
+            self.auto_tune.record_application_by_id(profile.id);
+            if self.auto_tune.should_escalate(&profile.name) {
                 warn!(
                     "AutoTune: '{}' strategy degrading (latency={}us)",
                     profile.name, latency_us
@@ -1420,14 +2326,18 @@ impl ProcessingPipeline {
             if let Some(ip) = crate::desync::parse_ip_header(original_packet) {
                 let tcp_data = &original_packet[ip.header_len()..];
                 if let Some(tcp) = pnet_packet::tcp::TcpPacket::new(tcp_data) {
-                    let key = (
-                        ip_to_u64(cp.src_ip),
-                        ip_to_u64(cp.dst_ip),
+                    let fk = crate::conntrack::FlowKey::new_bidirectional(
+                        cp.src_ip,
+                        cp.dst_ip,
                         cp.src_port,
                         cp.dst_port,
-                        tcp.get_sequence(),
+                        cp.protocol,
                     );
-                    self.injected_seqs.insert(key, ());
+                    let conn_id = crate::conntrack::compute_conn_id(&fk);
+                    let key = (conn_id, tcp.get_sequence());
+                    // P1-16: ключ уже вставлен на check-этапе (step 0).
+                    // Этот or_insert — no-op (защита на случай рефакторинга).
+                    self.injected_seqs.entry(key).or_insert(Instant::now());
                 }
             }
         }
@@ -1450,6 +2360,7 @@ impl ProcessingPipeline {
                 modified: Some(modified),
                 inject_protocol: InjectProtocol::Tcp,
                 inter_delay_us: inter_delay,
+                inject_direction: result.inject_direction,
             });
         }
 
@@ -1458,6 +2369,7 @@ impl ProcessingPipeline {
             modified: result.modified,
             inject_protocol: InjectProtocol::Tcp,
             inter_delay_us: inter_delay,
+            inject_direction: result.inject_direction,
         })
     }
 
@@ -1474,11 +2386,19 @@ impl ProcessingPipeline {
             use crate::desync::quic::extract_quic_pn_and_dcid;
 
             if self.conntrack.get(&cp.conn_key).is_none() {
-                let conn_id = ip_to_u64(cp.src_ip)
-                    ^ (ip_to_u64(cp.dst_ip) << 32)
-                    ^ ((cp.src_port as u64) << 48)
-                    ^ (cp.dst_port as u64);
-                let (quic_pn, quic_dcid) = extract_quic_pn_and_dcid(&packet).unwrap_or((0, vec![]));
+                let fk = crate::conntrack::FlowKey::new_bidirectional(
+                    cp.src_ip,
+                    cp.dst_ip,
+                    cp.src_port,
+                    cp.dst_port,
+                    cp.protocol,
+                );
+                let conn_id = crate::conntrack::compute_conn_id(&fk);
+                let (quic_pn, quic_dcid) = if cp.payload_offset < packet.len() {
+                    extract_quic_pn_and_dcid(&packet[cp.payload_offset..]).unwrap_or((0, vec![]))
+                } else {
+                    (0, vec![])
+                };
                 let entry = ConntrackEntry {
                     client_isn: 0,
                     server_isn: 0,
@@ -1497,14 +2417,24 @@ impl ProcessingPipeline {
                     quic_pn,
                     quic_dcid,
                     is_resumption: false,
+                    applied_strategy: None,
+                    route_key: self.fake_ip.lookup(&cp.dst_ip),
+                    quic_dropped_initials: 0,
                 };
                 self.conntrack.insert(cp.conn_key, entry);
             } else {
                 if let Some(mut entry) = self.conntrack.get_mut(&cp.conn_key) {
                     entry.last_activity = std::time::Instant::now();
                     // Обновляем PN, даже если не смогли распарсить (оставляем старый)
-                    if let Some((pn, _)) = extract_quic_pn_and_dcid(&packet) {
-                        entry.quic_pn = pn;
+                    if cp.payload_offset < packet.len() {
+                        if let Some((pn, _)) =
+                            extract_quic_pn_and_dcid(&packet[cp.payload_offset..])
+                        {
+                            entry.quic_pn = pn;
+                        }
+                    }
+                    if entry.route_key.is_none() {
+                        entry.route_key = self.fake_ip.lookup(&cp.dst_ip);
                     }
                 }
             }
@@ -1515,7 +2445,7 @@ impl ProcessingPipeline {
 
         // T43: QUIC не использует is_resumption — передаём None
         let tune_start = Instant::now();
-        let auto_tune_override = self.auto_tune.lock().unwrap().recommend(&profile.name);
+        let auto_tune_override = self.auto_tune.recommend_by_id(profile.id);
         let mut tune_params = profile.merged_params(&auto_tune_override);
         if self.config.hop_tab_enabled && tune_params.fake_ttl_offset.is_none() {
             tune_params.fake_ttl_offset = self.hop_tab.fake_ttl_for_ip(&cp.dst_ip);
@@ -1527,14 +2457,13 @@ impl ProcessingPipeline {
             Some(tune_params),
             None,
             None,
+            None,
         );
 
         {
             let latency_us = tune_start.elapsed().as_micros() as u64;
-            let success = !result.inject.is_empty() || result.modified.is_some();
-            let mut tune = self.auto_tune.lock().unwrap();
-            tune.record(&profile.name, success, latency_us);
-            if tune.should_escalate(&profile.name) {
+            self.auto_tune.record_application_by_id(profile.id);
+            if self.auto_tune.should_escalate(&profile.name) {
                 warn!(
                     "AutoTune: '{}' strategy degrading (latency={}us)",
                     profile.name, latency_us
@@ -1557,6 +2486,7 @@ impl ProcessingPipeline {
                 modified: Some(modified),
                 inject_protocol: InjectProtocol::Udp,
                 inter_delay_us: inter_delay,
+                inject_direction: result.inject_direction,
             });
         }
         Ok(PacketDecision::Desync {
@@ -1564,6 +2494,7 @@ impl ProcessingPipeline {
             modified: None,
             inject_protocol: InjectProtocol::Udp,
             inter_delay_us: inter_delay,
+            inject_direction: result.inject_direction,
         })
     }
 
@@ -1578,7 +2509,7 @@ impl ProcessingPipeline {
 
         // T43: HTTP не использует is_resumption — передаём None
         let tune_start = Instant::now();
-        let auto_tune_override = self.auto_tune.lock().unwrap().recommend(&profile.name);
+        let auto_tune_override = self.auto_tune.recommend_by_id(profile.id);
         let mut tune_params = profile.merged_params(&auto_tune_override);
         if self.config.hop_tab_enabled && tune_params.fake_ttl_offset.is_none() {
             tune_params.fake_ttl_offset = self.hop_tab.fake_ttl_for_ip(&cp.dst_ip);
@@ -1590,14 +2521,13 @@ impl ProcessingPipeline {
             Some(tune_params),
             None,
             None,
+            None,
         );
 
         {
             let latency_us = tune_start.elapsed().as_micros() as u64;
-            let success = !result.inject.is_empty() || result.modified.is_some();
-            let mut tune = self.auto_tune.lock().unwrap();
-            tune.record(&profile.name, success, latency_us);
-            if tune.should_escalate(&profile.name) {
+            self.auto_tune.record_application_by_id(profile.id);
+            if self.auto_tune.should_escalate(&profile.name) {
                 warn!(
                     "AutoTune: '{}' strategy degrading (latency={}us)",
                     profile.name, latency_us
@@ -1620,6 +2550,7 @@ impl ProcessingPipeline {
                 modified: Some(modified),
                 inject_protocol: InjectProtocol::Tcp,
                 inter_delay_us: inter_delay,
+                inject_direction: result.inject_direction,
             });
         }
         Ok(PacketDecision::Desync {
@@ -1627,6 +2558,7 @@ impl ProcessingPipeline {
             modified: None,
             inject_protocol: InjectProtocol::Tcp,
             inter_delay_us: inter_delay,
+            inject_direction: result.inject_direction,
         })
     }
 
@@ -1700,8 +2632,7 @@ impl ProcessingPipeline {
             let profile = self.profile_registry.get("tcp_window_clamp");
             if let Some(profile) = profile {
                 let tune_start = Instant::now();
-                let auto_tune_override =
-                    self.auto_tune.lock().unwrap().recommend("tcp_window_clamp");
+                let auto_tune_override = self.auto_tune.recommend_by_id(profile.id);
                 let tune_params = profile.merged_params(&auto_tune_override);
 
                 let result = self.apply_desync_sync(
@@ -1711,14 +2642,11 @@ impl ProcessingPipeline {
                     Some(tune_params),
                     None,
                     None,
+                    None,
                 );
 
                 let latency_us = tune_start.elapsed().as_micros() as u64;
-                let success = !result.inject.is_empty() || result.modified.is_some();
-                self.auto_tune
-                    .lock()
-                    .unwrap()
-                    .record("tcp_window_clamp", success, latency_us);
+                self.auto_tune.record_application_by_id(profile.id);
 
                 if result.drop {
                     return Ok(PacketDecision::Drop);
@@ -1732,6 +2660,7 @@ impl ProcessingPipeline {
                         modified: Some(modified),
                         inject_protocol: InjectProtocol::Tcp,
                         inter_delay_us: result.inter_delay_us,
+                        inject_direction: result.inject_direction,
                     });
                 }
                 if !result.inject.is_empty() {
@@ -1740,6 +2669,7 @@ impl ProcessingPipeline {
                         modified: None,
                         inject_protocol: InjectProtocol::Tcp,
                         inter_delay_us: result.inter_delay_us,
+                        inject_direction: result.inject_direction,
                     });
                 }
             }
@@ -1748,7 +2678,7 @@ impl ProcessingPipeline {
             let profile = self.profile_registry.get("tcp_mss_clamp");
             if let Some(profile) = profile {
                 let tune_start = Instant::now();
-                let auto_tune_override = self.auto_tune.lock().unwrap().recommend("tcp_mss_clamp");
+                let auto_tune_override = self.auto_tune.recommend_by_id(profile.id);
                 let tune_params = profile.merged_params(&auto_tune_override);
 
                 let result = self.apply_desync_sync(
@@ -1758,14 +2688,11 @@ impl ProcessingPipeline {
                     Some(tune_params),
                     None,
                     None,
+                    None,
                 );
 
                 let latency_us = tune_start.elapsed().as_micros() as u64;
-                let success = !result.inject.is_empty() || result.modified.is_some();
-                self.auto_tune
-                    .lock()
-                    .unwrap()
-                    .record("tcp_mss_clamp", success, latency_us);
+                self.auto_tune.record_application_by_id(profile.id);
 
                 if result.drop {
                     return Ok(PacketDecision::Drop);
@@ -1779,6 +2706,7 @@ impl ProcessingPipeline {
                         modified: Some(modified),
                         inject_protocol: InjectProtocol::Tcp,
                         inter_delay_us: result.inter_delay_us,
+                        inject_direction: result.inject_direction,
                     });
                 }
                 if !result.inject.is_empty() {
@@ -1787,6 +2715,7 @@ impl ProcessingPipeline {
                         modified: None,
                         inject_protocol: InjectProtocol::Tcp,
                         inter_delay_us: result.inter_delay_us,
+                        inject_direction: result.inject_direction,
                     });
                 }
             }
@@ -1797,10 +2726,7 @@ impl ProcessingPipeline {
 
     /// T57: Проверяет — активирован ли профиль (через probe recommendation или manual override).
     fn is_profile_activated(&self, profile_name: &str) -> bool {
-        self.auto_tune
-            .lock()
-            .unwrap()
-            .is_strategy_active(profile_name)
+        self.auto_tune.is_strategy_active(profile_name)
     }
 
     /// T57: Проверяет — нужно ли перенаправить пакет через SOCKS5 proxy.
@@ -1859,14 +2785,15 @@ impl ProcessingPipeline {
 
             // Переписываем dst в самом пакете на Localhost:REDIRECTOR_PORT
             let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-            let modified = crate::proxy::rewrite::rewrite_dst_addr(
-                &captured.data,
+            let modified = crate::proxy::rewrite::rewrite_dst_addr_cow(
+                captured.data.clone(),
                 localhost,
                 17650, // REDIRECTOR_PORT
+                &self.stats,
             )?;
 
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            return Ok(PacketDecision::Modify(modified.into()));
+            return Ok(PacketDecision::Modify(modified));
         }
 
         Ok(PacketDecision::Forward)
@@ -1888,6 +2815,7 @@ impl ProcessingPipeline {
                 modified,
                 inject_protocol,
                 inter_delay_us,
+                inject_direction,
             } => {
                 // T60: Register RST for Circuit Breaker
                 for inject_pkt in inject.iter() {
@@ -1903,19 +2831,51 @@ impl ProcessingPipeline {
                 }
 
                 for (i, inject_pkt) in inject.iter().enumerate() {
-                    if i > 0 && inter_delay_us > 0 {
-                        std::thread::sleep(Duration::from_micros(inter_delay_us as u64));
-                    }
-                    match inject_protocol {
-                        InjectProtocol::Tcp => {
-                            self.inject_tcp_packet_sync(inject_pkt.clone(), &captured.addr);
+                    let addr = match inject_direction {
+                        crate::desync::InjectDirection::ForceOutbound => {
+                            let mut a = captured.addr.clone();
+                            a.set_outbound(true);
+                            a
                         }
-                        InjectProtocol::Udp => {
-                            let pkt_clone = inject_pkt.clone();
-                            if let Err(e) = self.packet_engine.inject_raw_udp(&pkt_clone) {
-                                warn!("Failed to inject UDP desync packet: {}", e);
+                        crate::desync::InjectDirection::ForceInbound => {
+                            let mut a = captured.addr.clone();
+                            a.set_outbound(false);
+                            a
+                        }
+                        _ => captured.addr.clone(), // PreserveOriginal / DerivedFromPacketTuple
+                    };
+
+                    if i > 0 && inter_delay_us > 0 {
+                        if !self.delayed_inject.try_schedule(
+                            inter_delay_us * i as u32,
+                            inject_pkt.clone(),
+                            addr.clone(),
+                        ) {
+                            match inject_protocol {
+                                InjectProtocol::Tcp => {
+                                    self.inject_tcp_packet_sync(inject_pkt.clone(), &addr);
+                                }
+                                InjectProtocol::Udp => {
+                                    let pkt_clone = inject_pkt.clone();
+                                    if let Err(e) = self.packet_engine.inject_raw_udp(&pkt_clone) {
+                                        warn!("Failed to inject UDP desync packet: {}", e);
+                                    }
+                                    self.buf_pool.release_bytes(pkt_clone);
+                                }
                             }
-                            self.buf_pool.release_bytes(pkt_clone);
+                        }
+                    } else {
+                        match inject_protocol {
+                            InjectProtocol::Tcp => {
+                                self.inject_tcp_packet_sync(inject_pkt.clone(), &addr);
+                            }
+                            InjectProtocol::Udp => {
+                                let pkt_clone = inject_pkt.clone();
+                                if let Err(e) = self.packet_engine.inject_raw_udp(&pkt_clone) {
+                                    warn!("Failed to inject UDP desync packet: {}", e);
+                                }
+                                self.buf_pool.release_bytes(pkt_clone);
+                            }
                         }
                     }
                     self.stats.fake_ch_injected.fetch_add(1, Ordering::Relaxed);
@@ -1952,7 +2912,7 @@ impl ProcessingPipeline {
 
     /// Получает рекомендованные AutoTune параметры для стратегии.
     pub fn get_tuned_config(&self, strategy_name: &str) -> TuneParams {
-        self.auto_tune.lock().unwrap().recommend(strategy_name)
+        self.auto_tune.recommend(strategy_name)
     }
 
     pub fn stats(&self) -> &ProcessingStats {
@@ -1970,9 +2930,9 @@ impl ProcessingPipeline {
 }
 
 #[derive(Clone)]
-pub(crate) struct CapturedPacket {
-    data: bytes::Bytes,
-    addr: WinDivertAddress<NetworkLayer>,
+pub struct CapturedPacket {
+    pub data: bytes::Bytes,
+    pub addr: WinDivertAddress<NetworkLayer>,
 }
 
 /// Cached list of local IP addresses, populated once at startup.
@@ -1989,21 +2949,6 @@ pub fn refresh_local_ips() {
         }
         Arc::new(ips)
     });
-}
-
-/// Convert an IP address to a u64 for hashing/conn_id purposes.
-/// For IPv4: zero-extend the 32-bit value.
-/// For IPv6: XOR-fold upper and lower 64 bits.
-fn ip_to_u64(ip: IpAddr) -> u64 {
-    match ip {
-        IpAddr::V4(v4) => v4.to_bits() as u64,
-        IpAddr::V6(v6) => {
-            let bits = v6.to_bits();
-            let upper = (bits >> 64) as u64;
-            let lower = bits as u64;
-            upper ^ lower
-        }
-    }
 }
 
 /// Fast cached check: does `src_ip` belong to a local interface or private range?
@@ -2034,6 +2979,14 @@ pub fn is_outbound_cached(src_ip: IpAddr) -> bool {
     }
 }
 
+fn is_quic_initial_check(payload: &[u8]) -> bool {
+    payload.len() >= 5
+        && (payload[0] & 0x80) != 0
+        && (payload[0] & 0x40) != 0
+        && (payload[0] & 0x30) == 0x00
+        && payload[1..5] != [0, 0, 0, 0]
+}
+
 impl Default for ProcessingPipeline {
     fn default() -> Self {
         Self::new_api_only(ProcessingConfig::default())
@@ -2043,6 +2996,16 @@ impl Default for ProcessingPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn awg_state_is_shared_not_unwrapped() {
+        let state =
+            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None::<std::sync::Arc<()>>));
+        let cloned = state.clone();
+        assert_eq!(std::sync::Arc::strong_count(&state), 2);
+        drop(cloned);
+        assert_eq!(std::sync::Arc::strong_count(&state), 1);
+    }
 
     /// Строит minimally-valid TLS ClientHello с session_ticket extension заданной длины.
     ///

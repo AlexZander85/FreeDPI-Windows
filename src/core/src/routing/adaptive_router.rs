@@ -291,14 +291,17 @@ impl AdaptiveRouter {
         // 3c. Desync success_rate < threshold → Proxy fallback
         let metrics = auto_tune.get_metrics(profile_name);
         if let Some(m) = metrics {
-            let success_rate = m.success_rate();
-            if success_rate < self.config.desync_failure_threshold {
-                debug!(
-                    "Routing: desync success_rate={:.0}% < {:.0}% → Proxy fallback",
-                    success_rate * 100.0,
-                    self.config.desync_failure_threshold * 100.0
-                );
-                return RoutingDecision::Proxy;
+            let total = m.success_count + m.fail_count;
+            if total > 0 {
+                let success_rate = m.success_rate();
+                if success_rate < self.config.desync_failure_threshold {
+                    debug!(
+                        "Routing: desync success_rate={:.0}% < {:.0}% → Proxy fallback",
+                        success_rate * 100.0,
+                        self.config.desync_failure_threshold * 100.0
+                    );
+                    return RoutingDecision::Proxy;
+                }
             }
         }
 

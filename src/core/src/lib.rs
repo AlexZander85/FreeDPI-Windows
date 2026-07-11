@@ -14,6 +14,7 @@
 )]
 
 pub mod adaptive;
+pub mod capture_budget;
 pub mod classifier;
 pub mod config;
 pub mod conntrack;
@@ -23,11 +24,16 @@ pub mod dns;
 pub mod engine;
 pub mod infra;
 pub mod packet_engine;
+pub mod packet_invariants;
 pub mod probe;
 pub mod proxy;
 pub mod routing;
 pub mod socks;
 pub mod split_tunnel;
+pub mod tls_reassembly;
+pub mod windivert_ext;
+
+pub mod test_support;
 
 use rayon::ThreadPoolBuilder;
 use std::sync::OnceLock;

@@ -26,6 +26,8 @@ pub mod http;
 pub mod ip;
 pub mod obfs;
 pub mod quic;
+pub use quic::{QuicFallbackPolicy, QuicInitialBuildError};
+pub mod quarantine;
 pub mod rand;
 pub mod redirect_table;
 pub mod segment_plan;
@@ -40,6 +42,38 @@ use pnet_packet::ipv6::MutableIpv6Packet;
 use pnet_packet::MutablePacket;
 use pnet_packet::Packet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+/// P0-10: Направление инъекции пакетов.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub enum InjectDirection {
+    /// Сохранить направление оригинального пакета (по умолчанию).
+    #[default]
+    PreserveOriginal,
+    /// Всегда отправлять как outbound (от клиента к серверу).
+    ForceOutbound,
+    /// Всегда отправлять как inbound (от сервера к клиенту).
+    ForceInbound,
+    /// Вывести направление из src/dst IP-адресов пакета (будущее).
+    DerivedFromPacketTuple,
+}
+
+/// P0-10: Пакет для инъекции с метаданными направления.
+#[derive(Debug, Clone)]
+pub struct InjectPacket {
+    /// Данные пакета.
+    pub data: bytes::Bytes,
+    /// Направление инъекции.
+    pub direction: InjectDirection,
+}
+
+impl From<bytes::Bytes> for InjectPacket {
+    fn from(data: bytes::Bytes) -> Self {
+        Self {
+            data,
+            direction: InjectDirection::PreserveOriginal,
+        }
+    }
+}
 
 /// Результат применения desync техники.
 ///
@@ -56,10 +90,8 @@ pub struct DesyncResult {
     pub inter_delay_us: u32,
     /// Дропнуть пакет (не отправлять).
     pub drop: bool,
-    /// T44.6: флаг что inject пакеты должны быть отправлены как outbound (от клиента к серверу).
-    /// Устанавливается rst_selective (T11) — RST должен идти к серверу, не к клиенту.
-    /// По умолчанию false (большинство injects идут как inbound от server perspective в WinDivert).
-    pub is_outbound_inject: bool,
+    /// P0-10: Направление инъекции для всех пакетов в `inject`.
+    pub inject_direction: InjectDirection,
 }
 
 impl DesyncResult {
@@ -69,7 +101,7 @@ impl DesyncResult {
             inject: SmallVec::new(),
             inter_delay_us: 0,
             drop: false,
-            is_outbound_inject: false,
+            inject_direction: InjectDirection::PreserveOriginal,
         }
     }
 
@@ -79,7 +111,7 @@ impl DesyncResult {
             inject: SmallVec::new(),
             inter_delay_us: 0,
             drop: false,
-            is_outbound_inject: false,
+            inject_direction: InjectDirection::PreserveOriginal,
         }
     }
 
@@ -89,7 +121,7 @@ impl DesyncResult {
             inject: smallvec![inject.into()],
             inter_delay_us: 0,
             drop: false,
-            is_outbound_inject: false,
+            inject_direction: InjectDirection::PreserveOriginal,
         }
     }
 
@@ -102,7 +134,7 @@ impl DesyncResult {
             inject: smallvec![inject.into()],
             inter_delay_us: 0,
             drop: false,
-            is_outbound_inject: false,
+            inject_direction: InjectDirection::PreserveOriginal,
         }
     }
 
@@ -112,7 +144,7 @@ impl DesyncResult {
             inject: inject.into_iter().collect(),
             inter_delay_us: 0,
             drop: false,
-            is_outbound_inject: false,
+            inject_direction: InjectDirection::PreserveOriginal,
         }
     }
 
@@ -122,7 +154,7 @@ impl DesyncResult {
             inject: SmallVec::new(),
             inter_delay_us: 0,
             drop: true,
-            is_outbound_inject: false,
+            inject_direction: InjectDirection::PreserveOriginal,
         }
     }
 
@@ -226,6 +258,13 @@ pub enum DesyncTechnique {
     QuicConnectionClose,
     QuicStreamReset,
     QuicMaxStreams,
+    QuicInitialInject,
+    QuicShortHeaderPoison,
+    QuicPaddingFlood,
+    DoppelgangerGrease,
+    QuicLongHeaderDrop,
+    QuicNormalizer,
+    UdpCoalescing,
     // === Obfs/Crypto (P6) ===
     Udp2Icmp,
     XorFirst,
@@ -300,6 +339,13 @@ impl DesyncTechnique {
             Self::QuicConnectionClose => "QuicConnectionClose",
             Self::QuicStreamReset => "QuicStreamReset",
             Self::QuicMaxStreams => "QuicMaxStreams",
+            Self::QuicInitialInject => "QuicInitialInject",
+            Self::QuicShortHeaderPoison => "QuicShortHeaderPoison",
+            Self::QuicPaddingFlood => "QuicPaddingFlood",
+            Self::DoppelgangerGrease => "DoppelgangerGrease",
+            Self::QuicLongHeaderDrop => "QuicLongHeaderDrop",
+            Self::QuicNormalizer => "QuicNormalizer",
+            Self::UdpCoalescing => "UdpCoalescing",
             Self::Udp2Icmp => "Udp2Icmp",
             Self::XorFirst => "XorFirst",
             Self::WgObfs => "WgObfs",
@@ -372,6 +418,13 @@ impl DesyncTechnique {
             Self::QuicConnectionClose => "zapret",
             Self::QuicStreamReset => "zapret",
             Self::QuicMaxStreams => "zapret",
+            Self::QuicInitialInject => "byedpi",
+            Self::QuicShortHeaderPoison => "byedpi",
+            Self::QuicPaddingFlood => "byedpi",
+            Self::DoppelgangerGrease => "offveil",
+            Self::QuicLongHeaderDrop => "offveil",
+            Self::QuicNormalizer => "offveil",
+            Self::UdpCoalescing => "zapret",
             Self::Udp2Icmp => "zapret",
             Self::XorFirst => "dpimyass",
             Self::WgObfs => "zapret",
@@ -445,6 +498,13 @@ impl DesyncTechnique {
             | Self::QuicConnectionClose
             | Self::QuicStreamReset
             | Self::QuicMaxStreams
+            | Self::QuicInitialInject
+            | Self::QuicShortHeaderPoison
+            | Self::QuicPaddingFlood
+            | Self::DoppelgangerGrease
+            | Self::QuicLongHeaderDrop
+            | Self::QuicNormalizer
+            | Self::UdpCoalescing
             | Self::Udp2Icmp => TechniqueCategory::Quic,
             Self::XorFirst | Self::WgObfs => TechniqueCategory::Obfs,
             Self::ChaCha20 => TechniqueCategory::Crypto,
@@ -529,6 +589,10 @@ impl DesyncTechnique {
             | Self::QuicRetryInject
             | Self::QuicConnectionClose
             | Self::QuicStreamReset
+            | Self::QuicInitialInject
+            | Self::QuicShortHeaderPoison
+            | Self::QuicPaddingFlood
+            | Self::DoppelgangerGrease
             | Self::SeqSpoof
             | Self::Udp2Icmp => TechniqueEffect::InvalidatesSeq,
             #[allow(deprecated)]
@@ -555,7 +619,11 @@ impl DesyncTechnique {
             | Self::IpFragPrimitives
             | Self::SniMasking
             | Self::QuicBlocking
+            | Self::UdpCoalescing
             | Self::QuicVersionDowngrade => TechniqueEffect::Split,
+
+            // HeaderOnly
+            Self::QuicLongHeaderDrop | Self::QuicNormalizer => TechniqueEffect::HeaderOnly,
 
             // Crypto/Obfs — меняют содержимое payload, но не длину.
             // Классифицируем как HeaderOnly для целей композиции
@@ -596,6 +664,15 @@ pub struct DesyncConfig {
     pub inter_delay_us: u32,
     /// Количество PRNG вызовов между reseed'ами.
     pub reseed_interval: u64,
+    /// P1-02: TTL значение для TtlManipulation (вместо hardcoded 64).
+    pub ttl_value: u8,
+    /// P1-02: Разрешает использовать реальный TTL хоста как `ttl_value`
+    /// вместо фиксированного. Если true, `ttl_value` игнорируется.
+    pub allow_real_ttl_manipulation: bool,
+    /// P1-09: Разрешает применять BadChecksum к реальным пакетам (разрушительная манипуляция).
+    pub allow_destructive_manipulation: bool,
+    /// Политика фолбэка для QUIC
+    pub quic_fallback_policy: quic::QuicFallbackPolicy,
     /// Prebuilt fake ClientHello (lazily initialized).
     pub(crate) fake_ch_payload: std::sync::OnceLock<bytes::Bytes>,
 }
@@ -644,6 +721,10 @@ impl Default for DesyncConfig {
             inject_delay_us: 1000,
             inter_delay_us: 0,
             reseed_interval: 8192,
+            ttl_value: 64,
+            allow_real_ttl_manipulation: false,
+            allow_destructive_manipulation: false,
+            quic_fallback_policy: quic::QuicFallbackPolicy::default(),
             fake_ch_payload: std::sync::OnceLock::new(),
         }
     }
@@ -944,6 +1025,65 @@ impl ParsedIpHeader {
     }
 }
 
+pub struct PacketContext {
+    pub src_ip: IpAddr,
+    pub dst_ip: IpAddr,
+    pub proto: u8,
+    pub src_port: Option<u16>,
+    pub dst_port: Option<u16>,
+    pub ip_header_len: usize,
+    pub transport_header_len: usize,
+    pub payload_offset: usize,
+    pub ttl_or_hop_limit: u8,
+    pub identification: u16,
+}
+
+impl PacketContext {
+    pub fn from_packet(packet: &[u8]) -> Option<Self> {
+        let ip = parse_ip_header(packet)?;
+        let ip_header_len = ip.header_len();
+        let proto = ip.protocol().0;
+        let mut src_port = None;
+        let mut dst_port = None;
+        let mut transport_header_len = 0;
+        let mut payload_offset = ip_header_len;
+
+        if proto == 17 {
+            // UDP
+            let l4 = packet.get(ip_header_len..)?;
+            if l4.len() >= 8 {
+                src_port = Some(u16::from_be_bytes([l4[0], l4[1]]));
+                dst_port = Some(u16::from_be_bytes([l4[2], l4[3]]));
+                transport_header_len = 8;
+                payload_offset = ip_header_len + 8;
+            }
+        } else if proto == 6 {
+            // TCP
+            let l4 = packet.get(ip_header_len..)?;
+            if l4.len() >= 20 {
+                src_port = Some(u16::from_be_bytes([l4[0], l4[1]]));
+                dst_port = Some(u16::from_be_bytes([l4[2], l4[3]]));
+                let tcp_header_len = ((l4[12] >> 4) & 0xF) as usize * 4;
+                transport_header_len = tcp_header_len;
+                payload_offset = ip_header_len + tcp_header_len;
+            }
+        }
+
+        Some(Self {
+            src_ip: ip.src(),
+            dst_ip: ip.dst(),
+            proto,
+            src_port,
+            dst_port,
+            ip_header_len,
+            transport_header_len,
+            payload_offset,
+            ttl_or_hop_limit: ip.ttl(),
+            identification: ip.identification(),
+        })
+    }
+}
+
 /// Парсит TCP пакет (payload после IP header).
 pub fn parse_tcp_packet(packet: &[u8]) -> Option<ParsedTcpPacket<'_>> {
     let tcp = pnet_packet::tcp::TcpPacket::new(packet)?;
@@ -1053,12 +1193,21 @@ pub fn build_ip_packet(
 }
 
 /// Incremental IP/TCP checksum update для одного 16-bit слова.
-/// RFC 1624: HC' = HC - ~m_old + ~m_new
+///
+/// ## RFC 1624
+/// HC' = ~(~HC + ~m + m')
+///
+/// где:
+/// - HC — старый checksum
+/// - m — старое 16-битное слово
+/// - m' — новое 16-битное слово
+///
+/// ## Предыдущая ошибка
+/// Старая реализация использовала `~HC - ~m + ~m'`, что НЕ эквивалентно RFC 1624
+/// и давало неверный checksum на ненулевых начальных значениях.
 #[inline(always)]
 pub fn update_checksum_word(old_csum: u16, old_word: u16, new_word: u16) -> u16 {
-    let mut sum = (!old_csum) as u32;
-    sum = sum.wrapping_sub(!old_word as u32);
-    sum = sum.wrapping_add(!new_word as u32);
+    let mut sum = (!old_csum as u32) + (!old_word as u32) + (new_word as u32);
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
@@ -1236,5 +1385,170 @@ mod tests {
 
         let tcp_src_rewritten = TcpPacket::new(&src_rewritten[20..]).unwrap();
         assert_eq!(tcp_src_rewritten.get_source(), 80);
+    }
+
+    fn build_tls_clienthello_with_sni(sni: &str) -> Vec<u8> {
+        let mut extensions = Vec::new();
+
+        // SNI extension: type = 0x0000
+        let mut sni_ext = Vec::new();
+        let name_bytes = sni.as_bytes();
+        let list_len = 1 + 2 + name_bytes.len();
+        sni_ext.extend_from_slice(&(list_len as u16).to_be_bytes());
+        sni_ext.push(0x00); // host_name type
+        sni_ext.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
+        sni_ext.extend_from_slice(name_bytes);
+
+        extensions.extend_from_slice(&0x0000u16.to_be_bytes());
+        extensions.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&sni_ext);
+
+        let mut handshake = Vec::new();
+        handshake.extend_from_slice(&[0x03, 0x03]); // version
+        handshake.extend_from_slice(&[0u8; 32]); // random
+        handshake.push(0x00); // session id len
+        handshake.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
+        handshake.extend_from_slice(&[0x01, 0x00]); // compression
+
+        handshake.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        handshake.extend_from_slice(&extensions);
+
+        let mut record = Vec::new();
+        record.push(0x16); // Handshake
+        record.extend_from_slice(&[0x03, 0x01]); // version
+        let hs_len = 1 + 3 + handshake.len();
+        record.extend_from_slice(&(hs_len as u16).to_be_bytes());
+
+        record.push(0x01); // ClientHello
+        let hs_len_bytes = (handshake.len() as u32).to_be_bytes();
+        record.extend_from_slice(&hs_len_bytes[1..]);
+        record.extend_from_slice(&handshake);
+
+        let total_len = 40 + record.len();
+        let mut pkt = vec![0u8; total_len];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        pkt[9] = 6; // TCP
+        pkt[12..16].copy_from_slice(&[192, 168, 1, 1]);
+        pkt[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        let ip_csum = ipv4_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
+        pkt[24..28].copy_from_slice(&1000u32.to_be_bytes());
+        pkt[32] = 0x50;
+        pkt[33] = 0x18;
+
+        pkt[40..].copy_from_slice(&record);
+
+        let tcp_csum = tcp_checksum(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            &pkt[20..],
+        );
+        pkt[36..38].copy_from_slice(&tcp_csum.to_be_bytes());
+
+        pkt
+    }
+
+    #[test]
+    fn sni_masking_is_not_passthrough_for_valid_clienthello() {
+        let pkt = build_tls_clienthello_with_sni("blocked.example");
+        let cfg = DesyncConfig::default();
+        let hop_tab = std::sync::Arc::new(crate::adaptive::hop_tab::HopTab::new());
+        let conntrack = std::sync::Arc::new(crate::conntrack::Conntrack::default());
+        let mut group = group::DesyncGroup::with_context(cfg, hop_tab, conntrack);
+        group.add(DesyncTechnique::SniMasking);
+
+        let out = group.apply(&bytes::Bytes::from(pkt), None, None, None);
+        assert!(
+            out.modified.is_some() || !out.inject.is_empty(),
+            "SniMasking must modify or inject for valid CH"
+        );
+    }
+
+    #[test]
+    fn intended_helpers_have_reachable_techniques() {
+        let reachable = [
+            "MultiSplit",
+            "MultiDisorder",
+            "HostFakeSplit",
+            "FakeDataSplit",
+            "FakeDataDisorder",
+            "TcpSeg",
+            "SynData",
+            "SynAckSplit",
+            "WinSize",
+            "SynHide",
+            "FakeSni",
+            "OobInjection",
+            "TcpPreopen",
+            "MssClamp",
+            "AckSuppress",
+            "PktReorder",
+            "RstSelective",
+            "SynFloodDecoy",
+            "WinScaleManip",
+            "Disorder",
+            "MultidisorderNew",
+            "Disoob",
+            "HostFake",
+            "FakeRst",
+            "ByteByByte",
+            "UnidirFrag",
+            "PortShuffle",
+            "Wclamp",
+            "TsMd5",
+            "SeqSpoof",
+            "FragOverlap",
+            "BadChecksum",
+            "TtlManipulation",
+            "IpFragPrimitives",
+            "RstDropIpId",
+            "DscpRandom",
+            "MutualSpoof",
+            "TlsRecordFrag",
+            "TlsRecordPad",
+            "SniMasking",
+            "SniMicrofrag",
+            "TlsRecordRewrap",
+            "TlsVersionSpoof",
+            "SniRecordFrag",
+            "QuicBlocking",
+            "QuicVersionDowngrade",
+            "QuicRetryInject",
+            "QuicConnectionClose",
+            "QuicStreamReset",
+            "QuicMaxStreams",
+            "QuicInitialInject",
+            "QuicShortHeaderPoison",
+            "QuicPaddingFlood",
+            "DoppelgangerGrease",
+            "QuicLongHeaderDrop",
+            "QuicNormalizer",
+            "UdpCoalescing",
+            "Udp2Icmp",
+            "XorFirst",
+            "WgObfs",
+            "ChaCha20",
+            "ReverseFragmentOrder",
+        ];
+
+        for expected in [
+            "entropy_padding",
+            "ip_ppxor",
+            "poisson_delay_fast",
+            "h2_hpack_aware",
+            "host_obfuscation",
+            "hpack_bomber",
+        ] {
+            assert!(
+                reachable.contains(&expected)
+                    || crate::desync::quarantine::is_explicitly_quarantined(expected),
+                "{} is implemented but neither reachable nor quarantined",
+                expected
+            );
+        }
     }
 }

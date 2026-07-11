@@ -13,7 +13,33 @@
 //! Адаптировано из [zapret](https://github.com/bol-van/zapret) и
 //! [offveil](https://github.com/nickel-org/offveil).
 
-use crate::desync::{ipv4_checksum, parse_ip_header, DesyncResult};
+use crate::desync::{ipv4_checksum, parse_ip_header, DesyncResult, PacketContext};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub static QUIC_INITIAL_CRYPTO_BUILD_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static QUIC_FALLBACK_CONTROLLED_DROP_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static QUIC_FALLBACK_VALID_CLOSE_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static QUIC_FALLBACK_INVALID_CLOSE_BLOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum QuicFallbackPolicy {
+    #[default]
+    ControlledDropJitter,
+    ValidConnectionClose,
+    ValidRetry,
+    PassThrough,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuicInitialBuildError {
+    InvalidOriginalPacket,
+    CryptoDeriveFailed,
+    AeadFailed,
+    HeaderProtectionFailed,
+    SizeInvariantFailed,
+    InvalidSni,
+}
+
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
 use aes::Aes128;
@@ -62,16 +88,19 @@ const QUIC_INITIAL_TYPE: u8 = 0xC0; // Fixed bit + Long Header + Initial
 /// Packet Number (1-4 bytes)
 /// Payload (encrypted)
 /// ```
-pub fn quic_initial_inject(packet: &[u8], fake_sni: &str, fake_ttl_offset: u8) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
-    };
-
-    let udp_data = &packet[ip.header_len() + 8..]; // skip UDP header
-    if udp_data.len() < 20 {
+pub fn quic_initial_inject(
+    packet: &[u8],
+    ctx: &PacketContext,
+    fake_sni: &str,
+    fake_ttl_offset: u8,
+) -> DesyncResult {
+    if ctx.proto != 17 {
         return DesyncResult::passthrough();
     }
+    let udp_data = match packet.get(ctx.payload_offset..) {
+        Some(p) if p.len() >= 20 => p,
+        _ => return DesyncResult::passthrough(),
+    };
 
     // Проверяем, что это QUIC Long Header (первый бит = 1)
     if udp_data[0] & 0x80 == 0 {
@@ -103,20 +132,27 @@ pub fn quic_initial_inject(packet: &[u8], fake_sni: &str, fake_ttl_offset: u8) -
     let scid: &[u8] = &udp_data[scid_offset + 1..scid_end];
 
     // Строим fake QUIC Initial пакет с CRYPTO frame + шифрованием
-    let fake_payload = build_quic_initial_with_crypto(dcid, scid, fake_sni)
-        .unwrap_or_else(|| build_quic_initial(dcid, fake_sni));
+    let fake_payload = match build_quic_initial_with_crypto(dcid, scid, fake_sni) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("QUIC Initial crypto build failed: {:?}; skipping injection to avoid wire-visible invalid QUIC", e);
+            QUIC_INITIAL_CRYPTO_BUILD_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return DesyncResult::passthrough();
+        }
+    };
 
     // Fake UDP дейтаграмм
-    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
-    let fake_src_port = extract_src_port(packet).unwrap_or(443);
+    let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
+    let src_port = ctx.src_port.unwrap_or(443);
+    let dst_port = ctx.dst_port.unwrap_or(443);
     let fake_udp = build_udp_packet(
-        ip.src(),
-        ip.dst(),
-        fake_src_port,
-        443,
+        ctx.src_ip,
+        ctx.dst_ip,
+        src_port,
+        dst_port,
         &fake_payload,
         fake_ttl,
-        ip.identification().wrapping_add(1),
+        ctx.identification.wrapping_add(1),
     );
 
     debug!(
@@ -133,16 +169,18 @@ pub fn quic_initial_inject(packet: &[u8], fake_sni: &str, fake_ttl_offset: u8) -
 /// ## Принцип
 /// Отравление short header пакетов (0-RTT, 1-RTT) fake данными.
 /// DPI может потерять sync с QUIC потоком.
-pub fn quic_short_header_poison(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
-    };
-
-    let udp_data = &packet[ip.header_len() + 8..];
-    if udp_data.is_empty() {
+pub fn quic_short_header_poison(
+    packet: &[u8],
+    ctx: &PacketContext,
+    fake_ttl_offset: u8,
+) -> DesyncResult {
+    if ctx.proto != 17 {
         return DesyncResult::passthrough();
     }
+    let udp_data = match packet.get(ctx.payload_offset..) {
+        Some(p) if !p.is_empty() => p,
+        _ => return DesyncResult::passthrough(),
+    };
 
     // Short Header: первый бит = 0
     if udp_data[0] & 0x80 != 0 {
@@ -151,20 +189,18 @@ pub fn quic_short_header_poison(packet: &[u8], fake_ttl_offset: u8) -> DesyncRes
 
     // Фейковый short header пакет (8 байт padding)
     let fake_payload = vec![0u8; 8];
-    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
-
-    // Извлекаем source port из UDP
-    let udp = pnet_packet::udp::UdpPacket::new(&packet[ip.header_len()..]);
-    let src_port = udp.map(|u| u.get_source()).unwrap_or(443);
+    let src_port = ctx.src_port.unwrap_or(443);
+    let dst_port = ctx.dst_port.unwrap_or(443);
+    let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
 
     let fake_udp = build_udp_packet(
-        ip.src(),
-        ip.dst(),
+        ctx.src_ip,
+        ctx.dst_ip,
         src_port,
-        443,
+        dst_port,
         &fake_payload,
         fake_ttl,
-        ip.identification().wrapping_add(1),
+        ctx.identification.wrapping_add(1),
     );
 
     debug!("[QUIC] Short header poison: 8 bytes fake payload");
@@ -178,14 +214,18 @@ pub fn quic_short_header_poison(packet: &[u8], fake_ttl_offset: u8) -> DesyncRes
 /// Отправляем несколько padding-only пакетов для переполнения
 /// conntrack DPI. QUIC padding пакеты не содержат полезных данных,
 /// но DPI должен их обрабатывать.
-pub fn quic_padding_flood(packet: &[u8], count: usize, fake_ttl_offset: u8) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
-    };
-
-    let src_port = extract_src_port(packet).unwrap_or(443);
-    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
+pub fn quic_padding_flood(
+    packet: &[u8],
+    ctx: &PacketContext,
+    count: usize,
+    fake_ttl_offset: u8,
+) -> DesyncResult {
+    if ctx.proto != 17 {
+        return DesyncResult::passthrough();
+    }
+    let src_port = ctx.src_port.unwrap_or(443);
+    let dst_port = ctx.dst_port.unwrap_or(443);
+    let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
     let mut inject = Vec::with_capacity(count);
 
     for _ in 0..count {
@@ -195,10 +235,10 @@ pub fn quic_padding_flood(packet: &[u8], count: usize, fake_ttl_offset: u8) -> D
 
         let ip_id = crate::desync::rand::random_u32() as u16;
         let fake_udp = build_udp_packet(
-            ip.src(),
-            ip.dst(),
+            ctx.src_ip,
+            ctx.dst_ip,
             src_port,
-            443,
+            dst_port,
             &fake_payload,
             fake_ttl,
             ip_id,
@@ -216,11 +256,15 @@ pub fn quic_padding_flood(packet: &[u8], count: usize, fake_ttl_offset: u8) -> D
 /// ## Принцип
 /// Объединяем несколько маленьких UDP пакетов в один большой.
 /// DPI может не обработать коалесцированный пакет.
-pub fn udp_coalescing(packet: &[u8], extra_packets: &[&[u8]], fake_ttl_offset: u8) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
-    };
+pub fn udp_coalescing(
+    packet: &[u8],
+    ctx: &PacketContext,
+    extra_packets: &[&[u8]],
+    fake_ttl_offset: u8,
+) -> DesyncResult {
+    if ctx.proto != 17 {
+        return DesyncResult::passthrough();
+    }
 
     if extra_packets.is_empty() {
         return DesyncResult::passthrough();
@@ -228,23 +272,24 @@ pub fn udp_coalescing(packet: &[u8], extra_packets: &[&[u8]], fake_ttl_offset: u
 
     // Объединяем payload
     let mut combined = Vec::new();
-    let udp_start = ip.header_len() + 8;
-    if udp_start < packet.len() {
-        combined.extend_from_slice(&packet[udp_start..]);
+    if let Some(udp_payload) = packet.get(ctx.payload_offset..) {
+        combined.extend_from_slice(udp_payload);
     }
     for extra in extra_packets {
         combined.extend_from_slice(extra);
     }
 
-    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
+    let src_port = ctx.src_port.unwrap_or(443);
+    let dst_port = ctx.dst_port.unwrap_or(443);
+    let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
     let combined_udp = build_udp_packet(
-        ip.src(),
-        ip.dst(),
-        extract_src_port(packet).unwrap_or(443),
-        443,
+        ctx.src_ip,
+        ctx.dst_ip,
+        src_port,
+        dst_port,
         &combined,
         fake_ttl,
-        ip.identification().wrapping_add(1),
+        ctx.identification.wrapping_add(1),
     );
 
     debug!(
@@ -261,11 +306,14 @@ pub fn udp_coalescing(packet: &[u8], extra_packets: &[&[u8]], fake_ttl_offset: u
 /// ## Принцип
 /// Отправляем пакет с GREASE версией (0x?a?a?a?a). DPI может
 /// не распознать QUIC и пропустить пакет.
-pub fn doppelganger_grease(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
-    };
+pub fn doppelganger_grease(
+    packet: &[u8],
+    ctx: &PacketContext,
+    fake_ttl_offset: u8,
+) -> DesyncResult {
+    if ctx.proto != 17 {
+        return DesyncResult::passthrough();
+    }
 
     // GREASE version: 0x?a?a?a?a (RFC 8701)
     let grease_version: u32 = 0x0a0a_0a0a;
@@ -274,15 +322,17 @@ pub fn doppelganger_grease(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
     fake_payload.extend_from_slice(&grease_version.to_be_bytes());
     fake_payload.extend_from_slice(&[0u8; 8]); // CID placeholder
 
-    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
+    let src_port = ctx.src_port.unwrap_or(443);
+    let dst_port = ctx.dst_port.unwrap_or(443);
+    let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src(),
-        ip.dst(),
-        extract_src_port(packet).unwrap_or(443),
-        443,
+        ctx.src_ip,
+        ctx.dst_ip,
+        src_port,
+        dst_port,
         &fake_payload,
         fake_ttl,
-        ip.identification().wrapping_add(1),
+        ctx.identification.wrapping_add(1),
     );
 
     debug!("[QUIC] Doppelganger GREASE: version={:#x}", grease_version);
@@ -299,16 +349,14 @@ pub fn doppelganger_grease(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
 ///
 /// Проверяем: если пакет — QUIC Long Header (бит 0x80 установлен)
 /// и это ответ (не outbound) — дропаем.
-pub fn quic_long_header_drop(packet: &[u8]) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
-    };
-
-    let udp_data = &packet[ip.header_len() + 8..];
-    if udp_data.is_empty() {
+pub fn quic_long_header_drop(packet: &[u8], ctx: &PacketContext) -> DesyncResult {
+    if ctx.proto != 17 {
         return DesyncResult::passthrough();
     }
+    let udp_data = match packet.get(ctx.payload_offset..) {
+        Some(p) if !p.is_empty() => p,
+        _ => return DesyncResult::passthrough(),
+    };
 
     // Long Header: первый бит = 1
     if udp_data[0] & 0x80 == 0 {
@@ -317,7 +365,7 @@ pub fn quic_long_header_drop(packet: &[u8]) -> DesyncResult {
 
     debug!(
         "[OF8] LongHeaderDrop: dropping QUIC Long Header packet from {}",
-        ip.src()
+        ctx.src_ip
     );
 
     DesyncResult::drop_packet()
@@ -328,16 +376,14 @@ pub fn quic_long_header_drop(packet: &[u8]) -> DesyncResult {
 /// ## Принцип
 /// Нормализуем QUIC Initial пакет: убираем GREASE, исправляем
 /// version, чистим padding. DPI может сбиться на аномальных пакетах.
-pub fn quic_normalizer(packet: &[u8]) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
-    };
-
-    let udp_data = &packet[ip.header_len() + 8..];
-    if udp_data.len() < 5 {
+pub fn quic_normalizer(packet: &[u8], ctx: &PacketContext) -> DesyncResult {
+    if ctx.proto != 17 {
         return DesyncResult::passthrough();
     }
+    let udp_data = match packet.get(ctx.payload_offset..) {
+        Some(p) if p.len() >= 5 => p,
+        _ => return DesyncResult::passthrough(),
+    };
 
     // Проверяем Long Header
     if udp_data[0] & 0x80 == 0 {
@@ -349,7 +395,7 @@ pub fn quic_normalizer(packet: &[u8]) -> DesyncResult {
     // Нормализуем GREASE версию на Version 1
     if (version & 0x0a0a_0a0a) == 0x0a0a_0a0a {
         let mut modified = packet.to_vec();
-        let version_offset = ip.header_len() + 8 + 1; // +1 for first byte
+        let version_offset = ctx.payload_offset + 1; // +1 for first byte
         modified[version_offset..version_offset + 4].copy_from_slice(&QUIC_VERSION_1.to_be_bytes());
 
         // Пересчитываем IP checksum
@@ -372,30 +418,110 @@ pub fn quic_normalizer(packet: &[u8]) -> DesyncResult {
 /// Блокируем все QUIC пакеты (UDP:443). Клиент вынужден
 /// использовать TCP fallback. DPI может не блокировать TCP
 /// (или блокировать слабее).
-pub fn quic_blocking(packet: &[u8]) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
+pub fn quic_blocking(
+    packet: &[u8],
+    ctx: &PacketContext,
+    policy: QuicFallbackPolicy,
+    fake_ttl_offset: u8,
+    dropped_initials_count: &mut u8,
+) -> DesyncResult {
+    if ctx.proto != 17 {
+        return DesyncResult::passthrough();
+    }
+    let udp_data = match packet.get(ctx.payload_offset..) {
+        Some(p) if p.len() >= 8 => p,
+        _ => return DesyncResult::passthrough(),
     };
-
-    // Проверяем UDP:443
-    if ip.protocol().0 != 17 {
-        return DesyncResult::passthrough();
-    }
-
-    let udp_data = &packet[ip.header_len()..];
-    if udp_data.len() < 8 {
-        return DesyncResult::passthrough();
-    }
-
-    let dst_port = u16::from_be_bytes([udp_data[2], udp_data[3]]);
+    let dst_port = ctx.dst_port.unwrap_or(443);
     if dst_port != 443 {
         return DesyncResult::passthrough();
     }
 
-    debug!("[Z20] QUIC Blocking: dropping UDP:443 from {}", ip.src());
+    match policy {
+        QuicFallbackPolicy::PassThrough => DesyncResult::passthrough(),
+        QuicFallbackPolicy::ControlledDropJitter => {
+            // Check if this is a QUIC Long Header (Initial) packet
+            let is_initial = udp_data[0] & 0x80 != 0 && {
+                let version =
+                    u32::from_be_bytes([udp_data[1], udp_data[2], udp_data[3], udp_data[4]]);
+                version != 0 && (udp_data[0] & 0x30 == 0x00) // Initial packet type
+            };
 
-    DesyncResult::drop_packet()
+            if is_initial {
+                if *dropped_initials_count < 3 {
+                    *dropped_initials_count += 1;
+                    QUIC_FALLBACK_CONTROLLED_DROP_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    debug!("[Z20] QUIC Blocking (ControlledDropJitter): dropping Initial packet. Count: {}", *dropped_initials_count);
+                    DesyncResult::drop_packet()
+                } else {
+                    debug!("[Z20] QUIC Blocking (ControlledDropJitter): passing through Initial packet (limit 3 reached)");
+                    DesyncResult::passthrough()
+                }
+            } else {
+                DesyncResult::passthrough()
+            }
+        }
+        QuicFallbackPolicy::ValidConnectionClose => {
+            let is_initial = udp_data[0] & 0x80 != 0 && {
+                let version =
+                    u32::from_be_bytes([udp_data[1], udp_data[2], udp_data[3], udp_data[4]]);
+                version != 0 && (udp_data[0] & 0x30 == 0x00)
+            };
+            if is_initial {
+                let dcid_len = udp_data[5] as usize;
+                if 6 + dcid_len <= udp_data.len() {
+                    let dcid = &udp_data[6..6 + dcid_len];
+                    let scid_offset = 6 + dcid_len;
+                    if scid_offset < udp_data.len() {
+                        let scid_len = udp_data[scid_offset] as usize;
+                        let scid_end = scid_offset + 1 + scid_len;
+                        if scid_end <= udp_data.len() {
+                            let scid = &udp_data[scid_offset + 1..scid_end];
+                            if let Ok(res) = build_quic_connection_close_packet(
+                                dcid,
+                                scid,
+                                0x02,
+                                fake_ttl_offset,
+                                ctx,
+                            ) {
+                                QUIC_FALLBACK_VALID_CLOSE_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                return res;
+                            }
+                        }
+                    }
+                }
+                QUIC_FALLBACK_INVALID_CLOSE_BLOCKED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+            DesyncResult::drop_packet()
+        }
+        QuicFallbackPolicy::ValidRetry => {
+            let is_initial = udp_data[0] & 0x80 != 0 && {
+                let version =
+                    u32::from_be_bytes([udp_data[1], udp_data[2], udp_data[3], udp_data[4]]);
+                version != 0 && (udp_data[0] & 0x30 == 0x00)
+            };
+            if is_initial {
+                let dcid_len = udp_data[5] as usize;
+                if 6 + dcid_len <= udp_data.len() {
+                    let dcid = &udp_data[6..6 + dcid_len];
+                    let scid_offset = 6 + dcid_len;
+                    if scid_offset < udp_data.len() {
+                        let scid_len = udp_data[scid_offset] as usize;
+                        let scid_end = scid_offset + 1 + scid_len;
+                        if scid_end <= udp_data.len() {
+                            let scid = &udp_data[scid_offset + 1..scid_end];
+                            if let Ok(res) =
+                                build_quic_retry_packet(dcid, scid, fake_ttl_offset, ctx)
+                            {
+                                return res;
+                            }
+                        }
+                    }
+                }
+            }
+            DesyncResult::drop_packet()
+        }
+    }
 }
 
 /// [Z21] QUIC Version Downgrade: принудительный downgrade версии.
@@ -406,50 +532,60 @@ pub fn quic_blocking(packet: &[u8]) -> DesyncResult {
 /// DPI может потерять sync с QUIC потоком.
 pub fn quic_version_downgrade(
     packet: &[u8],
+    ctx: &PacketContext,
     fake_version: u32,
     fake_ttl_offset: u8,
 ) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
+    if ctx.proto != 17 {
+        return DesyncResult::passthrough();
+    }
+    let udp_data = match packet.get(ctx.payload_offset..) {
+        Some(p) if p.len() >= 7 => p,
+        _ => return DesyncResult::passthrough(),
     };
-
-    let udp_data = &packet[ip.header_len() + 8..];
-    if udp_data.len() < 5 || udp_data[0] & 0x80 == 0 {
+    if udp_data[0] & 0x80 == 0 {
         return DesyncResult::passthrough();
     }
 
     let version = u32::from_be_bytes([udp_data[1], udp_data[2], udp_data[3], udp_data[4]]);
-
     if version == 0 || version == fake_version {
         return DesyncResult::passthrough();
     }
 
-    // Version Negotiation: Long Header + Type=0x7F + version=0
-    let mut fake_payload = Vec::with_capacity(64);
-    fake_payload.push(0xFF); // Header Form + Fixed Bit + Long Packet Type (0x3F = VN)
-    fake_payload.extend_from_slice(&fake_version.to_be_bytes()); // fake version
-    fake_payload.push(0x08); // DCID length
-                             // Copy DCID from original
-    let dcid_start = 6;
-    if dcid_start + 8 <= udp_data.len() {
-        fake_payload.extend_from_slice(&udp_data[dcid_start..dcid_start + 8]);
+    let dcid_len = udp_data[5] as usize;
+    let dcid_start = 6usize;
+    let dcid_end = dcid_start + dcid_len;
+    if dcid_end >= udp_data.len() {
+        return DesyncResult::passthrough();
     }
-    fake_payload.push(0x08); // SCID length
-    let scid_start = dcid_start + 8 + 1;
-    if scid_start + 8 <= udp_data.len() {
-        fake_payload.extend_from_slice(&udp_data[scid_start..scid_start + 8]);
+    let scid_len = udp_data[dcid_end] as usize;
+    let scid_start = dcid_end + 1;
+    let scid_end = scid_start + scid_len;
+    if scid_end > udp_data.len() {
+        return DesyncResult::passthrough();
     }
 
-    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
+    let mut fake_payload = Vec::with_capacity(1 + 4 + 1 + dcid_len + 1 + scid_len + 8);
+    fake_payload.push(0x80 | 0x40);
+    fake_payload.extend_from_slice(&0u32.to_be_bytes());
+    fake_payload.push(dcid_len as u8);
+    fake_payload.extend_from_slice(&udp_data[dcid_start..dcid_end]);
+    fake_payload.push(scid_len as u8);
+    fake_payload.extend_from_slice(&udp_data[scid_start..scid_end]);
+    fake_payload.extend_from_slice(&fake_version.to_be_bytes());
+    fake_payload.extend_from_slice(&0x0a0a0a0au32.to_be_bytes());
+
+    let src_port = ctx.src_port.unwrap_or(443);
+    let dst_port = ctx.dst_port.unwrap_or(443);
+    let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src(),
-        ip.dst(),
-        extract_src_port(packet).unwrap_or(443),
-        443,
+        ctx.src_ip,
+        ctx.dst_ip,
+        src_port,
+        dst_port,
         &fake_payload,
         fake_ttl,
-        ip.identification().wrapping_add(1),
+        ctx.identification.wrapping_add(1),
     );
 
     debug!(
@@ -466,14 +602,15 @@ pub fn quic_version_downgrade(
 /// Отправляем fake Retry пакет с невалидным токеном.
 /// Клиент должен повторить handshake с токеном. DPI
 /// может сбиться при обработке Retry.
-pub fn quic_retry_inject(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
+pub fn quic_retry_inject(packet: &[u8], ctx: &PacketContext, fake_ttl_offset: u8) -> DesyncResult {
+    if ctx.proto != 17 {
+        return DesyncResult::passthrough();
+    }
+    let udp_data = match packet.get(ctx.payload_offset..) {
+        Some(p) if p.len() >= 5 => p,
+        _ => return DesyncResult::passthrough(),
     };
-
-    let udp_data = &packet[ip.header_len() + 8..];
-    if udp_data.len() < 5 || udp_data[0] & 0x80 == 0 {
+    if udp_data[0] & 0x80 == 0 {
         return DesyncResult::passthrough();
     }
 
@@ -510,15 +647,17 @@ pub fn quic_retry_inject(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
         fake_payload.push(crate::desync::rand::random_u32() as u8);
     }
 
-    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
+    let src_port = ctx.src_port.unwrap_or(443);
+    let dst_port = ctx.dst_port.unwrap_or(443);
+    let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src(),
-        ip.dst(),
-        extract_src_port(packet).unwrap_or(443),
-        443,
+        ctx.src_ip,
+        ctx.dst_ip,
+        src_port,
+        dst_port,
         &fake_payload,
         fake_ttl,
-        ip.identification().wrapping_add(1),
+        ctx.identification.wrapping_add(1),
     );
 
     debug!("[Z22] QUIC RetryInject: fake Retry token injected");
@@ -532,14 +671,20 @@ pub fn quic_retry_inject(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
 /// Отправляем fake CONNECTION_CLOSE frame. DPI видит
 /// закрытие соединения и может перестать инспектировать.
 /// Клиент создаст новое соединение.
-pub fn quic_connection_close(packet: &[u8], error_code: u64, fake_ttl_offset: u8) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
+pub fn quic_connection_close(
+    packet: &[u8],
+    ctx: &PacketContext,
+    error_code: u64,
+    fake_ttl_offset: u8,
+) -> DesyncResult {
+    if ctx.proto != 17 {
+        return DesyncResult::passthrough();
+    }
+    let udp_data = match packet.get(ctx.payload_offset..) {
+        Some(p) if p.len() >= 5 => p,
+        _ => return DesyncResult::passthrough(),
     };
-
-    let udp_data = &packet[ip.header_len() + 8..];
-    if udp_data.len() < 5 || udp_data[0] & 0x80 == 0 {
+    if udp_data[0] & 0x80 == 0 {
         return DesyncResult::passthrough();
     }
 
@@ -547,6 +692,25 @@ pub fn quic_connection_close(packet: &[u8], error_code: u64, fake_ttl_offset: u8
 
     if version == 0 {
         return DesyncResult::passthrough();
+    }
+
+    // Try valid Connection Close first
+    let dcid_len = udp_data[5] as usize;
+    if 6 + dcid_len <= udp_data.len() {
+        let dcid = &udp_data[6..6 + dcid_len];
+        let scid_offset = 6 + dcid_len;
+        if scid_offset < udp_data.len() {
+            let scid_len = udp_data[scid_offset] as usize;
+            let scid_end = scid_offset + 1 + scid_len;
+            if scid_end <= udp_data.len() {
+                let scid = &udp_data[scid_offset + 1..scid_end];
+                if let Ok(res) =
+                    build_quic_connection_close_packet(dcid, scid, error_code, fake_ttl_offset, ctx)
+                {
+                    return res;
+                }
+            }
+        }
     }
 
     // CONNECTION_CLOSE frame: type=0x1C, error_code(varint), frame_type(varint)
@@ -599,15 +763,17 @@ pub fn quic_connection_close(packet: &[u8], error_code: u64, fake_ttl_offset: u8
     // Padding
     initial.resize(initial.len() + 16, 0);
 
-    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
+    let src_port = ctx.src_port.unwrap_or(443);
+    let dst_port = ctx.dst_port.unwrap_or(443);
+    let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src(),
-        ip.dst(),
-        extract_src_port(packet).unwrap_or(443),
-        443,
+        ctx.src_ip,
+        ctx.dst_ip,
+        src_port,
+        dst_port,
         &initial,
         fake_ttl,
-        ip.identification().wrapping_add(1),
+        ctx.identification.wrapping_add(1),
     );
 
     debug!("[Z23] QUIC ConnectionClose: error_code={}", error_code);
@@ -620,14 +786,15 @@ pub fn quic_connection_close(packet: &[u8], error_code: u64, fake_ttl_offset: u8
 /// ## Принцип
 /// Отправляем fake RESET_STREAM frame для stream 0.
 /// DPI видит сброс потока и может перестать инспектировать.
-pub fn quic_stream_reset(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
+pub fn quic_stream_reset(packet: &[u8], ctx: &PacketContext, fake_ttl_offset: u8) -> DesyncResult {
+    if ctx.proto != 17 {
+        return DesyncResult::passthrough();
+    }
+    let udp_data = match packet.get(ctx.payload_offset..) {
+        Some(p) if p.len() >= 5 => p,
+        _ => return DesyncResult::passthrough(),
     };
-
-    let udp_data = &packet[ip.header_len() + 8..];
-    if udp_data.len() < 5 || udp_data[0] & 0x80 == 0 {
+    if udp_data[0] & 0x80 == 0 {
         return DesyncResult::passthrough();
     }
 
@@ -652,15 +819,17 @@ pub fn quic_stream_reset(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
     short.extend_from_slice(&frame);
     short.resize(short.len() + 8, 0); // padding
 
-    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
+    let src_port = ctx.src_port.unwrap_or(443);
+    let dst_port = ctx.dst_port.unwrap_or(443);
+    let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src(),
-        ip.dst(),
-        extract_src_port(packet).unwrap_or(443),
-        443,
+        ctx.src_ip,
+        ctx.dst_ip,
+        src_port,
+        dst_port,
         &short,
         fake_ttl,
-        ip.identification().wrapping_add(1),
+        ctx.identification.wrapping_add(1),
     );
 
     debug!("[Z24] QUIC StreamReset: RESET_STREAM for stream 0");
@@ -674,14 +843,20 @@ pub fn quic_stream_reset(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
 /// Отправляем MAX_STREAMS frame с large value.
 /// DPI должен обновить лимит потоков. Это может
 /// переполнить state machine DPI.
-pub fn quic_max_streams(packet: &[u8], max_streams: u32, fake_ttl_offset: u8) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
+pub fn quic_max_streams(
+    packet: &[u8],
+    ctx: &PacketContext,
+    max_streams: u32,
+    fake_ttl_offset: u8,
+) -> DesyncResult {
+    if ctx.proto != 17 {
+        return DesyncResult::passthrough();
+    }
+    let udp_data = match packet.get(ctx.payload_offset..) {
+        Some(p) if p.len() >= 5 => p,
+        _ => return DesyncResult::passthrough(),
     };
-
-    let udp_data = &packet[ip.header_len() + 8..];
-    if udp_data.len() < 5 || udp_data[0] & 0x80 == 0 {
+    if udp_data[0] & 0x80 == 0 {
         return DesyncResult::passthrough();
     }
 
@@ -728,15 +903,17 @@ pub fn quic_max_streams(packet: &[u8], max_streams: u32, fake_ttl_offset: u8) ->
     initial.extend_from_slice(&frame);
     initial.resize(initial.len() + 8, 0);
 
-    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
+    let src_port = ctx.src_port.unwrap_or(443);
+    let dst_port = ctx.dst_port.unwrap_or(443);
+    let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src(),
-        ip.dst(),
-        extract_src_port(packet).unwrap_or(443),
-        443,
+        ctx.src_ip,
+        ctx.dst_ip,
+        src_port,
+        dst_port,
         &initial,
         fake_ttl,
-        ip.identification().wrapping_add(1),
+        ctx.identification.wrapping_add(1),
     );
 
     debug!("[Z25] QUIC MaxStreams: max={}", max_streams);
@@ -749,14 +926,19 @@ pub fn quic_max_streams(packet: &[u8], max_streams: u32, fake_ttl_offset: u8) ->
 /// ## Принцип
 /// Отправляем fake NEW_CONNECTION_ID frame. DPI должен
 /// отслеживать connection ID смены. Это может сбить DPI.
-pub fn quic_new_connection_id(packet: &[u8], fake_ttl_offset: u8) -> DesyncResult {
-    let ip = match parse_ip_header(packet) {
-        Some(h) => h,
-        None => return DesyncResult::passthrough(),
+pub fn quic_new_connection_id(
+    packet: &[u8],
+    ctx: &PacketContext,
+    fake_ttl_offset: u8,
+) -> DesyncResult {
+    if ctx.proto != 17 {
+        return DesyncResult::passthrough();
+    }
+    let udp_data = match packet.get(ctx.payload_offset..) {
+        Some(p) if p.len() >= 5 => p,
+        _ => return DesyncResult::passthrough(),
     };
-
-    let udp_data = &packet[ip.header_len() + 8..];
-    if udp_data.len() < 5 || udp_data[0] & 0x80 == 0 {
+    if udp_data[0] & 0x80 == 0 {
         return DesyncResult::passthrough();
     }
 
@@ -787,15 +969,17 @@ pub fn quic_new_connection_id(packet: &[u8], fake_ttl_offset: u8) -> DesyncResul
     short.extend_from_slice(&frame);
     short.resize(short.len() + 8, 0);
 
-    let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
+    let src_port = ctx.src_port.unwrap_or(443);
+    let dst_port = ctx.dst_port.unwrap_or(443);
+    let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
     let fake_udp = build_udp_packet(
-        ip.src(),
-        ip.dst(),
-        extract_src_port(packet).unwrap_or(443),
-        443,
+        ctx.src_ip,
+        ctx.dst_ip,
+        src_port,
+        dst_port,
         &short,
         fake_ttl,
-        ip.identification().wrapping_add(1),
+        ctx.identification.wrapping_add(1),
     );
 
     debug!("[Z26] QUIC NewConnectionID: fake CID injected");
@@ -805,20 +989,9 @@ pub fn quic_new_connection_id(packet: &[u8], fake_ttl_offset: u8) -> DesyncResul
 
 // ==================== Вспомогательные функции ====================
 
-/// Extracts the UDP source port from a raw IP+UDP packet.
-fn extract_src_port(packet: &[u8]) -> Option<u16> {
-    if packet.len() < 28 {
-        return None;
-    }
-    let ihl = (packet[0] & 0x0F) as usize * 4;
-    if packet.len() < ihl + 8 {
-        return None;
-    }
-    Some(u16::from_be_bytes([packet[ihl], packet[ihl + 1]]))
-}
-
-/// Строит fake QUIC Initial пакет.
-fn build_quic_initial(dcid: &[u8], _sni: &str) -> Vec<u8> {
+/// Строит fake QUIC Initial пакет для тестов.
+#[cfg(test)]
+fn build_unprotected_quic_initial_for_tests_only(dcid: &[u8], _sni: &str) -> Vec<u8> {
     let mut payload = Vec::with_capacity(128);
 
     // Long Header: Header Form(1) + Fixed Bit(1) + Type(2) = 0xC0
@@ -1111,154 +1284,309 @@ pub fn quic_v1_initial_decrypt(
     Some(plaintext)
 }
 
-/// Builds a QUIC Initial packet with proper encryption.
-///
-/// This constructs a valid QUIC v1 Initial packet with:
-/// - Long Header with Initial type
-/// - Version 1
-/// - Destination and Source Connection IDs
-/// - CRYPTO frame with fake ClientHello
-/// - Proper padding to 1200 bytes minimum
-/// - AEAD AES-128-GCM encryption
-pub fn build_quic_initial_with_crypto(dcid: &[u8], scid: &[u8], fake_sni: &str) -> Option<Vec<u8>> {
-    // Build SNI extension
-    let sni_bytes = fake_sni.as_bytes();
-    let sni_ext = {
-        let mut ext = Vec::new();
-        // Extension type: server_name (0x0000)
-        ext.extend_from_slice(&[0x00, 0x00]);
-        // Extension data length placeholder
-        let ext_data_len_pos = ext.len();
-        ext.extend_from_slice(&[0x00, 0x00]);
-        // Server name list length
-        let sni_list_len = 1 + 2 + sni_bytes.len();
-        ext.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
-        // Server name type: host_name (0x00)
-        ext.push(0x00);
-        // Server name length
-        ext.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
-        ext.extend_from_slice(sni_bytes);
-        // Fill extension data length
-        let ext_data_len = sni_list_len + 2;
-        let len16 = ext_data_len as u16;
-        ext[ext_data_len_pos..ext_data_len_pos + 2].copy_from_slice(&len16.to_be_bytes());
-        ext
+fn append_quic_varint(out: &mut Vec<u8>, value: u64) -> Option<()> {
+    if value < 64 {
+        out.push(value as u8);
+    } else if value < 16_384 {
+        let v = 0x4000u16 | value as u16;
+        out.extend_from_slice(&v.to_be_bytes());
+    } else if value < 1_073_741_824 {
+        let v = 0x8000_0000u32 | value as u32;
+        out.extend_from_slice(&v.to_be_bytes());
+    } else if value < 4_611_686_018_427_387_904 {
+        let v = 0xC000_0000_0000_0000u64 | value;
+        out.extend_from_slice(&v.to_be_bytes());
+    } else {
+        return None;
+    }
+    Some(())
+}
+
+fn append_u16_len_prefixed(out: &mut Vec<u8>, data: &[u8]) -> Option<()> {
+    let len = u16::try_from(data.len()).ok()?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(data);
+    Some(())
+}
+
+fn append_tls_extension(out: &mut Vec<u8>, ext_type: u16, body: &[u8]) -> Option<()> {
+    let len = u16::try_from(body.len()).ok()?;
+    out.extend_from_slice(&ext_type.to_be_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(body);
+    Some(())
+}
+
+fn random_bytes_vec(len: usize) -> Vec<u8> {
+    let mut v = vec![0u8; len];
+    crate::desync::rand::fill_random_bytes(&mut v);
+    v
+}
+
+fn build_quic_tls_client_hello(fake_sni: &str) -> Option<Vec<u8>> {
+    let sni = fake_sni.as_bytes();
+    if sni.is_empty() || sni.len() > 253 {
+        return None;
+    }
+
+    let mut exts = Vec::with_capacity(512);
+
+    let mut sni_body = Vec::new();
+    let list_len = 1usize + 2 + sni.len();
+    sni_body.extend_from_slice(&(list_len as u16).to_be_bytes());
+    sni_body.push(0x00);
+    sni_body.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+    sni_body.extend_from_slice(sni);
+    append_tls_extension(&mut exts, 0x0000, &sni_body)?;
+
+    let mut supported_versions = Vec::new();
+    supported_versions.push(2);
+    supported_versions.extend_from_slice(&[0x03, 0x04]);
+    append_tls_extension(&mut exts, 0x002b, &supported_versions)?;
+
+    let mut alpn = Vec::new();
+    alpn.extend_from_slice(&[0x00, 0x03, 0x02, b'h', b'3']);
+    append_tls_extension(&mut exts, 0x0010, &alpn)?;
+
+    let sigalgs: [u8; 14] = [
+        0x00, 0x0c, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01,
+    ];
+    append_tls_extension(&mut exts, 0x000d, &sigalgs)?;
+
+    let groups: [u8; 8] = [0x00, 0x06, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18];
+    append_tls_extension(&mut exts, 0x000a, &groups)?;
+
+    let mut key_share = Vec::new();
+    let x25519_key = random_bytes_vec(32);
+    key_share.extend_from_slice(&(2 + 2 + x25519_key.len() as u16).to_be_bytes());
+    key_share.extend_from_slice(&[0x00, 0x1d]);
+    key_share.extend_from_slice(&(x25519_key.len() as u16).to_be_bytes());
+    key_share.extend_from_slice(&x25519_key);
+    append_tls_extension(&mut exts, 0x0033, &key_share)?;
+
+    let mut quic_tp = Vec::new();
+    append_quic_varint(&mut quic_tp, 0x04)?;
+    append_quic_varint(&mut quic_tp, 4)?;
+    quic_tp.extend_from_slice(&65536u32.to_be_bytes());
+    append_quic_varint(&mut quic_tp, 0x05)?;
+    append_quic_varint(&mut quic_tp, 4)?;
+    quic_tp.extend_from_slice(&65536u32.to_be_bytes());
+    append_quic_varint(&mut quic_tp, 0x06)?;
+    append_quic_varint(&mut quic_tp, 4)?;
+    quic_tp.extend_from_slice(&262144u32.to_be_bytes());
+    append_quic_varint(&mut quic_tp, 0x07)?;
+    append_quic_varint(&mut quic_tp, 4)?;
+    quic_tp.extend_from_slice(&100u32.to_be_bytes());
+    append_tls_extension(&mut exts, 0x0039, &quic_tp)?;
+
+    let mut body = Vec::with_capacity(128 + exts.len());
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&random_bytes_vec(32));
+    body.push(0x00);
+    let ciphers: [u8; 6] = [0x13, 0x01, 0x13, 0x02, 0x13, 0x03];
+    append_u16_len_prefixed(&mut body, &ciphers)?;
+    body.extend_from_slice(&[0x01, 0x00]);
+    append_u16_len_prefixed(&mut body, &exts)?;
+
+    let body_len = body.len();
+    if body_len > 0x00ff_ffff {
+        return None;
+    }
+    let mut ch = Vec::with_capacity(4 + body.len());
+    ch.push(0x01);
+    ch.extend_from_slice(&[
+        (body_len >> 16) as u8,
+        (body_len >> 8) as u8,
+        body_len as u8,
+    ]);
+    ch.extend_from_slice(&body);
+    Some(ch)
+}
+
+fn build_crypto_frame(payload: &[u8]) -> Option<Vec<u8>> {
+    let mut frame = Vec::with_capacity(payload.len() + 8);
+    frame.push(0x06);
+    append_quic_varint(&mut frame, 0)?;
+    append_quic_varint(&mut frame, payload.len() as u64)?;
+    frame.extend_from_slice(payload);
+    Some(frame)
+}
+
+fn build_quic_connection_close_packet(
+    dcid: &[u8],
+    scid: &[u8],
+    error_code: u64,
+    fake_ttl_offset: u8,
+    ctx: &PacketContext,
+) -> Result<DesyncResult, QuicInitialBuildError> {
+    let mut frame = Vec::with_capacity(32);
+    frame.push(0x1c);
+    append_quic_varint(&mut frame, error_code).ok_or(QuicInitialBuildError::SizeInvariantFailed)?;
+    append_quic_varint(&mut frame, 0).ok_or(QuicInitialBuildError::SizeInvariantFailed)?;
+    append_quic_varint(&mut frame, 0).ok_or(QuicInitialBuildError::SizeInvariantFailed)?;
+
+    let pn_len = 4usize;
+    let packet_number = crate::desync::rand::random_u32() as u64;
+
+    let mut header = Vec::with_capacity(64);
+    header.push(0xC3);
+    header.extend_from_slice(&QUIC_VERSION_1.to_be_bytes());
+    header.push(dcid.len() as u8);
+    header.extend_from_slice(dcid);
+    header.push(scid.len() as u8);
+    header.extend_from_slice(scid);
+    append_quic_varint(&mut header, 0).ok_or(QuicInitialBuildError::SizeInvariantFailed)?;
+
+    let length_offset = header.len();
+    append_quic_varint(&mut header, 0).ok_or(QuicInitialBuildError::SizeInvariantFailed)?;
+
+    let min_payload_len = 1200usize
+        .saturating_sub(header.len())
+        .saturating_sub(pn_len)
+        .saturating_sub(16);
+    let mut payload = frame;
+    if payload.len() < min_payload_len {
+        payload.resize(min_payload_len, 0);
+    }
+
+    let packet_len_after_len = pn_len + payload.len() + 16;
+    let mut final_header = Vec::with_capacity(header.len() + 8);
+    final_header.extend_from_slice(&header[..length_offset]);
+    append_quic_varint(&mut final_header, packet_len_after_len as u64)
+        .ok_or(QuicInitialBuildError::SizeInvariantFailed)?;
+
+    if let Some(encrypted) =
+        quic_v1_initial_encrypt(&final_header, packet_number, pn_len, &payload, dcid)
+    {
+        let src_port = ctx.src_port.unwrap_or(443);
+        let dst_port = ctx.dst_port.unwrap_or(443);
+        let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
+        let fake_udp = build_udp_packet(
+            ctx.src_ip,
+            ctx.dst_ip,
+            src_port,
+            dst_port,
+            &encrypted,
+            fake_ttl,
+            ctx.identification.wrapping_add(1),
+        );
+        Ok(DesyncResult::inject_only(fake_udp))
+    } else {
+        Err(QuicInitialBuildError::AeadFailed)
+    }
+}
+
+fn build_quic_retry_packet(
+    dcid: &[u8],
+    scid: &[u8],
+    fake_ttl_offset: u8,
+    ctx: &PacketContext,
+) -> Result<DesyncResult, QuicInitialBuildError> {
+    let mut retry_packet = Vec::with_capacity(128);
+    retry_packet.push(0xF0);
+    retry_packet.extend_from_slice(&QUIC_VERSION_1.to_be_bytes());
+    retry_packet.push(scid.len() as u8);
+    retry_packet.extend_from_slice(scid);
+    retry_packet.push(dcid.len() as u8);
+    retry_packet.extend_from_slice(dcid);
+
+    let token = random_bytes_vec(16);
+    retry_packet.extend_from_slice(&token);
+
+    let mut aad = Vec::with_capacity(1 + dcid.len() + retry_packet.len());
+    aad.push(dcid.len() as u8);
+    aad.extend_from_slice(dcid);
+    aad.extend_from_slice(&retry_packet);
+
+    let key_bytes = u128::from_str_radix("be0c690a9f6657c367041b7a8fd33141", 16)
+        .unwrap()
+        .to_be_bytes();
+    let nonce_bytes = {
+        let mut n = [0u8; 12];
+        let bytes = u128::from_str_radix("461599342a64c5a4528410fb", 16)
+            .unwrap()
+            .to_be_bytes();
+        n.copy_from_slice(&bytes[4..]);
+        n
     };
 
-    // Build the CRYPTO frame with fake ClientHello
-    let mut crypto_frame = Vec::with_capacity(512);
+    use aes_gcm::KeyInit;
+    let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&key_bytes));
+    let nonce = Nonce::from_slice(&nonce_bytes);
 
-    // CRYPTO frame type (0x06)
-    crypto_frame.push(0x06);
+    let tag = cipher
+        .encrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: &[],
+                aad: &aad,
+            },
+        )
+        .map_err(|_| QuicInitialBuildError::AeadFailed)?;
+    retry_packet.extend_from_slice(&tag);
 
-    // Offset (varint) = 0
-    crypto_frame.push(0x00);
+    let src_port = ctx.src_port.unwrap_or(443);
+    let dst_port = ctx.dst_port.unwrap_or(443);
+    let fake_ttl = ctx.ttl_or_hop_limit.saturating_sub(fake_ttl_offset);
+    let fake_udp = build_udp_packet(
+        ctx.src_ip,
+        ctx.dst_ip,
+        src_port,
+        dst_port,
+        &retry_packet,
+        fake_ttl,
+        ctx.identification.wrapping_add(1),
+    );
+    Ok(DesyncResult::inject_only(fake_udp))
+}
 
-    // Length (varint) - will be filled later
-    let length_offset = crypto_frame.len();
-    crypto_frame.push(0x00); // placeholder
-
-    // ----- TLS ClientHello (RFC 8446 §4.1.2) -----
-    // Handshake type: ClientHello (0x01)
-    crypto_frame.push(0x01);
-
-    // Length (3 bytes) — placeholder, filled after CH is built
-    let ch_len_pos = crypto_frame.len();
-    crypto_frame.extend_from_slice(&[0x00, 0x00, 0x00]);
-
-    // Client version: TLS 1.2 (0x0303) per spec
-    crypto_frame.extend_from_slice(&[0x03, 0x03]);
-
-    // Random (32 bytes) — deterministic
-    for i in 0..32 {
-        crypto_frame.push(i as u8);
+pub fn build_quic_initial_with_crypto(
+    dcid: &[u8],
+    scid: &[u8],
+    fake_sni: &str,
+) -> Result<bytes::Bytes, QuicInitialBuildError> {
+    if dcid.len() > 20 || scid.len() > 20 {
+        return Err(QuicInitialBuildError::InvalidOriginalPacket);
     }
 
-    // Session ID length (0 = no session ID)
-    crypto_frame.push(0x00);
+    let client_hello =
+        build_quic_tls_client_hello(fake_sni).ok_or(QuicInitialBuildError::InvalidSni)?;
+    let crypto_frame =
+        build_crypto_frame(&client_hello).ok_or(QuicInitialBuildError::CryptoDeriveFailed)?;
+    let pn_len = 4usize;
+    let packet_number = crate::desync::rand::random_u32() as u64;
 
-    // Cipher suites
-    crypto_frame.extend_from_slice(&[0x00, 0x04]); // length
-    crypto_frame.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
-    crypto_frame.extend_from_slice(&[0x13, 0x02]); // TLS_AES_256_GCM_SHA384
+    let mut header = Vec::with_capacity(64);
+    header.push(0xC3);
+    header.extend_from_slice(&QUIC_VERSION_1.to_be_bytes());
+    header.push(dcid.len() as u8);
+    header.extend_from_slice(dcid);
+    header.push(scid.len() as u8);
+    header.extend_from_slice(scid);
+    append_quic_varint(&mut header, 0).ok_or(QuicInitialBuildError::SizeInvariantFailed)?;
 
-    // Compression methods: null only
-    crypto_frame.extend_from_slice(&[0x01, 0x00]);
-
-    // Extensions: SNI only
-    let ext_start = crypto_frame.len();
-    crypto_frame.extend_from_slice(&sni_ext);
-    let ext_total_len = crypto_frame.len() - ext_start;
-    let extensions_len_pos = ext_start - 2;
-    let ext_len16 = ext_total_len as u16;
-    crypto_frame[extensions_len_pos..extensions_len_pos + 2]
-        .copy_from_slice(&ext_len16.to_be_bytes());
-
-    // Fill ClientHello length (everything after handshake type and length)
-    let ch_len = crypto_frame.len() - ch_len_pos - 3;
-    let ch_len24 = ch_len as u32;
-    crypto_frame[ch_len_pos..ch_len_pos + 3].copy_from_slice(&ch_len24.to_be_bytes()[1..]);
-
-    // Fill the CRYPTO frame length (everything after the length varint)
-    let crypto_len = crypto_frame.len() - length_offset - 1;
-    crypto_frame[length_offset] = crypto_len as u8;
-
-    // Build the Initial packet header
-    let mut packet = Vec::with_capacity(512);
-
-    // Long Header: Header Form(1) + Fixed Bit(1) + Type(2) = 0xC0
-    // Reserved Bits(2) = 0 + Packet Number Length(2) = 0
-    packet.push(0xC0);
-
-    // Version: 0x00000001 (QUIC v1)
-    packet.extend_from_slice(&QUIC_VERSION_1.to_be_bytes());
-
-    // Destination Connection ID Length + CID
-    packet.push(dcid.len() as u8);
-    packet.extend_from_slice(dcid);
-
-    // Source Connection ID Length + CID
-    packet.push(scid.len() as u8);
-    packet.extend_from_slice(scid);
-
-    // Token Length = 0 (no token)
-    packet.push(0);
-
-    // Length field placeholder (will be filled after padding)
-    let length_field_offset = packet.len();
-    packet.extend_from_slice(&[0u8; 2]);
-
-    // Packet Number: 0
-    packet.push(0x00);
-
-    // Add CRYPTO frame
-    packet.extend_from_slice(&crypto_frame);
-
-    // Pad to 1200 bytes minimum (RFC 9000 §14.1)
-    const QUIC_MIN_INITIAL_SIZE: usize = 1200;
-    if packet.len() < QUIC_MIN_INITIAL_SIZE {
-        packet.resize(QUIC_MIN_INITIAL_SIZE, 0);
+    let length_offset = header.len();
+    append_quic_varint(&mut header, 0).ok_or(QuicInitialBuildError::SizeInvariantFailed)?;
+    let min_payload_len = 1200usize
+        .saturating_sub(header.len())
+        .saturating_sub(pn_len)
+        .saturating_sub(16); // AEAD tag length = 16
+    let mut payload = crypto_frame;
+    if payload.len() < min_payload_len {
+        payload.resize(min_payload_len, 0);
     }
 
-    // Fill the length field (remaining bytes after length field)
-    let remaining = packet.len() - length_field_offset - 2;
-    packet[length_field_offset..length_field_offset + 2]
-        .copy_from_slice(&(remaining as u16).to_be_bytes());
-
-    // Encrypt using QUIC v1 Initial protection
-    // header = everything before PN (length_field_offset + 2 bytes length)
-    // PN is at header_len = length_field_offset + 2, PN length = 1 byte
-    let pn_offset = length_field_offset + 2;
-    let pn_len = 1; // PN length encoding in header byte 0 = 0 means 1 byte
-    let pn_val = packet[pn_offset] as u64;
-    let header = &packet[..pn_offset];
-    let payload = &packet[pn_offset + pn_len..];
-
-    if let Some(encrypted) = quic_v1_initial_encrypt(header, pn_val, pn_len, payload, dcid) {
-        Some(encrypted)
+    let packet_len_after_len = pn_len + payload.len() + 16;
+    let mut final_header = Vec::with_capacity(header.len() + 8);
+    final_header.extend_from_slice(&header[..length_offset]);
+    append_quic_varint(&mut final_header, packet_len_after_len as u64)
+        .ok_or(QuicInitialBuildError::SizeInvariantFailed)?;
+    if let Some(encrypted) =
+        quic_v1_initial_encrypt(&final_header, packet_number, pn_len, &payload, dcid)
+    {
+        Ok(bytes::Bytes::from(encrypted))
     } else {
-        // Fallback: return unencrypted (will be detected by DPI)
-        Some(packet)
+        Err(QuicInitialBuildError::AeadFailed)
     }
 }
 
@@ -1719,7 +2047,7 @@ mod tests {
     #[test]
     fn test_build_quic_initial() {
         let dcid = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-        let payload = build_quic_initial(&dcid, "example.com");
+        let payload = build_unprotected_quic_initial_for_tests_only(&dcid, "example.com");
         assert!(!payload.is_empty());
         // Long Header flag
         assert!(payload[0] & 0x80 != 0);
@@ -1792,49 +2120,63 @@ mod tests {
     #[test]
     fn test_quic_blocking() {
         let pkt = make_quic_packet();
-        let result = quic_blocking(&pkt);
+        let ctx = PacketContext::from_packet(&pkt).unwrap();
+        let mut count = 0;
+        let result = quic_blocking(
+            &pkt,
+            &ctx,
+            QuicFallbackPolicy::ControlledDropJitter,
+            1,
+            &mut count,
+        );
         assert!(result.drop);
     }
 
     #[test]
     fn test_quic_version_downgrade() {
         let pkt = make_quic_packet();
-        let result = quic_version_downgrade(&pkt, 0xFF00_001D, 1);
+        let ctx = PacketContext::from_packet(&pkt).unwrap();
+        let result = quic_version_downgrade(&pkt, &ctx, 0xFF00_001D, 1);
         assert_eq!(result.inject.len(), 1);
     }
 
     #[test]
     fn test_quic_retry_inject() {
         let pkt = make_quic_packet();
-        let result = quic_retry_inject(&pkt, 1);
+        let ctx = PacketContext::from_packet(&pkt).unwrap();
+        let result = quic_retry_inject(&pkt, &ctx, 1);
         assert_eq!(result.inject.len(), 1);
     }
 
     #[test]
     fn test_quic_connection_close() {
         let pkt = make_quic_packet();
-        let result = quic_connection_close(&pkt, 0x01, 1);
+        let ctx = PacketContext::from_packet(&pkt).unwrap();
+        let result = quic_connection_close(&pkt, &ctx, 0x02, 1);
         assert_eq!(result.inject.len(), 1);
     }
 
     #[test]
     fn test_quic_stream_reset() {
         let pkt = make_quic_packet();
-        let result = quic_stream_reset(&pkt, 1);
+        let ctx = PacketContext::from_packet(&pkt).unwrap();
+        let result = quic_stream_reset(&pkt, &ctx, 1);
         assert_eq!(result.inject.len(), 1);
     }
 
     #[test]
     fn test_quic_max_streams() {
         let pkt = make_quic_packet();
-        let result = quic_max_streams(&pkt, 100, 1);
+        let ctx = PacketContext::from_packet(&pkt).unwrap();
+        let result = quic_max_streams(&pkt, &ctx, 100, 1);
         assert_eq!(result.inject.len(), 1);
     }
 
     #[test]
     fn test_quic_new_connection_id() {
         let pkt = make_quic_packet();
-        let result = quic_new_connection_id(&pkt, 1);
+        let ctx = PacketContext::from_packet(&pkt).unwrap();
+        let result = quic_new_connection_id(&pkt, &ctx, 1);
         assert_eq!(result.inject.len(), 1);
     }
 
@@ -1849,8 +2191,18 @@ mod tests {
         pkt[16..20].copy_from_slice(&[8, 8, 8, 8]);
         let csum = ipv4_checksum(&pkt[..20]);
         pkt[10..12].copy_from_slice(&csum.to_be_bytes());
-        assert!(quic_blocking(&pkt).inject.is_empty());
-        assert!(!quic_blocking(&pkt).drop);
+        if let Some(ctx) = PacketContext::from_packet(&pkt) {
+            let mut count = 0;
+            let result = quic_blocking(
+                &pkt,
+                &ctx,
+                QuicFallbackPolicy::ControlledDropJitter,
+                1,
+                &mut count,
+            );
+            assert!(result.inject.is_empty());
+            assert!(!result.drop);
+        }
     }
 
     /// RFC 9001 Appendix A.1 test vector — key derivation.
@@ -1919,7 +2271,7 @@ mod tests {
         let scid = [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18];
 
         let result = build_quic_initial_with_crypto(&dcid, &scid, "example.com");
-        assert!(result.is_some());
+        assert!(result.is_ok());
 
         let packet = result.unwrap();
         // Should be at least 1200 bytes

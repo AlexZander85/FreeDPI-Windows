@@ -28,6 +28,8 @@ reqwest.workspace = true
 ipnet.workspace = true
 rand_chacha = "0.3"
 rand_core = "0.6"
+siphasher = "0.3"
+rustc-hash = "2"
 rand = "0.8"
 smallvec = "1.13"
 crossbeam = "0.8"
@@ -51,3 +53,6 @@ wireguard-sans-io = "1.0.0"
 
 [features]
 default = []
+
+[dev-dependencies]
+tempfile = "3"

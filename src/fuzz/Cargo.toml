@@ -1,0 +1,21 @@
+[package]
+name = "freedpi-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+freedpi-core = { path = "../core" }
+
+[profile.release]
+debug = true
+
+[[bin]]
+name = "classifier_invariants"
+path = "fuzz_targets/classifier_invariants.rs"
+test = false
+doc = false

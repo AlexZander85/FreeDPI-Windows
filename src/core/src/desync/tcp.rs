@@ -131,7 +131,7 @@ pub fn multisplit(
             .collect::<smallvec::SmallVec<[bytes::Bytes; 4]>>(),
         inter_delay_us,
         drop: false,
-        is_outbound_inject: false,
+        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
     }
 }
 
@@ -285,7 +285,7 @@ pub fn tcpseg(packet: &bytes::Bytes, max_seg_size: usize, _fake_ttl_offset: u8) 
         inject: inject.into_iter().collect(),
         inter_delay_us: 0,
         drop: false,
-        is_outbound_inject: false,
+        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
     }
 }
 
@@ -831,7 +831,7 @@ pub fn build_ip_tcp_packet_with_options(
 
             // Копируем TCP options после стандартного 20-байтового заголовка
             if tcp_opts_len > 0 {
-                buf[20 + 20..20 + tcp_header_len].copy_from_slice(&tcp_options);
+                buf[20 + 20..20 + tcp_header_len].copy_from_slice(tcp_options);
             }
 
             // Копируем payload после TCP заголовка
@@ -885,7 +885,7 @@ pub fn build_ip_tcp_packet_with_options(
             // Копируем TCP options после стандартного 20-байтового заголовка
             if tcp_opts_len > 0 {
                 buf[ip_header_len + 20..ip_header_len + tcp_header_len]
-                    .copy_from_slice(&tcp_options);
+                    .copy_from_slice(tcp_options);
             }
 
             // Копируем payload после TCP заголовка
@@ -949,7 +949,7 @@ pub fn build_ip_tcp_packet_with_options(
             }
 
             if tcp_opts_len > 0 {
-                buf[20 + 20..20 + tcp_header_len].copy_from_slice(&tcp_options);
+                buf[20 + 20..20 + tcp_header_len].copy_from_slice(tcp_options);
             }
 
             buf[20 + tcp_header_len..20 + tcp_segment_len].copy_from_slice(payload);
@@ -978,22 +978,22 @@ pub fn build_ip_tcp_packet_with_options(
 }
 
 /// Извлекает TCP options (байты после 20-байтового заголовка) из пакета.
-fn extract_tcp_options(packet: &[u8]) -> Vec<u8> {
+fn extract_tcp_options(packet: &[u8]) -> &[u8] {
     let ip = match pnet_packet::ipv4::Ipv4Packet::new(packet) {
         Some(p) => p,
-        None => return Vec::new(),
+        None => return &[],
     };
     let ip_hdr_len = ip.get_header_length() as usize * 4;
     let tcp_data = &packet[ip_hdr_len..];
     let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
         Some(t) => t,
-        None => return Vec::new(),
+        None => return &[],
     };
     let data_offset = tcp.get_data_offset() as usize * 4;
     if data_offset > 20 && data_offset <= tcp_data.len() {
-        tcp_data[20..data_offset].to_vec()
+        &tcp_data[20..data_offset]
     } else {
-        Vec::new()
+        &[]
     }
 }
 
@@ -1354,7 +1354,7 @@ pub fn pkt_reorder(packet: &bytes::Bytes, swap_with_next: bool) -> DesyncResult 
         inject,
         inter_delay_us: 0,
         drop: false,
-        is_outbound_inject: false,
+        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
     }
 }
 
@@ -1409,7 +1409,7 @@ pub fn rst_selective(packet: &bytes::Bytes, fake_ttl_offset: u8) -> DesyncResult
         inject: smallvec::smallvec![fake_rst],
         inter_delay_us: 0,
         drop: false,
-        is_outbound_inject: true,
+        inject_direction: crate::desync::InjectDirection::ForceOutbound,
     }
 }
 
@@ -1598,7 +1598,7 @@ pub fn disorder(packet: &bytes::Bytes, split_at: usize, fake_ttl_offset: u8) -> 
         inject: smallvec::smallvec![bytes::Bytes::from(seg2)],
         inter_delay_us: 0,
         drop: false,
-        is_outbound_inject: false,
+        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
     }
 }
 
@@ -1674,7 +1674,7 @@ pub fn multidisorder_new(
         inject: segments.into_iter().collect(),
         inter_delay_us: 0,
         drop: false,
-        is_outbound_inject: false,
+        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
     }
 }
 
@@ -1894,7 +1894,7 @@ pub fn byte_by_byte(packet: &bytes::Bytes, max_bytes: usize, fake_ttl_offset: u8
         inject: inject.into_iter().collect(),
         inter_delay_us: 0,
         drop: false,
-        is_outbound_inject: false,
+        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
     }
 }
 
@@ -1955,7 +1955,11 @@ pub fn unidir_frag(packet: &bytes::Bytes, frag_size: usize, fake_ttl_offset: u8)
 
     debug!("[RN2] UnidirFrag: {} × {} bytes", inject.len(), frag_size);
 
-    DesyncResult::inject_many(inject)
+    // P0-11: Не пересылать оригинал — фрагменты (все, включая последний с нормальным TTL)
+    // уже покрывают все данные оригинального TCP-сегмента.
+    let mut result = DesyncResult::inject_many(inject);
+    result.drop = true;
+    result
 }
 
 /// [CT8] PortShuffle: ротация source port.
@@ -2398,6 +2402,82 @@ mod tests {
         let pkt = bytes::Bytes::from(pkt);
         let result = unidir_frag(&pkt, 10, 1);
         assert!(result.inject.len() >= 3);
+        // P0-12: unidir_frag must drop the original — fragments carry all data
+        assert!(result.drop, "unidir_frag must set drop=true (P0-11)");
+        assert!(
+            result.modified.is_none(),
+            "unidir_frag must not set modified"
+        );
+    }
+
+    // === P0-12: Reassembly invariants ===
+
+    #[test]
+    fn test_multisplit_has_modified_does_not_drop() {
+        let mut pkt = vec![0u8; 80];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&80u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&[192, 168, 1, 1]);
+        pkt[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
+        pkt[32] = 0x50;
+        pkt[33] = TcpFlags::PSH | TcpFlags::ACK;
+        pkt[40..80].copy_from_slice(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let csum = crate::desync::ipv4_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+        let pkt = bytes::Bytes::from(pkt);
+        // multisplit: 80 bytes payload, split_size=10, 3 splits → 3 segments
+        let result = multisplit(&pkt, 10, 3, 1, 0);
+        // The real data is in modified, decoys in inject
+        assert!(
+            result.modified.is_some(),
+            "multisplit must set modified with real segment"
+        );
+        assert!(
+            !result.inject.is_empty(),
+            "multisplit must have inject decoys"
+        );
+        assert!(
+            !result.drop,
+            "multisplit must NOT drop the original — real data is in modified"
+        );
+    }
+
+    #[test]
+    fn test_multisplit_last_segment_has_original_ttl() {
+        // Verify that in multisplit, injected decoys have fake_ttl
+        // and the modified segment has the original TTL
+        let mut pkt = vec![0u8; 60];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&60u16.to_be_bytes());
+        pkt[8] = 64; // TTL = 64
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
+        pkt[32] = 0x50;
+        pkt[33] = TcpFlags::PSH | TcpFlags::ACK;
+        pkt[40..60].copy_from_slice(b"AAAAAAAAAAAAAAAAAAAA");
+        let csum = crate::desync::ipv4_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+        let pkt = bytes::Bytes::from(pkt);
+        // 20 bytes payload, split_size=5, 3 splits, fake_ttl_offset=1
+        let result = multisplit(&pkt, 5, 3, 1, 0);
+        // Injected decoys should have TTL = 64 - 1 = 63
+        for seg in &result.inject {
+            let ttl = seg[8]; // TTL is at offset 8 in IP header
+            assert_eq!(ttl, 63, "decoy segments must have fake TTL");
+        }
+        // Modified segment should have original TTL = 64
+        if let Some(ref modified) = result.modified {
+            assert_eq!(modified[8], 64, "modified segment must have original TTL");
+        } else {
+            panic!("multisplit must produce modified segment");
+        }
     }
 }
 
@@ -2537,6 +2617,6 @@ pub fn syn_ack_split(packet: &[u8]) -> DesyncResult {
         inject: smallvec::smallvec![bytes::Bytes::from(syn_seg), bytes::Bytes::from(ack_seg)],
         inter_delay_us: 0,
         drop: false,
-        is_outbound_inject: false,
+        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
     }
 }

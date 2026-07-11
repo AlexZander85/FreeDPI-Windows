@@ -54,7 +54,12 @@ pub trait EngineHandle {
     fn test_strategy(&self, params: &StrategyTestParams) -> Result<StrategyTestResult, String>;
     fn tune_strategy(&self, params: &TuneParams);
     fn set_routing_override(&self, params: &RoutingOverride);
-    fn probe_domain(&self, domain: &str, full: bool) -> Result<serde_json::Value, String>;
+    fn probe_domain(
+        &self,
+        domain: &str,
+        full: bool,
+        apply: bool,
+    ) -> Result<serde_json::Value, String>;
     fn probe_batch(&self, domains: &[&str], full: bool) -> Result<serde_json::Value, String>;
     fn get_presets(&self) -> serde_json::Value;
     fn get_probe_history(&self) -> serde_json::Value;
@@ -131,6 +136,8 @@ pub struct ProbeRequest {
     pub domain: String,
     #[serde(default = "default_false")]
     pub full: bool,
+    #[serde(default = "default_false")]
+    pub apply: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,7 +320,10 @@ async fn probe_handler(
     State(state): State<Arc<ApiState>>,
     Json(params): Json<ProbeRequest>,
 ) -> impl IntoResponse {
-    match state.engine.probe_domain(&params.domain, params.full) {
+    match state
+        .engine
+        .probe_domain(&params.domain, params.full, params.apply)
+    {
         Ok(result) => (StatusCode::OK, Json(result)),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -545,7 +555,12 @@ mod tests {
         }
         fn tune_strategy(&self, _params: &TuneParams) {}
         fn set_routing_override(&self, _params: &RoutingOverride) {}
-        fn probe_domain(&self, domain: &str, _full: bool) -> Result<serde_json::Value, String> {
+        fn probe_domain(
+            &self,
+            domain: &str,
+            _full: bool,
+            _apply: bool,
+        ) -> Result<serde_json::Value, String> {
             Ok(serde_json::json!({
                 "domain": domain,
                 "verdict": "ambiguous",

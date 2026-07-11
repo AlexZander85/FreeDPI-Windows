@@ -2267,11 +2267,28 @@ mod tests {
     fn test_profile_firefox_no_x25519mlkem768() {
         let mut rng = PerConnRng::new(42);
         let firefox_ch = build_firefox_120_ch("example.com", &mut rng);
+
+        let mut found = false;
+        let mut has_hybrid = false;
+        let mut i = 0;
+        while i < firefox_ch.len() - 4 {
+            if firefox_ch[i..i + 2] == [0x00, 0x0A] {
+                found = true;
+                let ext_len = u16::from_be_bytes([firefox_ch[i + 2], firefox_ch[i + 3]]) as usize;
+                let start = i + 4;
+                let end = (start + ext_len).min(firefox_ch.len());
+                let supported_groups_data = &firefox_ch[start..end];
+                has_hybrid = supported_groups_data
+                    .windows(2)
+                    .any(|w| w == GROUP_X25519MLKEM768.to_be_bytes());
+                break;
+            }
+            i += 1;
+        }
+        assert!(found, "supported_groups extension not found");
         assert!(
-            !firefox_ch
-                .windows(2)
-                .any(|w| w == GROUP_X25519MLKEM768.to_be_bytes()),
-            "Firefox CH must NOT have X25519MLKEM768 (0x11EC)"
+            !has_hybrid,
+            "Firefox CH supported_groups extension must NOT have X25519MLKEM768"
         );
     }
 

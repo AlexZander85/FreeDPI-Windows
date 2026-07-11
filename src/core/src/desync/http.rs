@@ -1020,7 +1020,7 @@ pub fn chunk_obfuscation(packet: &[u8], split_count: usize, fake_ttl_offset: u8)
         inject,
         inter_delay_us: 0,
         drop: false,
-        is_outbound_inject: false,
+        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
     }
 }
 

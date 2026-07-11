@@ -9,8 +9,42 @@
 //! ChaCha8Rng — CSPRNG, DPI не может восстановить state по выходам.
 //! Xoshiro256++ — passes BigCrush, O'Neill 2019, быстрый non-crypto PRNG.
 
+use hmac::{Hmac, Mac};
 use rand_chacha::ChaCha12Rng;
 use rand_core::{RngCore, SeedableRng};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub struct RngSeedDeriver {
+    key: [u8; 32],
+    counter: std::sync::atomic::AtomicU64,
+}
+
+impl RngSeedDeriver {
+    pub fn from_os_rng_once() -> anyhow::Result<Self> {
+        let mut key = [0u8; 32];
+        rand_core::RngCore::try_fill_bytes(&mut rand_core::OsRng, &mut key)
+            .map_err(|e| anyhow::anyhow!("OsRng error: {e}"))?;
+        Ok(Self {
+            key,
+            counter: std::sync::atomic::AtomicU64::new(1),
+        })
+    }
+
+    pub fn derive_for_conn_id(&self, conn_id: u64) -> [u8; 32] {
+        let ctr = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut mac = HmacSha256::new_from_slice(&self.key).expect("HMAC can take any key size");
+        mac.update(&conn_id.to_le_bytes());
+        mac.update(&ctr.to_le_bytes());
+        let result = mac.finalize();
+        result.into_bytes().into()
+    }
+}
+
+pub static SEED_DERIVER: std::sync::OnceLock<RngSeedDeriver> = std::sync::OnceLock::new();
 
 // ============================================================================
 // Thread-local CSPRNG (global functions)
@@ -88,19 +122,11 @@ impl std::fmt::Debug for PerConnRng {
 
 impl PerConnRng {
     pub fn new(conn_id: u64) -> Self {
-        let mut seed = [0u8; 32];
-        rand_core::OsRng.fill_bytes(&mut seed);
-        let fast_seed = splitmix64(u64::from_le_bytes(seed[..8].try_into().unwrap()) ^ conn_id);
-        Self {
-            fast: Xoshiro256ppState::new([
-                fast_seed,
-                splitmix64(fast_seed.wrapping_add(0x9E3779B97F4A7C15)),
-                splitmix64(fast_seed.wrapping_add(0xBB67AE8584CAA73B)),
-                splitmix64(fast_seed.wrapping_add(0x3C6EF372FE94F82B)),
-            ]),
-            crypto: ChaCha12Rng::from_seed(seed),
-            counter: 0,
-        }
+        let deriver = SEED_DERIVER.get_or_init(|| {
+            RngSeedDeriver::from_os_rng_once().expect("Failed to initialize OS RNG entropy deriver")
+        });
+        let seed = deriver.derive_for_conn_id(conn_id);
+        Self::from_seed(seed, conn_id)
     }
 
     /// Non-observable PRNG (TTL offset, padding LENGTH, internal jitter).
@@ -115,9 +141,10 @@ impl PerConnRng {
     pub fn next_wire_u64(&mut self) -> u64 {
         self.counter += 1;
         if (self.counter & RESEED_MASK) == 0 {
-            let mut new_seed = [0u8; 32];
-            rand_core::OsRng.fill_bytes(&mut new_seed);
-            self.crypto = ChaCha12Rng::from_seed(new_seed);
+            if let Some(deriver) = SEED_DERIVER.get() {
+                let new_seed = deriver.derive_for_conn_id(self.counter);
+                self.crypto = ChaCha12Rng::from_seed(new_seed);
+            }
         }
         self.crypto.next_u64()
     }

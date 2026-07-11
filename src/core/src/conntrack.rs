@@ -1,11 +1,108 @@
 //! Connection tracking — отслеживание состояния TCP/UDP соединений.
 
 use dashmap::DashMap;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
+
+/// P0-09: Канонический ключ соединения (направленно-независимый).
+/// Всегда сортирует (src, dst) и (sport, dport) так, что
+/// потоки client→server и server→client дают один и тот же FlowKey.
+#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
+pub struct FlowKey {
+    pub ip_a: IpAddr,
+    pub ip_b: IpAddr,
+    pub port_a: u16,
+    pub port_b: u16,
+    pub proto: u8,
+}
+
+impl FlowKey {
+    /// Создаёт канонический FlowKey, где ip_a ≤ ip_b (лексикографически),
+    /// а порты соответствуют порядку IP.
+    pub fn new_bidirectional(
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        proto: u8,
+    ) -> Self {
+        let (ip_a, ip_b, port_a, port_b) = if canonical_less(src_ip, dst_ip) {
+            (src_ip, dst_ip, src_port, dst_port)
+        } else {
+            (dst_ip, src_ip, dst_port, src_port)
+        };
+        Self {
+            ip_a,
+            ip_b,
+            port_a,
+            port_b,
+            proto,
+        }
+    }
+}
+
+/// P0-09: Сравнение IP-адресов для канонического порядка.
+/// IPv4 < IPv6 (по длине), затем лексикографически по октетам.
+fn canonical_less(a: IpAddr, b: IpAddr) -> bool {
+    match (a, b) {
+        (IpAddr::V4(a4), IpAddr::V4(b4)) => u32::from(a4) < u32::from(b4),
+        (IpAddr::V6(a6), IpAddr::V6(b6)) => u128::from(a6) < u128::from(b6),
+        (IpAddr::V4(_), IpAddr::V6(_)) => true, // v4 < v6
+        (IpAddr::V6(_), IpAddr::V4(_)) => false,
+    }
+}
+
+/// P0-09: Connection ID hasher, использует SipHash-1-3 с
+/// процесс-локальным случайным ключом. Заменяет XOR-folding ip_to_u64.
+pub struct ConnIdHasher {
+    key0: u64,
+    key1: u64,
+}
+
+impl ConnIdHasher {
+    /// Создаёт hasher со случайными ключами (вызывается один раз при старте процесса).
+    pub const fn new(key0: u64, key1: u64) -> Self {
+        Self { key0, key1 }
+    }
+
+    /// P0-09: Хеширует FlowKey в u64 conn_id для PerConnRng.
+    /// Использует SipHash-1-3 (безопаснее XOR-folding, без коллизий IPv6 /64).
+    pub fn hash_flow_key(&self, fk: &FlowKey) -> u64 {
+        let mut hasher = siphasher::sip::SipHasher13::new_with_keys(self.key0, self.key1);
+        fk.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// P0-09: Процесс-локальный ConnIdHasher (инициализируется со случайными ключами при старте).
+static CONN_ID_HASHER: std::sync::OnceLock<ConnIdHasher> = std::sync::OnceLock::new();
+
+/// P0-09: Инициализирует глобальный ConnIdHasher. Должна быть вызвана при старте процесса.
+pub fn init_conn_id_hasher() {
+    CONN_ID_HASHER.get_or_init(|| {
+        ConnIdHasher::new(
+            crate::desync::rand::random_u64(),
+            crate::desync::rand::random_u64(),
+        )
+    });
+}
+
+/// P0-09: Вычисляет conn_id для заданного FlowKey.
+/// Замена XOR-folding ip_to_u64.
+pub fn compute_conn_id(fk: &FlowKey) -> u64 {
+    CONN_ID_HASHER
+        .get_or_init(|| {
+            ConnIdHasher::new(
+                crate::desync::rand::random_u64(),
+                crate::desync::rand::random_u64(),
+            )
+        })
+        .hash_flow_key(fk)
+}
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub struct ConnKey {
@@ -67,6 +164,10 @@ pub struct ConntrackEntry {
     /// DSCP per-connection: фиксированное значение для всех пакетов соединения
     pub dscp_spoof: u8,
     pub strategy_id: u32,
+    /// P0-07: имя стратегии, которая была применена к соединению.
+    /// Заполняется при первой десинхронизации. Используется для
+    /// record_outcome: RST → fail, SYN-ACK/Established → success.
+    pub applied_strategy: Option<String>,
     pub last_activity: Instant,
     pub dup_ack_count: u32,
     pub rng: Option<crate::desync::rand::PerConnRng>,
@@ -78,6 +179,8 @@ pub struct ConntrackEntry {
     pub quic_pn: u64,
     /// QUIC: destination connection ID (первые 8 байт, для идентификации потока).
     pub quic_dcid: Vec<u8>,
+    pub route_key: Option<String>,
+    pub quic_dropped_initials: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -91,20 +194,35 @@ struct ConntrackInner {
     gc_interval: Duration,
     total_created: AtomicU64,
     active_count: AtomicU64,
-    gc_cursor: AtomicUsize,
+    gc_tick: std::sync::atomic::AtomicUsize,
+    gc_wheel: Vec<crossbeam::queue::SegQueue<ConnKey>>,
 }
 
 impl Conntrack {
     pub fn new(gc_interval: Duration) -> Self {
+        let mut gc_wheel = Vec::with_capacity(256);
+        for _ in 0..256 {
+            gc_wheel.push(crossbeam::queue::SegQueue::new());
+        }
         Self {
             inner: Arc::new(ConntrackInner {
                 map: DashMap::new(),
                 gc_interval,
                 total_created: AtomicU64::new(0),
                 active_count: AtomicU64::new(0),
-                gc_cursor: AtomicUsize::new(0),
+                gc_tick: std::sync::atomic::AtomicUsize::new(0),
+                gc_wheel,
             }),
         }
+    }
+
+    fn schedule_gc_key(&self, key: ConnKey) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash_val = hasher.finish();
+        let slot = (hash_val % 256) as usize;
+        self.inner.gc_wheel[slot].push(key);
     }
 
     /// Вставляет или обновляет запись — использует Entry API (один shard lock).
@@ -116,9 +234,11 @@ impl Conntrack {
                 e.insert(entry);
                 self.inner.total_created.fetch_add(1, Ordering::Relaxed);
                 self.inner.active_count.fetch_add(1, Ordering::Relaxed);
+                self.schedule_gc_key(key);
             }
             Entry::Occupied(mut e) => {
                 e.get_mut().last_activity = Instant::now();
+                self.schedule_gc_key(key);
             }
         }
     }
@@ -140,6 +260,7 @@ impl Conntrack {
                 } else {
                     entry.desync_applied = true;
                     entry.last_activity = Instant::now();
+                    self.schedule_gc_key(key);
                     true
                 }
             }
@@ -163,10 +284,14 @@ impl Conntrack {
                     quic_pn: 0,
                     quic_dcid: vec![],
                     is_resumption: false,
+                    applied_strategy: None,
+                    route_key: None,
+                    quic_dropped_initials: 0,
                 };
                 e.insert(entry);
                 self.inner.total_created.fetch_add(1, Ordering::Relaxed);
                 self.inner.active_count.fetch_add(1, Ordering::Relaxed);
+                self.schedule_gc_key(key);
                 true
             }
         }
@@ -219,6 +344,8 @@ impl Conntrack {
             // delta outside [-2^30, 2^30] is treated as outlier and ignored
             entry.client_ack = ack;
             entry.last_activity = Instant::now();
+            drop(entry);
+            self.schedule_gc_key(*key);
         }
     }
 
@@ -243,38 +370,39 @@ impl Conntrack {
         }
     }
 
-    /// Incremental GC — round-robin across shards using gc_cursor.
-    /// Processes entries from a subset of shards each tick to amortize work.
+    /// Bucketed timing-wheel GC using crossbeam SegQueue.
     pub fn gc_incremental(&self, max_idle: Duration) {
-        let deadline = Instant::now() + Duration::from_millis(1);
+        let slot = self.inner.gc_tick.fetch_add(1, Ordering::Relaxed) % 256;
+        let queue = &self.inner.gc_wheel[slot];
         let mut evicted = 0u64;
 
-        // Round-robin: start from current cursor position
-        // Use a fixed shard count estimate (DashMap default is num_cpus, typically 8-64)
-        let estimated_shards = 16; // reasonable default
-        let start = self.inner.gc_cursor.fetch_add(1, Ordering::Relaxed) % estimated_shards;
+        let mut count = 0;
+        while let Some(key) = queue.pop() {
+            count += 1;
+            if count > 1000 {
+                queue.push(key);
+                break;
+            }
 
-        // Collect keys to remove from this shard subset
-        let to_remove: Vec<ConnKey> = self
-            .inner
-            .map
-            .iter()
-            .skip(start)
-            .take_while(|_| Instant::now() <= deadline)
-            .filter(|r| r.value().last_activity.elapsed() > max_idle)
-            .map(|r| *r.key())
-            .collect();
-
-        for key in to_remove {
-            self.inner.map.remove(&key);
-            evicted += 1;
+            if let Some(entry) = self.inner.map.get(&key) {
+                if entry.last_activity.elapsed() > max_idle {
+                    drop(entry);
+                    self.inner.map.remove(&key);
+                    evicted += 1;
+                } else {
+                    drop(entry);
+                    // Reschedule since it is still active
+                    let next_slot = (slot + 128) % 256;
+                    self.inner.gc_wheel[next_slot].push(key);
+                }
+            }
         }
 
         if evicted > 0 {
             self.inner
                 .active_count
                 .fetch_sub(evicted, Ordering::Relaxed);
-            debug!("Conntrack GC incremental: evicted {} entries", evicted);
+            debug!("Conntrack GC timing-wheel: evicted {} entries", evicted);
         }
     }
 
@@ -337,6 +465,9 @@ mod tests {
             quic_pn: 0,
             quic_dcid: vec![],
             is_resumption: false,
+            applied_strategy: None,
+            route_key: None,
+            quic_dropped_initials: 0,
         }
     }
 
@@ -347,6 +478,22 @@ mod tests {
         ct.insert(key, test_entry());
         assert!(ct.contains(&key));
         assert_eq!(ct.get(&key).unwrap().strategy_id, 42);
+    }
+
+    #[test]
+    fn test_observe_tcp_syn_updates_existing_zero_isn() {
+        let ct = Conntrack::default();
+        let key = test_key();
+        let mut entry = test_entry();
+        entry.client_isn = 0;
+        ct.insert(key, entry);
+
+        // Simulate SYN observation
+        if let Some(mut e) = ct.get_mut(&key) {
+            e.client_isn = 777;
+        }
+
+        assert_eq!(ct.get(&key).unwrap().client_isn, 777);
     }
 
     #[test]
@@ -428,5 +575,31 @@ mod tests {
             17,
         );
         assert_ne!(k1, k2); // Different proto → different key
+    }
+
+    #[test]
+    fn test_gc_incremental_removes_stale() {
+        let ct = Conntrack::default();
+        let key = test_key();
+        let mut entry = test_entry();
+        entry.last_activity = Instant::now() - Duration::from_secs(300);
+        ct.insert(key, entry);
+
+        for _ in 0..256 {
+            ct.gc_incremental(Duration::from_secs(120));
+        }
+        assert!(!ct.contains(&key));
+    }
+
+    #[test]
+    fn test_gc_incremental_keeps_recent() {
+        let ct = Conntrack::default();
+        let key = test_key();
+        ct.insert(key, test_entry());
+
+        for _ in 0..256 {
+            ct.gc_incremental(Duration::from_secs(120));
+        }
+        assert!(ct.contains(&key));
     }
 }

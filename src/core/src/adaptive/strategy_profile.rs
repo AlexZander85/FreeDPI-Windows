@@ -9,9 +9,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error};
 
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct ProfileId(pub u32);
+
 /// Стратегия обхода — связывает имя с набором техник и параметрами.
 #[derive(Debug, Clone)]
 pub struct StrategyProfile {
+    pub id: ProfileId,
     /// Уникальное имя профиля — ключ в `AutoTune` и в `StrategyProfileRegistry`.
     pub name: String,
     /// Категория трафика (переиспользует `adaptive::strategy::StrategyCategory`).
@@ -50,16 +55,18 @@ impl StrategyProfile {
 
 /// Реестр профилей стратегий.
 pub struct StrategyProfileRegistry {
-    profiles: HashMap<String, StrategyProfile>,
-    category_defaults: HashMap<StrategyCategory, String>,
-    id_map: HashMap<u32, String>,
+    profiles: Vec<StrategyProfile>,
+    name_to_id: HashMap<String, ProfileId>,
+    category_defaults: HashMap<StrategyCategory, ProfileId>,
+    id_map: HashMap<u32, ProfileId>,
 }
 
 impl StrategyProfileRegistry {
     /// Создаёт реестр со стандартными профилями.
     pub fn with_defaults(base_config: &DesyncConfig, user_techniques: &[DesyncTechnique]) -> Self {
         let mut registry = Self {
-            profiles: HashMap::new(),
+            profiles: Vec::new(),
+            name_to_id: HashMap::new(),
             category_defaults: HashMap::new(),
             id_map: HashMap::new(),
         };
@@ -71,7 +78,7 @@ impl StrategyProfileRegistry {
         };
 
         // === 1: outbound_tls ===
-        registry.register(
+        let tls_id = registry.register(
             base_config,
             "outbound_tls",
             StrategyCategory::Tls,
@@ -87,21 +94,21 @@ impl StrategyProfileRegistry {
         );
         registry
             .category_defaults
-            .insert(StrategyCategory::Tls, "outbound_tls".into());
+            .insert(StrategyCategory::Tls, tls_id);
 
         // === 2: outbound_tls_split ===
         registry.register(
             base_config,
             "outbound_tls_split",
             StrategyCategory::Tls,
-            vec![DesyncTechnique::MultiSplit, DesyncTechnique::BadChecksum],
+            vec![DesyncTechnique::MultiSplit],
             TuneParams {
                 split_size: Some(1),
                 split_count: Some(3),
                 fake_ttl_offset: Some(1),
                 max_seg_size: Some(10),
             },
-            "TLS split-only: MultiSplit + BadChecksum (без FakeSni)",
+            "TLS split-only: MultiSplit (без FakeSni)",
             2,
         );
 
@@ -110,14 +117,14 @@ impl StrategyProfileRegistry {
             base_config,
             "outbound_tls_disorder",
             StrategyCategory::Tls,
-            vec![DesyncTechnique::Disorder, DesyncTechnique::BadChecksum],
+            vec![DesyncTechnique::Disorder],
             TuneParams {
                 split_size: Some(1),
                 split_count: Some(2),
                 fake_ttl_offset: Some(1),
                 max_seg_size: Some(10),
             },
-            "TLS disorder: Disorder + BadChecksum",
+            "TLS disorder: Disorder",
             7,
         );
 
@@ -126,14 +133,14 @@ impl StrategyProfileRegistry {
             base_config,
             "outbound_tls_tlsfrag",
             StrategyCategory::Tls,
-            vec![DesyncTechnique::TlsRecordFrag, DesyncTechnique::BadChecksum],
+            vec![DesyncTechnique::TlsRecordFrag],
             TuneParams {
                 split_size: Some(5),
                 split_count: Some(2),
                 fake_ttl_offset: Some(1),
                 max_seg_size: Some(10),
             },
-            "TLS record fragmentation: TlsRecordFrag + BadChecksum",
+            "TLS record fragmentation: TlsRecordFrag",
             15,
         );
 
@@ -154,7 +161,7 @@ impl StrategyProfileRegistry {
         );
 
         // === 6: outbound_http ===
-        registry.register(
+        let http_id = registry.register(
             base_config,
             "outbound_http",
             StrategyCategory::Http,
@@ -173,10 +180,10 @@ impl StrategyProfileRegistry {
         );
         registry
             .category_defaults
-            .insert(StrategyCategory::Http, "outbound_http".into());
+            .insert(StrategyCategory::Http, http_id);
 
         // === 7: outbound_quic ===
-        registry.register(
+        let quic_id = registry.register(
             base_config,
             "outbound_quic",
             StrategyCategory::Quic,
@@ -192,7 +199,7 @@ impl StrategyProfileRegistry {
         );
         registry
             .category_defaults
-            .insert(StrategyCategory::Quic, "outbound_quic".into());
+            .insert(StrategyCategory::Quic, quic_id);
 
         // === 8: outbound_quic_downgrade ===
         registry.register(
@@ -319,12 +326,12 @@ impl StrategyProfileRegistry {
                 id
             };
 
-            match crate::config::profile_config_to_profile(user_cfg, id) {
+            match crate::config::profile_config_to_profile(user_cfg, id, base_config) {
                 Ok(temp_profile) => {
                     let name = temp_profile.name.clone();
                     let category = temp_profile.category;
 
-                    registry.register(
+                    let profile_id = registry.register(
                         base_config,
                         &name,
                         category,
@@ -335,8 +342,8 @@ impl StrategyProfileRegistry {
                     );
 
                     // Если пользователь пометил профиль как default/active, обновляем дефолт категории
-                    if user_cfg.default == Some(true) {
-                        registry.category_defaults.insert(category, name.clone());
+                    if user_cfg.default == Some(true) || user_cfg.enabled == Some(true) {
+                        registry.category_defaults.insert(category, profile_id);
                     }
 
                     tracing::info!(
@@ -369,19 +376,39 @@ impl StrategyProfileRegistry {
         default_params: TuneParams,
         description: &str,
         strategy_id: u32,
-    ) {
+    ) -> ProfileId {
         let desync_group = Arc::new(Self::build_validated_group(base_config, &techniques, name));
-        let profile = StrategyProfile {
-            name: name.to_string(),
-            category,
-            techniques,
-            default_params,
-            description: description.to_string(),
-            strategy_id,
-            desync_group,
-        };
-        self.id_map.insert(strategy_id, name.to_string());
-        self.profiles.insert(name.to_string(), profile);
+        if let Some(&id) = self.name_to_id.get(name) {
+            let profile = StrategyProfile {
+                id,
+                name: name.to_string(),
+                category,
+                techniques,
+                default_params,
+                description: description.to_string(),
+                strategy_id,
+                desync_group,
+            };
+            self.id_map.insert(strategy_id, id);
+            self.profiles[id.0 as usize] = profile;
+            id
+        } else {
+            let id = ProfileId(self.profiles.len() as u32);
+            let profile = StrategyProfile {
+                id,
+                name: name.to_string(),
+                category,
+                techniques,
+                default_params,
+                description: description.to_string(),
+                strategy_id,
+                desync_group,
+            };
+            self.name_to_id.insert(name.to_string(), id);
+            self.id_map.insert(strategy_id, id);
+            self.profiles.push(profile);
+            id
+        }
     }
 
     fn build_validated_group(
@@ -407,19 +434,36 @@ impl StrategyProfileRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<&StrategyProfile> {
-        self.profiles.get(name)
+        self.name_to_id
+            .get(name)
+            .and_then(|&id| self.profiles.get(id.0 as usize))
     }
 
     pub fn get_default_for_category(&self, category: StrategyCategory) -> Option<&StrategyProfile> {
         self.category_defaults
             .get(&category)
-            .and_then(|name| self.profiles.get(name))
+            .and_then(|&id| self.profiles.get(id.0 as usize))
     }
 
     pub fn get_by_id(&self, strategy_id: u32) -> Option<&StrategyProfile> {
         self.id_map
             .get(&strategy_id)
-            .and_then(|name| self.profiles.get(name))
+            .and_then(|&id| self.profiles.get(id.0 as usize))
+    }
+
+    #[inline]
+    pub fn get_by_profile_id(&self, id: ProfileId) -> Option<&StrategyProfile> {
+        self.profiles.get(id.0 as usize)
+    }
+
+    pub fn find_by_technique(&self, technique: DesyncTechnique) -> Option<&StrategyProfile> {
+        self.profiles
+            .iter()
+            .find(|p| p.techniques.contains(&technique))
+    }
+
+    pub fn id_by_name(&self, name: &str) -> Option<ProfileId> {
+        self.name_to_id.get(name).copied()
     }
 
     pub fn len(&self) -> usize {
@@ -497,7 +541,7 @@ mod tests {
         let split = registry.get("outbound_tls_split").unwrap();
         assert_eq!(
             split.desync_group.techniques(),
-            &[DesyncTechnique::MultiSplit, DesyncTechnique::BadChecksum]
+            &[DesyncTechnique::MultiSplit]
         );
     }
 
@@ -508,7 +552,7 @@ mod tests {
         assert_eq!(registry.get("outbound_tls").unwrap().techniques, custom);
         assert_eq!(
             registry.get("outbound_tls_split").unwrap().techniques,
-            vec![DesyncTechnique::MultiSplit, DesyncTechnique::BadChecksum]
+            vec![DesyncTechnique::MultiSplit]
         );
     }
 
@@ -535,7 +579,7 @@ mod tests {
         let user_profiles = vec![crate::config::StrategyProfileConfig {
             name: "custom_tls_aggressive".into(),
             protocol: "tls".into(),
-            techniques: vec!["TlsRecordFrag".into(), "BadChecksum".into()],
+            techniques: vec!["TlsRecordFrag".into()],
             split_size: Some(3),
             split_count: Some(5),
             fake_ttl_offset: Some(2),
@@ -559,7 +603,7 @@ mod tests {
         let user_profiles = vec![crate::config::StrategyProfileConfig {
             name: "outbound_tls".into(), // replace default
             protocol: "tls".into(),
-            techniques: vec!["MultiSplit".into(), "BadChecksum".into()],
+            techniques: vec!["MultiSplit".into()],
             split_size: Some(2),
             split_count: Some(4),
             fake_ttl_offset: Some(2),
@@ -596,5 +640,28 @@ mod tests {
             .get_default_for_category(StrategyCategory::Tls)
             .unwrap();
         assert_eq!(default_tls.name, "outbound_tls_custom_default");
+    }
+
+    #[test]
+    fn test_user_enabled_sets_category_default() {
+        let cfg = crate::config::StrategyProfileConfig {
+            name: "my_tls".into(),
+            protocol: "tls".into(),
+            techniques: vec!["multisplit".into()],
+            split_size: Some(1),
+            split_count: Some(2),
+            fake_ttl_offset: Some(1),
+            max_seg_size: Some(100),
+            default: None,
+            enabled: Some(true),
+        };
+        let registry = StrategyProfileRegistry::from_config(&DesyncConfig::default(), &[cfg], &[]);
+        assert_eq!(
+            registry
+                .get_default_for_category(StrategyCategory::Tls)
+                .unwrap()
+                .name,
+            "my_tls"
+        );
     }
 }

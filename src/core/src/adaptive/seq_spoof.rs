@@ -388,6 +388,9 @@ mod tests {
             quic_pn: 0,
             quic_dcid: vec![],
             is_resumption: false,
+            applied_strategy: None,
+            route_key: None,
+            quic_dropped_initials: 0,
         };
         ct.insert(key, entry);
         ct
@@ -603,6 +606,9 @@ mod tests {
             quic_pn: 0,
             quic_dcid: vec![],
             is_resumption: true, // Включаем resumption
+            applied_strategy: None,
+            route_key: None,
+            quic_dropped_initials: 0,
         };
         ct.insert(key, entry);
 
@@ -682,6 +688,9 @@ mod tests {
             quic_pn: 0,
             quic_dcid: vec![],
             is_resumption: false,
+            applied_strategy: None,
+            route_key: None,
+            quic_dropped_initials: 0,
         };
         ct.insert(key, entry);
 

@@ -246,10 +246,12 @@ impl AwgTunnel {
             loop {
                 match socket_clone.recv(&mut buf).await {
                     Ok(len) => {
-                        let mut packet = buf[0..len].to_vec();
-                        if !obf_clone.deobfuscate(&mut packet) {
-                            continue; // Discard invalid/junk packet
-                        }
+                        let packet_slice = &mut buf[0..len];
+                        let packet_len = match obf_clone.deobfuscate_slice(packet_slice) {
+                            Some(new_len) => new_len,
+                            None => continue, // Discard invalid/junk packet
+                        };
+                        let deobf_packet = &packet_slice[..packet_len];
 
                         let mono_nanos = start_time.elapsed().as_nanos() as u64;
                         let system_time = std::time::SystemTime::now()
@@ -266,7 +268,7 @@ impl AwgTunnel {
                             now,
                             &[],
                             false,
-                            &packet,
+                            deobf_packet,
                             &mut decap_buf,
                             &mut rng,
                         ) {
@@ -275,23 +277,48 @@ impl AwgTunnel {
                                 if let Some(parsed) = parse_ipv4_udp(plain) {
                                     if let Some(entry) = nat_clone.get(&parsed.dst_port) {
                                         let (client_ip, client_port) = *entry;
-                                        let mut plain_packet = plain.to_vec();
-                                        rewrite_ipv4_udp(
-                                            &mut plain_packet,
-                                            parsed.src_ip,
-                                            parsed.src_port,
-                                            client_ip,
-                                            client_port,
-                                        );
-                                        // Reinject decapsulated reply
-                                        let _ = engine_clone.inject_raw_udp(&plain_packet);
+                                        let plain_len = plain.len();
+                                        let mut plain_buf = [0u8; 2048];
+                                        if plain_len <= 2048 {
+                                            plain_buf[..plain_len].copy_from_slice(plain);
+                                            let slice = &mut plain_buf[..plain_len];
+                                            rewrite_ipv4_udp(
+                                                slice,
+                                                parsed.src_ip,
+                                                parsed.src_port,
+                                                client_ip,
+                                                client_port,
+                                            );
+                                            let _ = engine_clone.inject_raw_udp(slice);
+                                        } else {
+                                            let mut plain_packet = plain.to_vec();
+                                            rewrite_ipv4_udp(
+                                                &mut plain_packet,
+                                                parsed.src_ip,
+                                                parsed.src_port,
+                                                client_ip,
+                                                client_port,
+                                            );
+                                            let _ = engine_clone.inject_raw_udp(&plain_packet);
+                                        }
                                     }
                                 }
                             }
                             Ok(Received::Reply(reply_bytes)) => {
-                                let mut reply_vec = reply_bytes.to_vec();
-                                obf_clone.obfuscate(&mut reply_vec);
-                                let _ = socket_clone.send(&reply_vec).await;
+                                let reply_len = reply_bytes.len();
+                                let mut reply_buf = [0u8; 512];
+                                if reply_len <= 512 {
+                                    reply_buf[..reply_len].copy_from_slice(reply_bytes);
+                                    if let (_, Some(new_len)) =
+                                        obf_clone.obfuscate_slice(&mut reply_buf, reply_len)
+                                    {
+                                        let _ = socket_clone.send(&reply_buf[..new_len]).await;
+                                    }
+                                } else {
+                                    let mut reply_vec = reply_bytes.to_vec();
+                                    obf_clone.obfuscate(&mut reply_vec);
+                                    let _ = socket_clone.send(&reply_vec).await;
+                                }
                             }
                             Ok(Received::HandshakeComplete) => {
                                 info!("AWG: Handshake complete!");
@@ -335,15 +362,32 @@ impl AwgTunnel {
                 if let Ok(PollOutput::Send(wire_bytes, reason)) =
                     tunnel_guard.poll(now, &mut poll_buf, &mut rng)
                 {
-                    let mut wire_vec = wire_bytes.to_vec();
-                    if matches!(
-                        reason,
-                        SendReason::HandshakeInitiation | SendReason::HandshakeRetransmit
-                    ) {
-                        let _ = obf_clone.inject_junk_packets(&socket_clone, endpoint).await;
+                    let wire_len = wire_bytes.len();
+                    let mut wire_buf = [0u8; 2048];
+                    if wire_len <= 2048 {
+                        wire_buf[..wire_len].copy_from_slice(wire_bytes);
+                        if matches!(
+                            reason,
+                            SendReason::HandshakeInitiation | SendReason::HandshakeRetransmit
+                        ) {
+                            let _ = obf_clone.inject_junk_packets(&socket_clone, endpoint).await;
+                        }
+                        if let (_, Some(new_len)) =
+                            obf_clone.obfuscate_slice(&mut wire_buf, wire_len)
+                        {
+                            let _ = socket_clone.send(&wire_buf[..new_len]).await;
+                        }
+                    } else {
+                        let mut wire_vec = wire_bytes.to_vec();
+                        if matches!(
+                            reason,
+                            SendReason::HandshakeInitiation | SendReason::HandshakeRetransmit
+                        ) {
+                            let _ = obf_clone.inject_junk_packets(&socket_clone, endpoint).await;
+                        }
+                        obf_clone.obfuscate(&mut wire_vec);
+                        let _ = socket_clone.send(&wire_vec).await;
                     }
-                    obf_clone.obfuscate(&mut wire_vec);
-                    let _ = socket_clone.send(&wire_vec).await;
                 }
             }
         });
@@ -360,7 +404,7 @@ impl AwgTunnel {
     }
 
     /// Tunnels a raw IP packet via AWG
-    pub async fn send_ip_packet(&self, mut ip_packet: Vec<u8>) -> anyhow::Result<()> {
+    pub async fn send_ip_packet(&self, ip_packet: bytes::Bytes) -> anyhow::Result<()> {
         let parsed = parse_ipv4_udp(&ip_packet)
             .ok_or_else(|| anyhow::anyhow!("Invalid IPv4 UDP packet for AWG tunnel"))?;
 
@@ -369,8 +413,19 @@ impl AwgTunnel {
             .insert(parsed.src_port, (parsed.src_ip, parsed.src_port));
 
         // Rewrite source address to virtual IP
+        let len = ip_packet.len();
+        let mut local_buf = [0u8; 2048];
+        let mut local_vec;
+        let ip_packet_mut = if len <= 2048 {
+            local_buf[..len].copy_from_slice(&ip_packet);
+            &mut local_buf[..len]
+        } else {
+            local_vec = ip_packet.to_vec();
+            &mut local_vec[..]
+        };
+
         rewrite_ipv4_udp(
-            &mut ip_packet,
+            ip_packet_mut,
             self.virtual_ip,
             parsed.src_port,
             parsed.dst_ip,
@@ -387,24 +442,50 @@ impl AwgTunnel {
             system_time.subsec_nanos(),
         );
 
-        let mut encap_buf = vec![0u8; 2048];
+        let mut encap_buf = [0u8; 2048];
         let mut rng = OsEntropy;
 
         let mut tunnel_guard = self.tunnel.lock().await;
-        match tunnel_guard.encapsulate(now, &ip_packet, &mut encap_buf, &mut rng) {
+        match tunnel_guard.encapsulate(now, ip_packet_mut, &mut encap_buf, &mut rng) {
             Ok(Encapsulated::Transport(wire_bytes)) => {
-                let mut wire_vec = wire_bytes.to_vec();
-                self.obfuscator.obfuscate(&mut wire_vec);
-                self.socket.send(&wire_vec).await?;
+                let wire_len = wire_bytes.len();
+                let mut wire_buf = [0u8; 2048];
+                if wire_len <= 2048 {
+                    wire_buf[..wire_len].copy_from_slice(wire_bytes);
+                    if let (_, Some(new_len)) =
+                        self.obfuscator.obfuscate_slice(&mut wire_buf, wire_len)
+                    {
+                        self.socket.send(&wire_buf[..new_len]).await?;
+                    }
+                } else {
+                    let mut wire_vec = wire_bytes.to_vec();
+                    self.obfuscator.obfuscate(&mut wire_vec);
+                    self.socket.send(&wire_vec).await?;
+                }
             }
             Ok(Encapsulated::HandshakeInitiation(wire_bytes)) => {
-                let mut wire_vec = wire_bytes.to_vec();
-                let _ = self
-                    .obfuscator
-                    .inject_junk_packets(&self.socket, self.endpoint)
-                    .await;
-                self.obfuscator.obfuscate(&mut wire_vec);
-                self.socket.send(&wire_vec).await?;
+                let wire_len = wire_bytes.len();
+                let mut wire_buf = [0u8; 2048];
+                if wire_len <= 2048 {
+                    wire_buf[..wire_len].copy_from_slice(wire_bytes);
+                    let _ = self
+                        .obfuscator
+                        .inject_junk_packets(&self.socket, self.endpoint)
+                        .await;
+                    if let (_, Some(new_len)) =
+                        self.obfuscator.obfuscate_slice(&mut wire_buf, wire_len)
+                    {
+                        self.socket.send(&wire_buf[..new_len]).await?;
+                    }
+                } else {
+                    let mut wire_vec = wire_bytes.to_vec();
+                    let _ = self
+                        .obfuscator
+                        .inject_junk_packets(&self.socket, self.endpoint)
+                        .await;
+                    self.obfuscator.obfuscate(&mut wire_vec);
+                    self.socket.send(&wire_vec).await?;
+                }
             }
             Err(e) => {
                 anyhow::bail!("AWG encapsulate error: {e}");

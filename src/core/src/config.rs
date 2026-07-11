@@ -100,7 +100,32 @@ pub struct WindivertConfig {
     pub queue_time: u32,
 }
 
-fn default_filter() -> String {
+/// Настройки сетевого тюнинга (RSS, Chimney, ECN)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkTuningConfig {
+    #[serde(default = "default_true")]
+    pub disable_chimney: bool,
+    #[serde(default = "default_true")]
+    pub disable_ecn: bool,
+    #[serde(default = "default_false")]
+    pub disable_rss: bool,
+}
+
+impl Default for NetworkTuningConfig {
+    fn default() -> Self {
+        Self {
+            disable_chimney: true,
+            disable_ecn: true,
+            disable_rss: false,
+        }
+    }
+}
+
+fn default_false() -> bool {
+    false
+}
+
+pub fn default_filter() -> String {
     "(ip or ipv6) && ( \
         (outbound && tcp.DstPort == 443 && tcp.PayloadLength > 5 \
             && tcp.Payload[0] == 0x16 && tcp.Payload[1] == 0x03 && tcp.Payload[5] == 0x01) \
@@ -158,6 +183,9 @@ pub struct Config {
     /// AmneziaWG configuration
     #[serde(default)]
     pub awg: AwgConfig,
+    /// T64: Network tuning (ECN, Chimney, RSS)
+    #[serde(default)]
+    pub network_tuning: NetworkTuningConfig,
 }
 
 /// Desync секция конфигурации.
@@ -181,6 +209,22 @@ pub struct DesyncSection {
     /// Техники (пусто = default set: FakeSni + MultiSplit + BadChecksum)
     #[serde(default)]
     pub techniques: Vec<String>,
+    /// TTL значение для TtlManipulation
+    #[serde(default = "default_ttl_value")]
+    pub ttl_value: u8,
+    /// Разрешить TtlManipulation на реальных пакетах
+    #[serde(default)]
+    pub allow_real_ttl_manipulation: bool,
+    /// Разрешить BadChecksum на реальных пакетах (разрушительная манипуляция)
+    #[serde(default)]
+    pub allow_destructive_manipulation: bool,
+    /// Политика фолбэка для QUIC
+    #[serde(default)]
+    pub quic_fallback_policy: crate::desync::QuicFallbackPolicy,
+}
+
+fn default_ttl_value() -> u8 {
+    64
 }
 
 fn default_fake_sni() -> String {
@@ -205,6 +249,10 @@ impl Default for DesyncSection {
             fake_ttl_offset: default_fake_ttl_offset(),
             inject_delay_us: default_inject_delay(),
             techniques: Vec::new(),
+            ttl_value: default_ttl_value(),
+            allow_real_ttl_manipulation: false,
+            allow_destructive_manipulation: false,
+            quic_fallback_policy: crate::desync::QuicFallbackPolicy::default(),
         }
     }
 }
@@ -239,6 +287,7 @@ impl Default for Config {
             adaptive_router: crate::routing::adaptive_router::AdaptiveRouterConfig::default(),
             zero_config: ZeroConfigConfig::default(),
             awg: AwgConfig::default(),
+            network_tuning: NetworkTuningConfig::default(),
         }
     }
 }
@@ -258,6 +307,10 @@ impl Config {
             inject_delay_us: self.desync.inject_delay_us,
             inter_delay_us: 0,
             reseed_interval: 8192,
+            ttl_value: self.desync.ttl_value,
+            allow_real_ttl_manipulation: self.desync.allow_real_ttl_manipulation,
+            allow_destructive_manipulation: self.desync.allow_destructive_manipulation,
+            quic_fallback_policy: self.desync.quic_fallback_policy,
             ..Default::default()
         };
 
@@ -284,6 +337,8 @@ impl Config {
             adaptive_router_config: self.adaptive_router.clone(),
             zero_config: self.zero_config.clone(),
             awg: self.awg.clone(),
+            network_tuning: self.network_tuning.clone(),
+            capture_budget: crate::capture_budget::CaptureBudgetConfig::default(),
         }
     }
 }
@@ -454,6 +509,13 @@ pub fn parse_technique_name(name: &str) -> Option<crate::desync::DesyncTechnique
         "quicconnectionclose" => Some(crate::desync::DesyncTechnique::QuicConnectionClose),
         "quicstreamreset" => Some(crate::desync::DesyncTechnique::QuicStreamReset),
         "quicmaxstreams" => Some(crate::desync::DesyncTechnique::QuicMaxStreams),
+        "quicinitialinject" => Some(crate::desync::DesyncTechnique::QuicInitialInject),
+        "quicshortheaderpoison" => Some(crate::desync::DesyncTechnique::QuicShortHeaderPoison),
+        "quicpaddingflood" => Some(crate::desync::DesyncTechnique::QuicPaddingFlood),
+        "doppelgangergrease" => Some(crate::desync::DesyncTechnique::DoppelgangerGrease),
+        "quiclongheaderdrop" => Some(crate::desync::DesyncTechnique::QuicLongHeaderDrop),
+        "quicnormalizer" => Some(crate::desync::DesyncTechnique::QuicNormalizer),
+        "udpcoalescing" => Some(crate::desync::DesyncTechnique::UdpCoalescing),
         "udp2icmp" => Some(crate::desync::DesyncTechnique::Udp2Icmp),
         "xorfirst" => Some(crate::desync::DesyncTechnique::XorFirst),
         "wgobfs" => Some(crate::desync::DesyncTechnique::WgObfs),
@@ -468,12 +530,12 @@ pub fn parse_technique_name(name: &str) -> Option<crate::desync::DesyncTechnique
 pub fn profile_config_to_profile(
     config: &StrategyProfileConfig,
     strategy_id: u32,
+    base_config: &crate::desync::DesyncConfig,
 ) -> Result<crate::adaptive::strategy_profile::StrategyProfile, String> {
     use crate::adaptive::auto_tune::TuneParams;
     use crate::adaptive::strategy::StrategyCategory;
     use crate::adaptive::strategy_profile::StrategyProfile;
     use crate::desync::group::DesyncGroup;
-    use crate::desync::DesyncConfig;
 
     let category = match config.protocol.to_lowercase().as_str() {
         "tls" => StrategyCategory::Tls,
@@ -505,7 +567,19 @@ pub fn profile_config_to_profile(
         }
     }
 
+    let mut group = DesyncGroup::new(base_config.clone());
+    for t in &techniques {
+        group.add(*t);
+    }
+    if let Err(e) = group.validate() {
+        return Err(format!(
+            "Invalid technique composition in strategy '{}': {}",
+            config.name, e
+        ));
+    }
+
     Ok(StrategyProfile {
+        id: crate::adaptive::strategy_profile::ProfileId(0),
         name: config.name.clone(),
         category,
         techniques,
@@ -517,7 +591,7 @@ pub fn profile_config_to_profile(
         },
         description: "User-defined profile from config.toml".to_string(),
         strategy_id,
-        desync_group: std::sync::Arc::new(DesyncGroup::new(DesyncConfig::default())),
+        desync_group: std::sync::Arc::new(group),
     })
 }
 
@@ -615,7 +689,8 @@ queue_length = 4096
             default: None,
             enabled: None,
         };
-        let profile = profile_config_to_profile(&cfg, 200).unwrap();
+        let profile =
+            profile_config_to_profile(&cfg, 200, &crate::desync::DesyncConfig::default()).unwrap();
         assert_eq!(profile.name, "custom_tls");
         assert_eq!(
             profile.category,
@@ -641,7 +716,9 @@ queue_length = 4096
             default: None,
             enabled: None,
         };
-        assert!(profile_config_to_profile(&cfg, 200).is_err());
+        assert!(
+            profile_config_to_profile(&cfg, 200, &crate::desync::DesyncConfig::default()).is_err()
+        );
     }
 
     #[test]
@@ -657,7 +734,9 @@ queue_length = 4096
             default: None,
             enabled: None,
         };
-        assert!(profile_config_to_profile(&cfg, 200).is_err());
+        assert!(
+            profile_config_to_profile(&cfg, 200, &crate::desync::DesyncConfig::default()).is_err()
+        );
     }
 
     #[test]
@@ -679,6 +758,39 @@ fake_ttl_offset = 1
             config.strategies[0].techniques,
             vec!["FakeSni", "BadChecksum"]
         );
+    }
+
+    #[test]
+    fn filter_includes_syn_when_mss_enabled() {
+        let features = FilterFeatures {
+            tls_desync: true,
+            quic_desync: true,
+            dns_proxy: true,
+            mss_clamp: true,
+            win_size_clamp: false,
+            socks_redirect: false,
+            fakeip_redirect: false,
+            target_ports: smallvec::smallvec![443],
+        };
+        let filter = build_windivert_filter(&features);
+        assert!(filter.contains("tcp.Syn"));
+        assert!(filter.contains("tcp.DstPort == 443"));
+    }
+
+    #[test]
+    fn filter_excludes_syn_when_no_syn_features_enabled() {
+        let features = FilterFeatures {
+            tls_desync: true,
+            quic_desync: true,
+            dns_proxy: true,
+            mss_clamp: false,
+            win_size_clamp: false,
+            socks_redirect: false,
+            fakeip_redirect: false,
+            target_ports: smallvec::smallvec![443],
+        };
+        let filter = build_windivert_filter(&features);
+        assert!(!filter.contains("tcp.Syn"));
     }
 }
 
@@ -887,6 +999,94 @@ impl Default for AwgConfig {
             h2: default_awg_h2(),
             h3: default_awg_h3(),
             h4: default_awg_h4(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FilterFeatures {
+    pub tls_desync: bool,
+    pub quic_desync: bool,
+    pub dns_proxy: bool,
+    pub mss_clamp: bool,
+    pub win_size_clamp: bool,
+    pub socks_redirect: bool,
+    pub fakeip_redirect: bool,
+    pub target_ports: smallvec::SmallVec<[u16; 8]>,
+}
+
+fn render_port_predicate(field: &str, ports: &[u16]) -> String {
+    if ports.is_empty() {
+        return "false".to_string();
+    }
+    if ports.len() == 1 {
+        return format!("{} == {}", field, ports[0]);
+    }
+    let parts: Vec<String> = ports
+        .iter()
+        .map(|p| format!("{} == {}", field, p))
+        .collect();
+    format!("({})", parts.join(" or "))
+}
+
+pub fn build_windivert_filter(features: &FilterFeatures) -> String {
+    let mut terms = Vec::new();
+
+    if features.mss_clamp
+        || features.win_size_clamp
+        || features.socks_redirect
+        || features.fakeip_redirect
+    {
+        let ports = render_port_predicate("tcp.DstPort", &features.target_ports);
+        terms.push(format!("(tcp.Syn && !tcp.Ack && {})", ports));
+    }
+
+    if features.tls_desync {
+        terms.push("(tcp.DstPort == 443 && tcp.PayloadLength > 5 && tcp.Payload[0] == 0x16 && tcp.Payload[1] == 0x03 && tcp.Payload[5] == 0x01)".to_string());
+    }
+
+    if features.quic_desync {
+        terms.push("(udp.DstPort == 443 && udp.PayloadLength >= 1200 && (udp.Payload[0] & 0xC0) == 0xC0 && (udp.Payload[0] & 0x30) == 0x00)".to_string());
+    }
+
+    if features.dns_proxy {
+        terms.push("udp.DstPort == 53".to_string());
+    }
+
+    format!("(ip or ipv6) && outbound && ({})", terms.join(" or "))
+}
+
+impl Config {
+    pub fn get_filter_features(&self) -> FilterFeatures {
+        let target_ports = smallvec::smallvec![443];
+
+        let has_technique = |name: &str| {
+            self.desync
+                .techniques
+                .iter()
+                .any(|t| t.to_lowercase().replace('_', "") == name)
+                || self.strategies.iter().any(|s| {
+                    s.techniques
+                        .iter()
+                        .any(|t| t.to_lowercase().replace('_', "") == name)
+                })
+        };
+
+        let mss_clamp = has_technique("mssclamp");
+        let win_size_clamp =
+            has_technique("winsize") || has_technique("wclamp") || has_technique("winscalemanip");
+        let socks_redirect = self.proxy.enabled;
+        let fakeip_redirect = self.zero_config.enabled;
+
+        FilterFeatures {
+            tls_desync: true,
+            quic_desync: true,
+            dns_proxy: true,
+            mss_clamp,
+            win_size_clamp,
+            socks_redirect,
+            fakeip_redirect,
+            target_ports,
         }
     }
 }

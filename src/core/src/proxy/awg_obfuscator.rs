@@ -165,6 +165,97 @@ impl AwgObfuscator {
 
         Ok(())
     }
+
+    /// Obfuscates a standard WireGuard packet to match the AmneziaWG format in-place on a slice.
+    /// Returns (is_initiation, Some(new_len)) or (false, None) if the buffer is too small.
+    pub fn obfuscate_slice(&self, packet: &mut [u8], len: usize) -> (bool, Option<usize>) {
+        if len < 4 {
+            return (false, None);
+        }
+
+        let mut header_bytes = [0u8; 4];
+        header_bytes.copy_from_slice(&packet[0..4]);
+        let msg_type = u32::from_le_bytes(header_bytes);
+
+        let mut is_initiation = false;
+        let junk_size = match msg_type {
+            1 => {
+                is_initiation = true;
+                self.config.s1
+            }
+            2 => self.config.s2,
+            3 => self.config.s3,
+            4 => self.config.s4,
+            _ => 0,
+        };
+
+        if len + junk_size > packet.len() {
+            return (false, None);
+        }
+
+        match msg_type {
+            1 => {
+                packet[0..4].copy_from_slice(&self.config.h1.to_le_bytes());
+            }
+            2 => {
+                packet[0..4].copy_from_slice(&self.config.h2.to_le_bytes());
+            }
+            3 => {
+                packet[0..4].copy_from_slice(&self.config.h3.to_le_bytes());
+            }
+            4 => {
+                packet[0..4].copy_from_slice(&self.config.h4.to_le_bytes());
+            }
+            _ => {}
+        }
+
+        if junk_size > 0 {
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut packet[len..len + junk_size]);
+        }
+
+        (is_initiation, Some(len + junk_size))
+    }
+
+    /// De-obfuscates an incoming AmneziaWG packet to standard WireGuard format in-place on a slice.
+    /// Returns Some(new_len) if de-obfuscation succeeded, or None if the packet is invalid.
+    pub fn deobfuscate_slice(&self, packet: &mut [u8]) -> Option<usize> {
+        if packet.len() < 4 {
+            return None;
+        }
+
+        let mut header_bytes = [0u8; 4];
+        header_bytes.copy_from_slice(&packet[0..4]);
+        let msg_type = u32::from_le_bytes(header_bytes);
+
+        if msg_type == self.config.h1 {
+            if packet.len() < 4 + self.config.s1 {
+                return None;
+            }
+            packet[0..4].copy_from_slice(&1u32.to_le_bytes());
+            Some(packet.len() - self.config.s1)
+        } else if msg_type == self.config.h2 {
+            if packet.len() < 4 + self.config.s2 {
+                return None;
+            }
+            packet[0..4].copy_from_slice(&2u32.to_le_bytes());
+            Some(packet.len() - self.config.s2)
+        } else if msg_type == self.config.h3 {
+            if packet.len() < 4 + self.config.s3 {
+                return None;
+            }
+            packet[0..4].copy_from_slice(&3u32.to_le_bytes());
+            Some(packet.len() - self.config.s3)
+        } else if msg_type == self.config.h4 {
+            if packet.len() < 4 + self.config.s4 {
+                return None;
+            }
+            packet[0..4].copy_from_slice(&4u32.to_le_bytes());
+            Some(packet.len() - self.config.s4)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]

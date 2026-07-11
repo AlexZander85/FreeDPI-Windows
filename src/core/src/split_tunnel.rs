@@ -13,6 +13,7 @@
 use dashmap::{DashMap, DashSet};
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
@@ -58,19 +59,19 @@ pub struct SplitTunnel {
     /// Точные IP, которые НЕ нужно обходить (IPv4 + IPv6)
     blacklist_ips: Arc<DashSet<IpAddr>>,
     /// CIDR диапазоны, которые НЕ нужно обходить
-    blacklist_nets: Vec<IpNet>,
+    blacklist_nets: arc_swap::ArcSwap<Vec<IpNet>>,
     /// Домены, которые нужно обходить (только в WhitelistOnly)
     whitelist_domains: Arc<DashSet<String>>,
     /// Точные IP для whitelist (IPv4 + IPv6)
     whitelist_ips: Arc<DashSet<IpAddr>>,
     /// CIDR диапазоны для whitelist
-    whitelist_nets: Vec<IpNet>,
+    whitelist_nets: arc_swap::ArcSwap<Vec<IpNet>>,
     /// Авто-детекшенные IP (для Auto-режима)
     auto_detected: Arc<DashSet<IpAddr>>,
     /// Маппинг IP → domain (из DNS ответов)
     domain_cache: Arc<DashMap<IpAddr, String>>,
     /// Текущий режим
-    mode: SplitMode,
+    mode: std::sync::atomic::AtomicU8,
 }
 
 impl SplitTunnel {
@@ -85,16 +86,21 @@ impl SplitTunnel {
         blacklist_nets: Vec<IpNet>,
         whitelist_nets: Vec<IpNet>,
     ) -> Self {
+        let mode_val = match mode {
+            SplitMode::WhitelistOnly => 0,
+            SplitMode::BlacklistOnly => 1,
+            SplitMode::Auto => 2,
+        };
         Self {
             blacklist_domains: Arc::new(DashSet::new()),
             blacklist_ips: Arc::new(DashSet::new()),
-            blacklist_nets,
+            blacklist_nets: arc_swap::ArcSwap::new(Arc::new(blacklist_nets)),
             whitelist_domains: Arc::new(DashSet::new()),
             whitelist_ips: Arc::new(DashSet::new()),
-            whitelist_nets,
+            whitelist_nets: arc_swap::ArcSwap::new(Arc::new(whitelist_nets)),
             auto_detected: Arc::new(DashSet::new()),
             domain_cache: Arc::new(DashMap::new()),
-            mode,
+            mode: std::sync::atomic::AtomicU8::new(mode_val),
         }
     }
 
@@ -141,7 +147,7 @@ impl SplitTunnel {
     /// 1. Точное совпадение в DashSet (O(1)) — fast path
     /// 2. CIDR contains (O(n), n = число CIDR диапазонов)
     pub fn should_bypass_ip(&self, dst_ip: &IpAddr) -> bool {
-        match self.mode {
+        match self.mode() {
             SplitMode::WhitelistOnly => {
                 // 1. Точное совпадение
                 let exact = self.domain_cache.get(dst_ip);
@@ -151,7 +157,10 @@ impl SplitTunnel {
                     return true;
                 }
                 // 2. CIDR contains
-                self.whitelist_nets.iter().any(|net| net.contains(dst_ip))
+                self.whitelist_nets
+                    .load()
+                    .iter()
+                    .any(|net| net.contains(dst_ip))
             }
             SplitMode::BlacklistOnly => {
                 // 1. Точное совпадение
@@ -159,7 +168,11 @@ impl SplitTunnel {
                     return false;
                 }
                 // 2. CIDR contains
-                !self.blacklist_nets.iter().any(|net| net.contains(dst_ip))
+                !self
+                    .blacklist_nets
+                    .load()
+                    .iter()
+                    .any(|net| net.contains(dst_ip))
             }
             SplitMode::Auto => !self.auto_detected.contains(dst_ip),
         }
@@ -167,7 +180,7 @@ impl SplitTunnel {
 
     /// Определяет, нужно ли обходить этот домен.
     pub fn should_bypass_domain(&self, domain: &str) -> bool {
-        match self.mode {
+        match self.mode() {
             SplitMode::WhitelistOnly => self.whitelist_domains.contains(domain),
             SplitMode::BlacklistOnly => !self.blacklist_domains.contains(domain),
             SplitMode::Auto => true, // Auto: пробуем всё
@@ -176,7 +189,7 @@ impl SplitTunnel {
 
     /// Принимает решение для домена.
     pub fn decide(&self, domain: &str) -> SplitDecision {
-        match self.mode {
+        match self.mode() {
             SplitMode::WhitelistOnly => {
                 if self.whitelist_domains.contains(domain) {
                     SplitDecision::Bypass
@@ -218,9 +231,11 @@ impl SplitTunnel {
     }
 
     /// Добавляет CIDR в blacklist.
-    pub fn add_net_to_blacklist(&mut self, net: IpNet) {
+    pub fn add_net_to_blacklist(&self, net: IpNet) {
         debug!("Adding CIDR to blacklist: {}", net);
-        self.blacklist_nets.push(net);
+        let mut nets = (**self.blacklist_nets.load()).clone();
+        nets.push(net);
+        self.blacklist_nets.store(Arc::new(nets));
     }
 
     /// Добавляет домен в whitelist.
@@ -236,9 +251,11 @@ impl SplitTunnel {
     }
 
     /// Добавляет CIDR в whitelist.
-    pub fn add_net_to_whitelist(&mut self, net: IpNet) {
+    pub fn add_net_to_whitelist(&self, net: IpNet) {
         debug!("Adding CIDR to whitelist: {}", net);
-        self.whitelist_nets.push(net);
+        let mut nets = (**self.whitelist_nets.load()).clone();
+        nets.push(net);
+        self.whitelist_nets.store(Arc::new(nets));
     }
 
     /// Регистрирует IP → domain маппинг (из DNS ответов).
@@ -262,7 +279,7 @@ impl SplitTunnel {
                      or udp.DstPort == 53 or udp.DstPort == 443)"
             .to_string();
 
-        match self.mode {
+        match self.mode() {
             SplitMode::BlacklistOnly => {
                 // Собираем все IP-исключения (точные + CIDR)
                 let mut exclusions: Vec<String> = Vec::new();
@@ -277,7 +294,7 @@ impl SplitTunnel {
                 }
 
                 // CIDR диапазоны — конвертируем в WinDivert синтаксис
-                for net in &self.blacklist_nets {
+                for net in &**self.blacklist_nets.load() {
                     match net {
                         IpNet::V4(v4net) => {
                             // Формат: ip.DstAddr != 10.0.0.0/8
@@ -307,14 +324,24 @@ impl SplitTunnel {
     }
 
     /// Меняет режим.
-    pub fn set_mode(&mut self, mode: SplitMode) {
-        debug!("Split tunnel mode changed: {:?} → {:?}", self.mode, mode);
-        self.mode = mode;
+    pub fn set_mode(&self, mode: SplitMode) {
+        let mode_val = match mode {
+            SplitMode::WhitelistOnly => 0,
+            SplitMode::BlacklistOnly => 1,
+            SplitMode::Auto => 2,
+        };
+        debug!("Split tunnel mode changed to: {:?}", mode);
+        self.mode.store(mode_val, Ordering::Relaxed);
     }
 
     /// Текущий режим.
     pub fn mode(&self) -> SplitMode {
-        self.mode
+        match self.mode.load(Ordering::Relaxed) {
+            0 => SplitMode::WhitelistOnly,
+            1 => SplitMode::BlacklistOnly,
+            2 => SplitMode::Auto,
+            _ => SplitMode::WhitelistOnly,
+        }
     }
 
     /// Удаляет домен из blacklist.
@@ -330,10 +357,15 @@ impl SplitTunnel {
     }
 
     /// Удаляет CIDR из blacklist по значению.
-    pub fn remove_net_from_blacklist(&mut self, net: &IpNet) -> bool {
-        let len_before = self.blacklist_nets.len();
-        self.blacklist_nets.retain(|n| n != net);
-        self.blacklist_nets.len() < len_before
+    pub fn remove_net_from_blacklist(&self, net: &IpNet) -> bool {
+        let mut nets = (**self.blacklist_nets.load()).clone();
+        let len_before = nets.len();
+        nets.retain(|n| n != net);
+        let changed = nets.len() < len_before;
+        if changed {
+            self.blacklist_nets.store(Arc::new(nets));
+        }
+        changed
     }
 
     /// Удаляет домен из whitelist.
@@ -349,10 +381,15 @@ impl SplitTunnel {
     }
 
     /// Удаляет CIDR из whitelist по значению.
-    pub fn remove_net_from_whitelist(&mut self, net: &IpNet) -> bool {
-        let len_before = self.whitelist_nets.len();
-        self.whitelist_nets.retain(|n| n != net);
-        self.whitelist_nets.len() < len_before
+    pub fn remove_net_from_whitelist(&self, net: &IpNet) -> bool {
+        let mut nets = (**self.whitelist_nets.load()).clone();
+        let len_before = nets.len();
+        nets.retain(|n| n != net);
+        let changed = nets.len() < len_before;
+        if changed {
+            self.whitelist_nets.store(Arc::new(nets));
+        }
+        changed
     }
 
     /// Снапшот blacklist доменов для API.
@@ -368,6 +405,7 @@ impl SplitTunnel {
     /// Снапшот blacklist CIDR для API.
     pub fn blacklist_nets_snapshot(&self) -> Vec<String> {
         self.blacklist_nets
+            .load()
             .iter()
             .map(|net| net.to_string())
             .collect()
@@ -386,6 +424,7 @@ impl SplitTunnel {
     /// Снапшот whitelist CIDR для API.
     pub fn whitelist_nets_snapshot(&self) -> Vec<String> {
         self.whitelist_nets
+            .load()
             .iter()
             .map(|net| net.to_string())
             .collect()
@@ -698,7 +737,7 @@ mod tests {
     fn test_remove_cidr() {
         let cidr = IpNet::from_str("10.0.0.0/8").unwrap();
         let cidr2 = IpNet::from_str("10.0.0.0/8").unwrap();
-        let mut tunnel = SplitTunnel::with_cidrs(SplitMode::BlacklistOnly, vec![cidr], Vec::new());
+        let tunnel = SplitTunnel::with_cidrs(SplitMode::BlacklistOnly, vec![cidr], Vec::new());
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         assert!(!tunnel.should_bypass_ip(&ip));
         assert!(tunnel.remove_net_from_blacklist(&cidr2));

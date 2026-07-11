@@ -93,7 +93,7 @@ struct ServiceEngine {
     running: AtomicBool,
     probe_history: std::sync::Mutex<Vec<serde_json::Value>>,
     pub pipeline: std::sync::OnceLock<Arc<ProcessingPipeline>>,
-    split_tunnel: std::sync::Mutex<SplitTunnel>,
+    split_tunnel: Arc<SplitTunnel>,
     config_path: std::path::PathBuf,
 }
 
@@ -112,7 +112,7 @@ impl ServiceEngine {
             running: AtomicBool::new(true),
             probe_history: std::sync::Mutex::new(Vec::new()),
             pipeline: std::sync::OnceLock::new(),
-            split_tunnel: std::sync::Mutex::new(SplitTunnel::new(split_mode)),
+            split_tunnel: Arc::new(SplitTunnel::new(split_mode)),
             config_path,
         }
     }
@@ -191,7 +191,12 @@ impl EngineHandle for ServiceEngine {
     fn set_routing_override(&self, params: &RoutingOverride) {
         info!("Routing override: {} → {}", params.domain, params.region);
     }
-    fn probe_domain(&self, domain: &str, _full: bool) -> Result<serde_json::Value, String> {
+    fn probe_domain(
+        &self,
+        domain: &str,
+        _full: bool,
+        apply: bool,
+    ) -> Result<serde_json::Value, String> {
         use freedpi_core::probe::strategy_map::recommend;
         use freedpi_core::probe::ProbeModule;
 
@@ -199,6 +204,21 @@ impl EngineHandle for ServiceEngine {
         let module = ProbeModule::new();
         let result = rt.block_on(module.probe(domain));
         let recommendations = recommend(&result);
+
+        if apply {
+            if let Some(rec) = recommendations.first() {
+                if let Some(pipeline) = self.pipeline.get() {
+                    let params =
+                        freedpi_core::adaptive::probe_tune_run::recommendation_to_tune_params(rec);
+                    pipeline.apply_strategy_tune(rec.strategy_id, params);
+                    info!(
+                        "API probe applied strategy_id={} (profile={}) for domain={} verdict={:?}",
+                        rec.strategy_id, rec.profile_name, domain, result.verdict
+                    );
+                }
+            }
+        }
+
         let recs_json: Vec<serde_json::Value> = recommendations
             .iter()
             .map(|r| {
@@ -363,7 +383,7 @@ impl EngineHandle for ServiceEngine {
     }
 
     fn split_tunnel_state(&self) -> serde_json::Value {
-        let st = self.split_tunnel.lock().unwrap();
+        let st = &self.split_tunnel;
         serde_json::json!({
             "mode": match st.mode() {
                 SplitMode::BlacklistOnly => "BlacklistOnly",
@@ -385,15 +405,14 @@ impl EngineHandle for ServiceEngine {
             "Auto" => SplitMode::Auto,
             _ => SplitMode::BlacklistOnly,
         };
-        let mut st = self.split_tunnel.lock().unwrap();
-        st.set_mode(new_mode);
+        self.split_tunnel.set_mode(new_mode);
     }
 
     fn split_tunnel_add(&self, list: &str, entry_type: &str, value: &str) -> Result<(), String> {
         use std::net::IpAddr;
         use std::str::FromStr;
 
-        let mut st = self.split_tunnel.lock().unwrap();
+        let st = &self.split_tunnel;
         match (list, entry_type) {
             ("blacklist", "domain") => {
                 st.add_to_blacklist(value.to_string());
@@ -436,7 +455,7 @@ impl EngineHandle for ServiceEngine {
         use std::net::IpAddr;
         use std::str::FromStr;
 
-        let mut st = self.split_tunnel.lock().unwrap();
+        let st = &self.split_tunnel;
         match (list, entry_type) {
             ("blacklist", "domain") => {
                 st.remove_from_blacklist(value);
@@ -577,12 +596,24 @@ impl EngineHandle for ServiceEngine {
 ///    Возвращает `None`, если не удалось создать (например, нет прав админа).
 fn init_pipeline(config: &Config, engine: &Arc<ServiceEngine>) -> Option<Arc<ProcessingPipeline>> {
     let proc_config = config.to_processing_config();
+    let filter = if config.windivert.filter.is_empty()
+        || config.windivert.filter == freedpi_core::config::default_filter()
+    {
+        let features = config.get_filter_features();
+        let built = freedpi_core::config::build_windivert_filter(&features);
+        info!("WinDivert filter dynamically built: {}", built);
+        built
+    } else {
+        config.windivert.filter.clone()
+    };
+
     match ProcessingPipeline::new(
-        &config.windivert.filter,
+        &filter,
         proc_config,
         Arc::new(GeoRouter::new_default()),
         Arc::new(FakeIpManager::new(10_000)),
         Arc::new(HopTab::new()),
+        Some(engine.split_tunnel.clone()),
     ) {
         Ok(p) => {
             info!("Pipeline created");
@@ -668,6 +699,7 @@ fn start_stats_loop(
     // T60: Auto-probe при старте
     if config.proxy.enabled && config.proxy.auto_probe {
         let geo_router = pipeline.geo_router().clone();
+        let pipeline_clone = pipeline.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             let candidates = vec![
@@ -684,6 +716,22 @@ fn start_stats_loop(
                         domain
                     );
                     geo_router.add_user_domain(&domain);
+
+                    let recommendations = freedpi_core::probe::strategy_map::recommend(&result);
+                    if let Some(rec) = recommendations.first() {
+                        let params =
+                            freedpi_core::adaptive::probe_tune_run::recommendation_to_tune_params(
+                                rec,
+                            );
+                        pipeline_clone.apply_strategy_tune(rec.strategy_id, params);
+                        info!(
+                            "Auto-probe applied strategy_id={} (profile={}) for domain={} verdict={:?}",
+                            rec.strategy_id,
+                            rec.profile_name,
+                            domain,
+                            result.verdict
+                        );
+                    }
                 }
             }
         });

@@ -1,1 +1,3 @@
-pub mod redirector;
+pub mod redirector {
+    pub use crate::proxy::redirector::SocksRedirector;
+}

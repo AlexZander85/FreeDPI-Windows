@@ -310,40 +310,98 @@ pub fn rst_drop_ip_id(packet: &[u8]) -> DesyncResult {
 /// Случайная DSCP метка сбивает классификацию.
 /// DSCP постоянный per-connection (не per-packet) — иначе anomaly.
 ///
-/// Использует инкрементальный checksum (RFC 1624: HC' = ~(~HC + ~m + m')).
+/// ## IPv4
+/// - Меняет byte 1 (DSCP+ECN), обновляет IPv4 checksum инкрементально (RFC 1624).
+///
+/// ## IPv6
+/// - Меняет Traffic Class через bytes 0/1, сохраняет Version и Flow Label.
+/// - Не трогает IPv4 checksum (у IPv6 его нет).
 pub fn dscp_random(packet: &[u8], dscp_value: u8) -> DesyncResult {
-    let _ip = match parse_ip_header(packet) {
+    let ip = match parse_ip_header(packet) {
         Some(h) => h,
         None => return DesyncResult::passthrough(),
     };
 
-    let current_dscp = (packet[1] >> 2) & 0x3F;
-    let new_dscp = dscp_value & 0x3F;
+    match ip {
+        ParsedIpHeader::V4(_) => dscp_random_v4(packet, dscp_value),
+        ParsedIpHeader::V6(_) => dscp_random_v6(packet, dscp_value),
+    }
+}
 
-    if new_dscp == current_dscp {
+/// IPv4 ветка DscpRandom.
+///
+/// Меняет DSCP+ECN в byte 1. Пересчитывает IPv4 header checksum
+/// через `ipv4_checksum` (RFC 1071).
+#[inline]
+fn dscp_random_v4(packet: &[u8], dscp_value: u8) -> DesyncResult {
+    if packet.len() < 20 {
+        return DesyncResult::passthrough();
+    }
+
+    let current_tos = packet[1];
+    let current_dscp = current_tos >> 2;
+    let ecn = current_tos & 0x03;
+    let new_dscp = dscp_value & 0x3F;
+    let new_tos = (new_dscp << 2) | ecn;
+
+    if new_tos == current_tos {
         return DesyncResult::passthrough();
     }
 
     let mut modified = packet.to_vec();
-    let ecn = modified[1] & 0x03;
-    modified[1] = (new_dscp << 2) | ecn;
+    modified[1] = new_tos;
 
-    // Инкрементальный checksum: RFC 1624
-    // HC' = ~(~HC + ~m + m')
-    let old_byte = ((current_dscp << 2) | ecn) as u32;
-    let new_byte = ((new_dscp << 2) | ecn) as u32;
-    let old_csum = u32::from(u16::from_be_bytes([modified[10], modified[11]]));
-    let mut sum = (!old_csum & 0xFFFF)
-        .wrapping_add(!old_byte & 0xFFFF)
-        .wrapping_add(new_byte);
-    // Fold carries
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF).wrapping_add(sum >> 16);
-    }
-    let new_csum = !(sum as u16);
+    // Пересчитываем IPv4 header checksum (RFC 1071).
+    // Обнуляем checksum поле, затем вычисляем заново через ipv4_checksum.
+    modified[10] = 0;
+    modified[11] = 0;
+    let new_csum = crate::desync::ipv4_checksum(&modified[..20]);
     modified[10..12].copy_from_slice(&new_csum.to_be_bytes());
 
-    debug!("[CT4] DscpRandom: DSCP {} → {}", current_dscp, new_dscp);
+    debug!(
+        "[CT4] DscpRandom IPv4: DSCP {} -> {}",
+        current_dscp, new_dscp
+    );
+    DesyncResult::modified_only(modified)
+}
+
+/// IPv6 ветка DscpRandom.
+///
+/// IPv6 Traffic Class занимает 8 бит: младшие 4 бита byte 0 +
+/// старшие 4 бита byte 1. Version (4 бита) — старшая половина byte 0.
+/// Flow Label — 20 бит: младшие 4 бита byte 1 + bytes 2-3.
+///
+/// Функция:
+/// - Сохраняет Version (старшие 4 бита byte 0).
+/// - Сохраняет Flow Label (младшие 4 бита byte 1 + bytes 2-3).
+/// - Меняет только Traffic Class (DSCP + ECN).
+/// - Не трогает IPv4 checksum (у IPv6 его нет, bytes 10..11 — часть src address).
+#[inline]
+fn dscp_random_v6(packet: &[u8], dscp_value: u8) -> DesyncResult {
+    if packet.len() < 40 || (packet[0] >> 4) != 6 {
+        return DesyncResult::passthrough();
+    }
+
+    let version = packet[0] & 0xF0;
+    let old_tc = ((packet[0] & 0x0F) << 4) | (packet[1] >> 4);
+    let old_dscp = old_tc >> 2;
+    let ecn = old_tc & 0x03;
+    let new_dscp = dscp_value & 0x3F;
+    let new_tc = (new_dscp << 2) | ecn;
+
+    if new_tc == old_tc {
+        return DesyncResult::passthrough();
+    }
+
+    let mut modified = packet.to_vec();
+
+    // byte0: Version (high nibble) + TrafficClass high nibble (low nibble).
+    modified[0] = version | (new_tc >> 4);
+    // byte1: TrafficClass low nibble (high nibble) + FlowLabel high nibble (low nibble).
+    modified[1] = (new_tc << 4) | (packet[1] & 0x0F);
+
+    // IPv6 has no header checksum. Do not touch bytes 10..12 or any pseudo-header fields.
+    debug!("[CT4] DscpRandom IPv6: DSCP {} -> {}", old_dscp, new_dscp);
     DesyncResult::modified_only(modified)
 }
 
@@ -443,5 +501,117 @@ fn build_ip_fragment(
             buf[10..12].copy_from_slice(&checksum.to_be_bytes());
             buf.freeze()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// IPv6 DscpRandom должен:
+    /// - Сохранять Version=6
+    /// - Устанавливать правильный DSCP (0x2A)
+    /// - Сохранять Flow Label (младшие 4 бита byte 1 + bytes 2-3)
+    #[test]
+    fn dscp_random_v6_preserves_version_and_flow_label() {
+        let mut pkt = vec![0u8; 40 + 8];
+        pkt[0] = 0x60; // Version=6, TC high=0
+        pkt[1] = 0x0A; // Flow label high nibble = 0xA
+        pkt[2] = 0xBC;
+        pkt[3] = 0xDE;
+        pkt[4..6].copy_from_slice(&8u16.to_be_bytes());
+        pkt[6] = 17;
+        pkt[7] = 64;
+
+        let out = dscp_random(&pkt, 0x2A);
+        let modified = out.modified.expect("IPv6 DSCP must modify packet");
+
+        assert_eq!(modified[0] >> 4, 6, "Version must be preserved");
+        let tc = ((modified[0] & 0x0F) << 4) | (modified[1] >> 4);
+        assert_eq!(tc >> 2, 0x2A, "DSCP must be 0x2A");
+        assert_eq!(
+            modified[1] & 0x0F,
+            pkt[1] & 0x0F,
+            "Flow Label low nibble must be preserved"
+        );
+        assert_eq!(
+            &modified[2..4],
+            &pkt[2..4],
+            "Flow Label bytes 2-3 must be preserved"
+        );
+    }
+
+    /// IPv6 DscpRandom не должен трогать source address (bytes 8..24).
+    #[test]
+    fn dscp_random_ipv6_does_not_touch_source_address_prefix() {
+        let mut pkt = vec![0u8; 40 + 8];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&8u16.to_be_bytes());
+        pkt[6] = 17;
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&[0xAA; 16]);
+
+        let out = dscp_random(&pkt, 0x10);
+        let modified = out.modified.expect("IPv6 DSCP must modify packet");
+        assert_eq!(
+            &modified[8..24],
+            &[0xAA; 16],
+            "Source address must be preserved"
+        );
+    }
+
+    /// IPv4 DscpRandom должен корректно обновлять checksum.
+    #[test]
+    fn dscp_random_v4_updates_checksum_correctly() {
+        let mut pkt = vec![0u8; 20 + 20]; // 20 IP + 20 TCP
+        pkt[0] = 0x45; // Version=4, IHL=5
+        pkt[1] = 0x00; // DSCP=0, ECN=0
+        pkt[2..4].copy_from_slice(&40u16.to_be_bytes()); // total length
+        pkt[8] = 64; // TTL
+        pkt[9] = 6; // TCP
+        let csum = crate::desync::ipv4_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+
+        let out = dscp_random(&pkt, 0x2A);
+        let modified = out.modified.expect("IPv4 DSCP must modify packet");
+
+        // Verify DSCP set correctly
+        let new_dscp = modified[1] >> 2;
+        assert_eq!(new_dscp, 0x2A, "IPv4 DSCP must be 0x2A");
+
+        // Verify checksum: обнуляем checksum поле, затем пересчитываем.
+        // ipv4_checksum на header с корректным checksum возвращает 0
+        // (сумма всех 16-bit слов включая checksum = 0xFFFF, !0xFFFF = 0).
+        // Поэтому обнуляем checksum перед вычислением.
+        let mut hdr = modified[..20].to_vec();
+        hdr[10] = 0;
+        hdr[11] = 0;
+        let expected = crate::desync::ipv4_checksum(&hdr);
+        let actual = u16::from_be_bytes([modified[10], modified[11]]);
+        assert_eq!(actual, expected, "IPv4 header checksum must be correct");
+    }
+
+    /// Если DSCP не меняется — passthrough.
+    #[test]
+    fn dscp_random_same_value_returns_passthrough() {
+        let pkt = vec![
+            0x45, 0x28, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        // DSCP = 0x28 >> 2 = 0x0A
+        let out = dscp_random(&pkt, 0x0A);
+        assert!(out.modified.is_none(), "Same DSCP must return passthrough");
+        assert!(out.inject.is_empty());
+        assert!(!out.drop);
+    }
+
+    /// Malformed packet не должен паниковать.
+    #[test]
+    fn dscp_random_truncated_packet_no_panic() {
+        let pkt = vec![0x45, 0x00]; // too short
+        let out = dscp_random(&pkt, 0x2A);
+        assert!(
+            out.modified.is_none(),
+            "Truncated packet must return passthrough"
+        );
     }
 }

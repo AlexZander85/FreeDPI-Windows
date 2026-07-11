@@ -43,8 +43,40 @@ const RECV_BATCH_BUFFER_SIZE: usize = RECV_BATCH_SIZE * 2048; // 128 KB
 /// ## single-copy
 /// Единственная копия за весь путь пакета — kernel→user (неустранима для WinDivert).
 /// В steady-state ноль вызовов аллокатора: буферы переиспользуются через `ArrayQueue`.
+/// Sizing function for packet buffer pool
+pub fn packet_pool_capacity(worker_count: usize, recv_batch_size: usize) -> usize {
+    let rx_prefetch = 2usize;
+    let send_backlog = 2usize;
+    let safety_factor = 2usize;
+    let base = recv_batch_size
+        .saturating_mul(worker_count + rx_prefetch + send_backlog)
+        .saturating_mul(safety_factor);
+    base.clamp(512, 8192)
+}
+
+/// Lock-free пул переиспользуемых `BytesMut` для single-copy recv.
+///
+/// ## single-copy
+/// Единственная копия за весь путь пакета — kernel→user (неустранима для WinDivert).
+/// В steady-state ноль вызовов аллокатора: буферы переиспользуются через `ArrayQueue`.
 pub struct PacketBufferPool {
     free: ArrayQueue<BytesMut>,
+    alloc_miss: AtomicU64,
+    return_drop: AtomicU64,
+    acquire_total: AtomicU64,
+    release_success_total: AtomicU64,
+    release_refcount_failed_total: AtomicU64,
+    capacity: usize,
+}
+
+impl std::fmt::Debug for PacketBufferPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketBufferPool")
+            .field("capacity", &self.capacity)
+            .field("alloc_miss", &self.alloc_miss.load(Ordering::Relaxed))
+            .field("acquire_total", &self.acquire_total.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 impl PacketBufferPool {
@@ -56,13 +88,23 @@ impl PacketBufferPool {
             b.resize(POOLED_BUF_SIZE, 0);
             let _ = free.push(b);
         }
-        Self { free }
+        Self {
+            free,
+            alloc_miss: AtomicU64::new(0),
+            return_drop: AtomicU64::new(0),
+            acquire_total: AtomicU64::new(0),
+            release_success_total: AtomicU64::new(0),
+            release_refcount_failed_total: AtomicU64::new(0),
+            capacity,
+        }
     }
 
     /// Извлекает буфер из пула или создаёт новый (нестандартный случай).
     #[inline]
     pub fn acquire(&self) -> BytesMut {
+        self.acquire_total.fetch_add(1, Ordering::Relaxed);
         self.free.pop().unwrap_or_else(|| {
+            self.alloc_miss.fetch_add(1, Ordering::Relaxed);
             let mut b = BytesMut::with_capacity(POOLED_BUF_SIZE);
             b.resize(POOLED_BUF_SIZE, 0);
             b
@@ -77,9 +119,12 @@ impl PacketBufferPool {
         if buf.capacity() < POOLED_BUF_SIZE {
             return; // нестандартный — одноразовый
         }
-        // memset дельты = размеру последнего пакета, не всего буфера
         buf.resize(POOLED_BUF_SIZE, 0);
-        let _ = self.free.push(buf);
+        if self.free.push(buf).is_ok() {
+            self.release_success_total.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.return_drop.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Пытается вернуть замороженный `Bytes` обратно в пул, если refcount == 1.
@@ -89,7 +134,38 @@ impl PacketBufferPool {
     pub fn release_bytes(&self, packet: bytes::Bytes) {
         if let Ok(buf) = packet.try_into_mut() {
             self.release(buf);
+        } else {
+            self.release_refcount_failed_total
+                .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub fn alloc_miss(&self) -> u64 {
+        self.alloc_miss.load(Ordering::Relaxed)
+    }
+
+    pub fn return_drop(&self) -> u64 {
+        self.return_drop.load(Ordering::Relaxed)
+    }
+
+    pub fn pool_acquire_total(&self) -> u64 {
+        self.acquire_total.load(Ordering::Relaxed)
+    }
+
+    pub fn pool_release_success_total(&self) -> u64 {
+        self.release_success_total.load(Ordering::Relaxed)
+    }
+
+    pub fn pool_release_refcount_failed_total(&self) -> u64 {
+        self.release_refcount_failed_total.load(Ordering::Relaxed)
+    }
+
+    pub fn pool_acquire_miss_total(&self) -> u64 {
+        self.alloc_miss.load(Ordering::Relaxed)
+    }
+
+    pub fn pool_capacity(&self) -> usize {
+        self.capacity
     }
 }
 
@@ -187,7 +263,10 @@ impl PacketEngine {
     ///
     /// Автоматически устанавливает WinDivert driver если он не загружен.
     /// Требует admin elevation для установки driver.
-    pub fn new(filter: &str) -> Result<Self> {
+    pub fn new_with_tuning(
+        filter: &str,
+        tuning: &crate::config::NetworkTuningConfig,
+    ) -> Result<Self> {
         // Проверяем/устанавливаем driver если нужно
         if !crate::infra::windivert_driver::is_driver_loaded() {
             info!("WinDivert driver not loaded, installing...");
@@ -199,12 +278,7 @@ impl PacketEngine {
             .context("Failed to open WinDivert (driver may be blocked by HVCI/EDR)")?;
 
         // WinDivert tuning
-        divert
-            .set_param(WinDivertParam::QueueLength, 65535)
-            .context("Failed to set QueueLength")?;
-        divert
-            .set_param(WinDivertParam::QueueTime, 500)
-            .context("Failed to set QueueTime")?;
+        Self::tune_divert(&divert)?;
 
         let raw_sock_v4 = match unsafe { RawSocketTxV4::new() } {
             Ok(sock) => {
@@ -229,7 +303,7 @@ impl PacketEngine {
         };
 
         // Отключаем TSO/LSO/RSS для совместимости с desync техниками
-        if let Err(e) = Self::disable_offload() {
+        if let Err(e) = Self::disable_offload(tuning) {
             warn!("Failed to disable network offload: {}", e);
         }
 
@@ -242,6 +316,10 @@ impl PacketEngine {
             stats: PacketStats::new(),
             mode: EngineMode::WinDivert,
         })
+    }
+
+    pub fn new(filter: &str) -> Result<Self> {
+        Self::new_with_tuning(filter, &crate::config::NetworkTuningConfig::default())
     }
 
     /// Создаёт движок без WinDivert (API-only режим).
@@ -410,26 +488,47 @@ impl PacketEngine {
         self.stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Динамическое обновление WinDivert фильтра.
+    /// P1-01: Атомарное обновление WinDivert фильтра.
     ///
-    /// Вызывается при изменении blacklist/whitelist.
-    /// Создаёт новый WinDivert handle (старый закрывается при drop).
+    /// Создаёт новый WinDivert handle, затем атомарно переключает `self.divert`
+    /// через `ArcSwap::rcu()`. Старый handle закрывается автоматически при
+    /// освобождении последней ссылки (drop внутри rcu-замыкания).
+    /// Между старым и новым handle нет слепого окна — ни один пакет не теряется.
     pub fn update_filter(&self, filter: &str) -> Result<()> {
-        // Explicitly drop old handle before opening a new one to avoid
-        // having two WinDivert filters active simultaneously.
-        let old = self.divert.swap(Arc::new(None));
-        drop(old);
+        // P5-01: Compile check safety
+        crate::windivert_ext::compile_filter(filter)
+            .map_err(|e| anyhow::anyhow!("WinDivert filter compile failed: {}", e))?;
 
+        // Сначала создаём новый handle (может фейлиться — не трогаем state).
         let new_divert = WinDivert::network(filter, WINDIVERT_PRIORITY, WinDivertFlags::default())
             .context("Failed to update WinDivert filter")?;
-        new_divert
+        Self::tune_divert(&new_divert).context("Failed to tune new WinDivert handle")?;
+
+        // Атомарный swap — старый handle живёт до вызова drop, WinDivert
+        // не переходит в состояние None, потери пакетов нет.
+        // Кратковременное сосуществование двух WinDivert фильтров безопасно:
+        // каждый handle получает только свои matched пакеты; читаем только из нового.
+        let old = self.divert.swap(Arc::new(Some(new_divert)));
+        drop(old);
+
+        debug!(
+            "WinDivert filter updated (P1-01 atomic swap with FFI check): {}",
+            filter
+        );
+        Ok(())
+    }
+
+    /// Check if WinDivert is initialized.
+    fn tune_divert(divert: &WinDivert<NetworkLayer>) -> Result<()> {
+        divert
             .set_param(WinDivertParam::QueueLength, 65535)
-            .context("Failed to set QueueLength on new handle")?;
-        new_divert
+            .context("Failed to set QueueLength")?;
+        divert
             .set_param(WinDivertParam::QueueTime, 500)
-            .context("Failed to set QueueTime on new handle")?;
-        self.divert.store(Arc::new(Some(new_divert)));
-        debug!("WinDivert filter updated: {}", filter);
+            .context("Failed to set QueueTime")?;
+        divert
+            .set_param(WinDivertParam::QueueSize, 64 * 1024 * 1024)
+            .context("Failed to set QueueSize")?;
         Ok(())
     }
 
@@ -454,8 +553,10 @@ impl PacketEngine {
     }
 
     /// Асинхронная версия `disable_offload` — не блокирует вызывающий поток.
-    pub fn disable_offload_async() -> tokio::task::JoinHandle<Result<()>> {
-        tokio::task::spawn_blocking(Self::disable_offload)
+    pub fn disable_offload_async(
+        tuning: crate::config::NetworkTuningConfig,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        tokio::task::spawn_blocking(move || Self::disable_offload(&tuning))
     }
 
     /// Отключает TSO/LSO (TCP Segmentation Offload / Large Send Offload)
@@ -466,58 +567,64 @@ impl PacketEngine {
     /// Это ломает desync техники (IP fragmentation overlap, SEQ spoofing).
     ///
     /// Использует `netsh` для отключения offload на всех адаптерах.
-    pub fn disable_offload() -> Result<()> {
-        // Отключаем TCP Chimney Offload (включает TSO/LSO)
-        let output = std::process::Command::new("netsh")
-            .args(["int", "tcp", "set", "global", "chimney=disabled"])
-            .output();
+    pub fn disable_offload(tuning: &crate::config::NetworkTuningConfig) -> Result<()> {
+        if tuning.disable_chimney {
+            // Отключаем TCP Chimney Offload (включает TSO/LSO)
+            let output = std::process::Command::new("netsh")
+                .args(["int", "tcp", "set", "global", "chimney=disabled"])
+                .output();
 
-        match output {
-            Ok(o) if o.status.success() => {
-                debug!("TCP Chimney Offload disabled");
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                warn!("Failed to disable TCP Chimney: {}", stderr);
-            }
-            Err(e) => {
-                warn!("Failed to run netsh: {}", e);
+            match output {
+                Ok(o) if o.status.success() => {
+                    debug!("TCP Chimney Offload disabled");
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    warn!("Failed to disable TCP Chimney: {}", stderr);
+                }
+                Err(e) => {
+                    warn!("Failed to run netsh: {}", e);
+                }
             }
         }
 
-        // Отключаем RSS (Receive Side Scaling) — может переупорядочить пакеты
-        let output = std::process::Command::new("netsh")
-            .args(["int", "tcp", "set", "global", "rss=disabled"])
-            .output();
+        if tuning.disable_rss {
+            // Отключаем RSS (Receive Side Scaling) — может переупорядочить пакеты
+            let output = std::process::Command::new("netsh")
+                .args(["int", "tcp", "set", "global", "rss=disabled"])
+                .output();
 
-        match output {
-            Ok(o) if o.status.success() => {
-                debug!("RSS disabled");
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                warn!("Failed to disable RSS: {}", stderr);
-            }
-            Err(e) => {
-                warn!("Failed to run netsh for RSS: {}", e);
+            match output {
+                Ok(o) if o.status.success() => {
+                    warn!("RSS disabled by explicit config; throughput may degrade");
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    warn!("Failed to disable RSS: {}", stderr);
+                }
+                Err(e) => {
+                    warn!("Failed to run netsh for RSS: {}", e);
+                }
             }
         }
 
-        // Отключаем ECN (Explicit Congestion Notification) — может модифицировать TCP headers
-        let output = std::process::Command::new("netsh")
-            .args(["int", "tcp", "set", "global", "ecn=disabled"])
-            .output();
+        if tuning.disable_ecn {
+            // Отключаем ECN (Explicit Congestion Notification) — может модифицировать TCP headers
+            let output = std::process::Command::new("netsh")
+                .args(["int", "tcp", "set", "global", "ecn=disabled"])
+                .output();
 
-        match output {
-            Ok(o) if o.status.success() => {
-                debug!("ECN disabled");
-            }
-            _ => {
-                debug!("ECN disable skipped (non-critical)");
+            match output {
+                Ok(o) if o.status.success() => {
+                    debug!("ECN disabled");
+                }
+                _ => {
+                    debug!("ECN disable skipped (non-critical)");
+                }
             }
         }
 
-        info!("Network offload disabled (TSO/LSO/RSS/ECN) for desync compatibility");
+        info!("Network offload disabled based on config tuning");
         Ok(())
     }
 
@@ -541,10 +648,12 @@ impl PacketEngine {
     ///
     /// # Returns
     /// `Vec<(bytes::Bytes, WinDivertAddress)>` — до 64 пакетов
-    pub fn recv_batch(
+    pub fn recv_batch_into(
         &self,
         pool: &PacketBufferPool,
-    ) -> Result<Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)>> {
+        out: &mut Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)>,
+    ) -> Result<usize> {
+        out.clear();
         let guard = self.divert.load();
         let Some(ref divert) = **guard else {
             anyhow::bail!("WinDivert not initialized (API-only mode)");
@@ -556,39 +665,53 @@ impl PacketEngine {
                 std::cell::RefCell::new(vec![0u8; RECV_BATCH_BUFFER_SIZE]);
         }
 
-        let packets = BATCH_BUF.with(|buf| {
+        let n = BATCH_BUF.with(|buf| -> Result<usize> {
             let mut buf = buf.borrow_mut();
 
             // 2. Вызываем WinDivertRecvEx — до 64 пакетов за 1 syscall
-            match divert.recv_ex(&mut buf[..], RECV_BATCH_SIZE as u8) {
-                Ok(pkts) => {
-                    // 3. Для каждого пакета: берём BytesMut из pool, memcpy, freeze
-                    let mut result = Vec::with_capacity(pkts.len());
-                    for pkt in pkts {
-                        let mut data_buf = pool.acquire();
-                        let len = pkt.data.len();
+            // P4-03: Note on zero-copy scatter/gather FFI support.
+            // WinDivert's underlying native API (WinDivertRecvEx) only supports reading multiple packets
+            // contiguously into a single flat buffer (passed as a single pointer). It does not support
+            // scatter/gather into disjoint buffers. Thus, true zero-copy from the kernel driver straight
+            // into disjoint pool-allocated buffers is not possible with WinDivert. The optimal path
+            // remains: single contiguous copy from kernel into BATCH_BUF, and then copying individual
+            // packet slices from BATCH_BUF into pool buffers.
+            let pkts = divert
+                .recv_ex(&mut buf[..], RECV_BATCH_SIZE as u8)
+                .map_err(|e| anyhow::anyhow!("WinDivertRecvEx failed: {}", e))?;
 
-                        if len > data_buf.capacity() {
-                            // Jumbo frame — аллоцируем под размер
-                            data_buf = bytes::BytesMut::from(&pkt.data[..]);
-                        } else {
-                            // memcpy из batch buffer в pool buffer (~50ns для 1500B)
-                            data_buf.resize(len, 0);
-                            data_buf[..len].copy_from_slice(&pkt.data);
-                        }
+            out.reserve(pkts.len());
+            for pkt in pkts {
+                let len = pkt.data.len();
+                let mut data_buf = if len > POOLED_BUF_SIZE {
+                    BytesMut::with_capacity(len)
+                } else {
+                    pool.acquire()
+                };
 
-                        result.push((data_buf.freeze(), pkt.address));
-                    }
-                    Ok(result)
+                if len > data_buf.capacity() {
+                    data_buf = BytesMut::with_capacity(len);
                 }
-                Err(e) => Err(anyhow::anyhow!("WinDivertRecvEx failed: {}", e)),
+                data_buf.resize(len, 0);
+                data_buf[..len].copy_from_slice(&pkt.data);
+                out.push((data_buf.freeze(), pkt.address));
             }
+            Ok(out.len())
         })?;
 
         self.stats
             .packets_received
-            .fetch_add(packets.len() as u64, Ordering::Relaxed);
-        Ok(packets)
+            .fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+
+    pub fn recv_batch(
+        &self,
+        pool: &PacketBufferPool,
+    ) -> Result<Vec<(bytes::Bytes, WinDivertAddress<NetworkLayer>)>> {
+        let mut out = Vec::with_capacity(RECV_BATCH_SIZE);
+        self.recv_batch_into(pool, &mut out)?;
+        Ok(out)
     }
 
     /// T62: Пакетная отправка — до 64 пакетов за один syscall.
@@ -612,7 +735,7 @@ impl PacketEngine {
         };
 
         let mut total_sent = 0;
-        let mut wd_packets = Vec::with_capacity(packets.len());
+        let mut wd_packets = smallvec::SmallVec::<[_; 64]>::new();
 
         for (data, addr) in packets {
             wd_packets.push(WinDivertPacket {
@@ -662,7 +785,7 @@ impl PacketEngine {
             anyhow::bail!("WinDivert not initialized");
         };
 
-        let mut wd_packets = Vec::with_capacity(packets.len());
+        let mut wd_packets = smallvec::SmallVec::<[_; 64]>::new();
         for (data, addr) in packets {
             let mut a = addr.clone();
             a.set_impostor(true);

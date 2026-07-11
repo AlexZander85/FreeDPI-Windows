@@ -70,6 +70,26 @@ impl Classifier {
         }
     }
 
+    fn classify_other(
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        protocol: u8,
+        payload_offset: usize,
+        packet_len: usize,
+    ) -> Classification {
+        Classification::Other(ClassifiedPacket {
+            src_ip,
+            dst_ip,
+            src_port: 0,
+            dst_port: 0,
+            protocol,
+            direction: PacketDirection::Outbound,
+            conn_key: ConnKey::new(src_ip, dst_ip, 0, 0, protocol),
+            payload_offset,
+            payload_len: packet_len.saturating_sub(payload_offset),
+        })
+    }
+
     fn classify_ipv4(packet: &[u8]) -> Classification {
         let ip = match Ipv4Packet::new(packet) {
             Some(ip) => ip,
@@ -79,22 +99,47 @@ impl Classifier {
         let src_ip = IpAddr::V4(ip.get_source());
         let dst_ip = IpAddr::V4(ip.get_destination());
         let protocol = ip.get_next_level_protocol().0;
-        let header_len = ip.get_header_length() as usize * 4;
+        let header_len = (ip.get_header_length() as usize) * 4;
+        if header_len < 20 || packet.len() < header_len {
+            return Classification::Unknown;
+        }
+
+        let flags = ip.get_flags();
+        let fragment_offset = ip.get_fragment_offset();
+        let more_fragments = (flags & 0x1) != 0;
+        if fragment_offset != 0 || more_fragments {
+            return Self::classify_other(
+                src_ip,
+                dst_ip,
+                protocol,
+                header_len.min(packet.len()),
+                packet.len(),
+            );
+        }
 
         Self::classify_transport(packet, src_ip, dst_ip, protocol, header_len)
     }
 
     fn classify_ipv6(packet: &[u8]) -> Classification {
-        let ip = match Ipv6Packet::new(packet) {
-            Some(ip) => ip,
+        let parsed = match crate::desync::parse_ipv6_header(packet) {
+            Some(h) => h,
             None => return Classification::Unknown,
         };
 
-        let src_ip = IpAddr::V6(ip.get_source());
-        let dst_ip = IpAddr::V6(ip.get_destination());
-        let protocol = ip.get_next_header().0;
-        // IPv6 fixed header = 40 bytes (extension headers не учитываем для простоты)
-        let header_len = 40;
+        if parsed.fragment_offset.is_some() {
+            return Self::classify_other(
+                IpAddr::V6(parsed.src),
+                IpAddr::V6(parsed.dst),
+                parsed.protocol.0,
+                parsed.header_len,
+                packet.len(),
+            );
+        }
+
+        let src_ip = IpAddr::V6(parsed.src);
+        let dst_ip = IpAddr::V6(parsed.dst);
+        let protocol = parsed.protocol.0;
+        let header_len = parsed.header_len;
 
         Self::classify_transport(packet, src_ip, dst_ip, protocol, header_len)
     }
@@ -108,15 +153,28 @@ impl Classifier {
     ) -> Classification {
         match protocol {
             6 => {
-                // TCP
-                let tcp = match TcpPacket::new(&packet[header_len..]) {
+                let transport = match packet.get(header_len..) {
+                    Some(s) => s,
+                    None => return Classification::Unknown,
+                };
+                let tcp = match TcpPacket::new(transport) {
                     Some(tcp) => tcp,
                     None => return Classification::Unknown,
                 };
                 let src_port = tcp.get_source();
                 let dst_port = tcp.get_destination();
                 let tcp_header_len = (tcp.get_data_offset() as usize) * 4;
-                let payload_offset = header_len + tcp_header_len;
+                if tcp_header_len < 20 || transport.len() < tcp_header_len {
+                    return Classification::Unknown;
+                }
+                let payload_offset = match header_len.checked_add(tcp_header_len) {
+                    Some(val) => val,
+                    None => return Classification::Unknown,
+                };
+                let payload = match packet.get(payload_offset..) {
+                    Some(p) => p,
+                    None => return Classification::Unknown,
+                };
 
                 let cp = ClassifiedPacket {
                     src_ip,
@@ -124,20 +182,16 @@ impl Classifier {
                     src_port,
                     dst_port,
                     protocol,
-                    direction: PacketDirection::Outbound, // будет уточнено
+                    direction: PacketDirection::Outbound,
                     conn_key: ConnKey::new(src_ip, dst_ip, src_port, dst_port, protocol),
                     payload_offset,
-                    payload_len: packet.len().saturating_sub(payload_offset),
+                    payload_len: payload.len(),
                 };
 
-                // Content-based classification (DPI) before port fallback
-                let payload = &packet[payload_offset..];
                 if payload.len() >= 5 {
-                    // TLS ClientHello: 0x16 0x03 0x01-0x03
                     if payload[0] == 0x16 && payload[1] == 0x03 && payload[2] <= 0x03 {
                         return Classification::Tls(cp);
                     }
-                    // HTTP methods
                     if payload.starts_with(b"GET ")
                         || payload.starts_with(b"POST ")
                         || payload.starts_with(b"PUT ")
@@ -148,14 +202,12 @@ impl Classifier {
                     {
                         return Classification::Http(cp);
                     }
-                    // HTTP/2 connection preface
                     if payload.len() >= 24 && &payload[..24] == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
                     {
                         return Classification::Http(cp);
                     }
                 }
 
-                // Port-based fallback
                 match dst_port {
                     443 => Classification::Tls(cp),
                     80 => Classification::Http(cp),
@@ -163,14 +215,27 @@ impl Classifier {
                 }
             }
             17 => {
-                // UDP
-                let udp = match UdpPacket::new(&packet[header_len..]) {
+                let transport = match packet.get(header_len..) {
+                    Some(s) => s,
+                    None => return Classification::Unknown,
+                };
+                let udp = match UdpPacket::new(transport) {
                     Some(udp) => udp,
                     None => return Classification::Unknown,
                 };
+                if transport.len() < 8 {
+                    return Classification::Unknown;
+                }
                 let src_port = udp.get_source();
                 let dst_port = udp.get_destination();
-                let payload_offset = header_len + 8; // UDP header = 8 bytes
+                let payload_offset = match header_len.checked_add(8) {
+                    Some(val) => val,
+                    None => return Classification::Unknown,
+                };
+                let payload = match packet.get(payload_offset..) {
+                    Some(p) => p,
+                    None => return Classification::Unknown,
+                };
 
                 let cp = ClassifiedPacket {
                     src_ip,
@@ -181,11 +246,9 @@ impl Classifier {
                     direction: PacketDirection::Outbound,
                     conn_key: ConnKey::new(src_ip, dst_ip, src_port, dst_port, protocol),
                     payload_offset,
-                    payload_len: packet.len().saturating_sub(payload_offset),
+                    payload_len: payload.len(),
                 };
 
-                // Content-based QUIC detection (long header: first bit = 1)
-                let payload = &packet[payload_offset..];
                 if !payload.is_empty() && (payload[0] & 0x80) != 0 {
                     return Classification::Quic(cp);
                 }
@@ -196,20 +259,13 @@ impl Classifier {
                     _ => Classification::Other(cp),
                 }
             }
-            _ => {
-                let cp = ClassifiedPacket {
-                    src_ip,
-                    dst_ip,
-                    src_port: 0,
-                    dst_port: 0,
-                    protocol,
-                    direction: PacketDirection::Outbound,
-                    conn_key: ConnKey::new(src_ip, dst_ip, 0, 0, protocol),
-                    payload_offset: header_len,
-                    payload_len: packet.len().saturating_sub(header_len),
-                };
-                Classification::Other(cp)
-            }
+            _ => Self::classify_other(
+                src_ip,
+                dst_ip,
+                protocol,
+                header_len.min(packet.len()),
+                packet.len(),
+            ),
         }
     }
 
@@ -258,7 +314,7 @@ impl Classifier {
     ///
     /// Возвращает Some(domain) если найден.
     pub fn extract_sni(payload: &[u8]) -> Option<String> {
-        if !Self::is_client_hello(payload) {
+        if !Self::is_client_hello(payload) || payload.len() < 44 {
             return None;
         }
 
@@ -418,5 +474,128 @@ mod tests {
             Classification::Unknown => {} // expected
             _ => panic!("Expected Unknown"),
         }
+    }
+
+    #[test]
+    fn test_classify_ipv4_fragment() {
+        // Minimal IPv4 fragment (Fragment Offset = 180)
+        let pkt = vec![
+            0x45, 0x00, 0x00, 0x28, 0x00, 0x00, 0x20,
+            0xb4, // Flags (0x20) + FragOffset (0xb4 = 180)
+            0x40, 0x06, 0x00, 0x00, 0xc0, 0xa8, 0x01, 0x01, 0x08, 0x08, 0x08, 0x08,
+        ];
+        match Classifier::classify(&pkt) {
+            Classification::Other(cp) => {
+                assert_eq!(cp.src_port, 0);
+                assert_eq!(cp.dst_port, 0);
+            }
+            _ => panic!("Expected fragment to be classified as Other"),
+        }
+    }
+
+    #[test]
+    fn test_classify_ipv6_extension_headers() {
+        // Minimal IPv6 packet with Hop-by-Hop extension header + TCP
+        let mut pkt = vec![0u8; 40 + 8 + 20];
+        // IPv6 Header: Version 6 (0x60), NextHeader = 0 (Hop-by-Hop), payload len = 28
+        pkt[0] = 0x60;
+        pkt[6] = 0; // Hop-by-Hop
+        pkt[7] = 64; // Hop limit
+                     // Source/Dest IP dummy bytes
+        pkt[8..24].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        pkt[24..40].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+
+        // Hop-by-Hop header: NextHeader = 6 (TCP), HeaderExtLen = 0 (8 bytes total)
+        pkt[40] = 6; // NextHeader: TCP
+        pkt[41] = 0; // Length = 0 (8 bytes)
+
+        // TCP header at offset 48: source 12345 (0x3039), dest 443 (0x01bb)
+        pkt[48] = 0x30;
+        pkt[49] = 0x39;
+        pkt[50] = 0x01;
+        pkt[51] = 0xbb;
+        pkt[60] = 0x50; // Offset = 5 (20 bytes)
+
+        match Classifier::classify(&pkt) {
+            Classification::Tls(cp) => {
+                assert_eq!(cp.src_port, 12345);
+                assert_eq!(cp.dst_port, 443);
+                assert_eq!(cp.payload_offset, 68); // 40 (IP) + 8 (Hop-by-Hop) + 20 (TCP)
+            }
+            _ => panic!("Expected TLS classification with extensions"),
+        }
+    }
+
+    // === P0-12: Short/truncated packet no-panic tests ===
+
+    #[test]
+    fn test_short_ip_header_no_panic() {
+        // IP header too short (< 20 bytes) — must not panic
+        let pkt = vec![0x45; 15];
+        let _ = Classifier::classify(&pkt);
+    }
+
+    #[test]
+    fn test_short_tcp_no_panic() {
+        // TCP data offset (48..) would be out of bounds
+        let pkt = vec![
+            0x45, 0x00, 0x00, 0x28, // IP header
+            0x00, 0x00, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, // TCP proto
+            0xc0, 0xa8, 0x01, 0x01, // src: 192.168.1.1
+            0x08, 0x08, 0x08, 0x08, // dst: 8.8.8.8
+            // TCP header — only 10 bytes (truncated)
+            0x30, 0x39, 0x01, 0xbb, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        ];
+        let _ = Classifier::classify(&pkt);
+    }
+
+    #[test]
+    fn test_short_udp_no_panic() {
+        // UDP header truncated (< 8 bytes)
+        let pkt = vec![
+            0x45, 0x00, 0x00, 0x18, // IP header
+            0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, // UDP proto
+            0xc0, 0xa8, 0x01, 0x01, // src
+            0x08, 0x08, 0x08, 0x08, // dst
+            0x00, 0x35, 0x00, 0x35, // src/dst port — only 4 bytes of UDP header
+        ];
+        let _ = Classifier::classify(&pkt);
+    }
+
+    #[test]
+    fn test_ipv6_truncated_no_panic() {
+        // IPv6 packet with payload length > actual data
+        let mut pkt = vec![0u8; 30]; // 40-byte IPv6 header would need 40 bytes
+        pkt[0] = 0x60; // IPv6, TC=0, FlowLabel=0
+        pkt[4] = 0; // Payload Length high byte = 0 (claims 65535.. wait just 0)
+        pkt[5] = 10; // Payload Length = 10, but only 30 bytes total
+        pkt[6] = 6; // Next Header: TCP
+        pkt[7] = 64; // Hop Limit
+        let _ = Classifier::classify(&pkt);
+    }
+
+    #[test]
+    fn test_empty_packet_no_panic() {
+        let pkt: Vec<u8> = vec![];
+        let _ = Classifier::classify(&pkt);
+    }
+
+    #[test]
+    fn test_ipv6_extension_chain_truncated_no_panic() {
+        // IPv6 with Fragment extension header, truncated after extension
+        let mut pkt = vec![0u8; 50];
+        pkt[0] = 0x60;
+        pkt[4] = 0;
+        pkt[5] = 10; // payload len = 10 (but extension needs 8)
+        pkt[6] = 44; // Next Header: Fragment Header (44)
+        pkt[7] = 64;
+        // Extension header starts at offset 40
+        pkt[40] = 6; // Next Header: TCP (but truncated after)
+        pkt[41] = 0; // Reserved
+                     // Fragment offset bits
+        pkt[42] = 0;
+        pkt[43] = 0; // More fragments = 0, Fragment offset = 0
+                     // Only 46 bytes total, extension header is 8 bytes
+        let _ = Classifier::classify(&pkt);
     }
 }

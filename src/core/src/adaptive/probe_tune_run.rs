@@ -331,6 +331,18 @@ impl ProbeTuneRun {
     }
 }
 
+/// P2-02: Преобразует рекомендацию probe в параметры настройки.
+pub fn recommendation_to_tune_params(
+    _rec: &crate::probe::strategy_map::StrategyRecommendation,
+) -> crate::adaptive::auto_tune::TuneParams {
+    crate::adaptive::auto_tune::TuneParams {
+        split_size: None,
+        split_count: None,
+        fake_ttl_offset: None,
+        max_seg_size: None,
+    }
+}
+
 impl Default for ProbeTuneRun {
     fn default() -> Self {
         Self::new(PtrConfig::default())

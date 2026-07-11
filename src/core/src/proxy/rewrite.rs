@@ -71,7 +71,90 @@ pub fn rewrite_dst_addr(
     new_dst_port: u16,
 ) -> Result<Vec<u8>> {
     let mut buf = packet_data.to_vec();
-    let ip_hdr = parse_ip_header_local(&buf).ok_or_else(|| anyhow!("invalid ip header"))?;
+    rewrite_dst_addr_inplace(&mut buf[..], new_dst_ip, new_dst_port)?;
+    Ok(buf)
+}
+
+pub fn rewrite_src_addr(
+    packet_data: &[u8],
+    new_src_ip: IpAddr,
+    new_src_port: u16,
+) -> Result<Vec<u8>> {
+    let mut buf = packet_data.to_vec();
+    rewrite_src_addr_inplace(&mut buf[..], new_src_ip, new_src_port)?;
+    Ok(buf)
+}
+
+pub fn rewrite_dst_addr_cow(
+    packet: bytes::Bytes,
+    new_dst_ip: IpAddr,
+    new_dst_port: u16,
+    stats: &crate::engine::ProcessingStats,
+) -> Result<bytes::Bytes> {
+    match packet.try_into_mut() {
+        Ok(mut unique) => {
+            rewrite_dst_addr_inplace(&mut unique[..], new_dst_ip, new_dst_port)?;
+            stats
+                .rewrite_inplace_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(unique.freeze())
+        }
+        Err(shared) => {
+            let mut buf = bytes::BytesMut::from(&shared[..]);
+            match rewrite_dst_addr_inplace(&mut buf[..], new_dst_ip, new_dst_port) {
+                Ok(()) => {
+                    stats
+                        .rewrite_copy_fallback
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(buf.freeze())
+                }
+                Err(e) => {
+                    stats
+                        .rewrite_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+pub fn rewrite_src_addr_cow(
+    packet: bytes::Bytes,
+    new_src_ip: IpAddr,
+    new_src_port: u16,
+    stats: &crate::engine::ProcessingStats,
+) -> Result<bytes::Bytes> {
+    match packet.try_into_mut() {
+        Ok(mut unique) => {
+            rewrite_src_addr_inplace(&mut unique[..], new_src_ip, new_src_port)?;
+            stats
+                .rewrite_inplace_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(unique.freeze())
+        }
+        Err(shared) => {
+            let mut buf = bytes::BytesMut::from(&shared[..]);
+            match rewrite_src_addr_inplace(&mut buf[..], new_src_ip, new_src_port) {
+                Ok(()) => {
+                    stats
+                        .rewrite_copy_fallback
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(buf.freeze())
+                }
+                Err(e) => {
+                    stats
+                        .rewrite_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+fn rewrite_dst_addr_inplace(buf: &mut [u8], new_dst_ip: IpAddr, new_dst_port: u16) -> Result<()> {
+    let ip_hdr = parse_ip_header_local(buf).ok_or_else(|| anyhow!("invalid ip header"))?;
     let ip_hdr_len = ip_hdr.header_len();
     let orig_src = ip_hdr.src();
 
@@ -113,18 +196,11 @@ pub fn rewrite_dst_addr(
     let mut tcp_pkt = MutableTcpPacket::new(&mut buf[ip_hdr_len..]).unwrap();
     tcp_pkt.set_checksum(new_csum);
 
-    Ok(buf)
+    Ok(())
 }
 
-/// Переписывает IP-источник и TCP-порт источника (обратный путь: ответ
-/// локального редиректора → клиенту, подмена под адрес оригинальной цели).
-pub fn rewrite_src_addr(
-    packet_data: &[u8],
-    new_src_ip: IpAddr,
-    new_src_port: u16,
-) -> Result<Vec<u8>> {
-    let mut buf = packet_data.to_vec();
-    let ip_hdr = parse_ip_header_local(&buf).ok_or_else(|| anyhow!("invalid ip header"))?;
+fn rewrite_src_addr_inplace(buf: &mut [u8], new_src_ip: IpAddr, new_src_port: u16) -> Result<()> {
+    let ip_hdr = parse_ip_header_local(buf).ok_or_else(|| anyhow!("invalid ip header"))?;
     let ip_hdr_len = ip_hdr.header_len();
     let orig_dst = ip_hdr.dst();
 
@@ -166,7 +242,7 @@ pub fn rewrite_src_addr(
     let mut tcp_pkt = MutableTcpPacket::new(&mut buf[ip_hdr_len..]).unwrap();
     tcp_pkt.set_checksum(new_csum);
 
-    Ok(buf)
+    Ok(())
 }
 
 /// UDP-чексумма — обязательна для IPv6 (RFC 8200 запрещает нулевую), опциональна

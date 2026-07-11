@@ -14,9 +14,92 @@
 //! Адаптировано из [zapret](https://github.com/bol-van/zapret) и
 //! [byedpi](https://github.com/hufrea/byedpi).
 
-use crate::desync::{parse_ip_header, DesyncResult};
+use crate::desync::{parse_ip_header, DesyncResult, ParsedIpHeader};
 use pnet_packet::tcp::TcpFlags;
 use tracing::debug;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientHelloShape {
+    pub has_pre_shared_key: bool,
+    pub has_psk_key_exchange_modes: bool,
+    pub has_early_data: bool,
+    pub extension_order: smallvec::SmallVec<[u16; 32]>,
+    pub pre_shared_key_len: Option<usize>,
+}
+
+pub fn parse_client_hello_shape(payload: &[u8]) -> Option<ClientHelloShape> {
+    // TLS Record: ContentType(1) + Version(2) + Length(2)
+    if payload.len() < 5 || payload[0] != 0x16 {
+        return None;
+    }
+    let record_len = u16::from_be_bytes([payload[3], payload[4]]) as usize;
+    if 5 + record_len > payload.len() {
+        return None;
+    }
+
+    // Handshake: Type(1) + Length(3) + Body
+    let handshake = &payload[5..];
+    if handshake.len() < 4 || handshake[0] != 0x01 {
+        // 0x01 = ClientHello
+        return None;
+    }
+    let ch_body = &handshake[4..];
+
+    // ClientHello: ProtocolVersion(2) + Random(32) + SessionID(1 + len)
+    if ch_body.len() < 35 {
+        return None;
+    }
+    let session_id_len = ch_body[34] as usize;
+    let mut pos = 35 + session_id_len;
+
+    // Cipher Suites: length(2) + suites
+    if pos + 2 > ch_body.len() {
+        return None;
+    }
+    let cs_len = u16::from_be_bytes([ch_body[pos], ch_body[pos + 1]]) as usize;
+    pos += 2 + cs_len;
+
+    // Compression Methods: length(1) + methods
+    if pos >= ch_body.len() {
+        return None;
+    }
+    let comp_len = ch_body[pos] as usize;
+    pos += 1 + comp_len;
+
+    // Extensions: total_length(2) + extensions
+    if pos + 2 > ch_body.len() {
+        return None;
+    }
+    let ext_total = u16::from_be_bytes([ch_body[pos], ch_body[pos + 1]]) as usize;
+    pos += 2;
+
+    let mut shape = ClientHelloShape::default();
+    let ext_end = pos + ext_total;
+    while pos + 4 <= ext_end && pos + 4 <= ch_body.len() {
+        let ext_type = u16::from_be_bytes([ch_body[pos], ch_body[pos + 1]]);
+        let ext_len = u16::from_be_bytes([ch_body[pos + 2], ch_body[pos + 3]]) as usize;
+        pos += 4;
+
+        if pos + ext_len > ch_body.len() {
+            return None; // truncated extension
+        }
+
+        shape.extension_order.push(ext_type);
+
+        if ext_type == 0x0029 {
+            shape.has_pre_shared_key = true;
+            shape.pre_shared_key_len = Some(ext_len);
+        } else if ext_type == 0x002D {
+            shape.has_psk_key_exchange_modes = true;
+        } else if ext_type == 0x002A {
+            shape.has_early_data = true;
+        }
+
+        pos += ext_len;
+    }
+
+    Some(shape)
+}
 
 /// [15] TlsRecordFrag: разделение TLS record внутри ClientHello у SNI.
 ///
@@ -132,7 +215,10 @@ pub fn tls_record_frag(packet: &[u8], frag_at: usize, fake_ttl_offset: u8) -> De
         frag2_payload.len()
     );
 
-    DesyncResult::inject_many(inject)
+    // P0-11: Не пересылать оригинальный CH вместе с фрагментами — фрагменты уже несут все данные.
+    let mut result = DesyncResult::inject_many(inject);
+    result.drop = true;
+    result
 }
 
 /// [07] TlsRecordPad: padding внутри TLS record.
@@ -155,6 +241,12 @@ pub fn tls_record_pad(packet: &[u8], pad_size: usize, _fake_ttl_offset: u8) -> D
         Some(h) => h,
         None => return DesyncResult::passthrough(),
     };
+
+    // P0-06: IPv6 не имеет IP checksum — возвращаем passthrough.
+    // IPv4 с опциями (IHL > 5) корректно обрабатывается через ip.header_len().
+    if !matches!(ip, ParsedIpHeader::V4(_)) {
+        return DesyncResult::passthrough();
+    }
 
     let tcp_data = &packet[ip.header_len()..];
     let tcp = match pnet_packet::tcp::TcpPacket::new(tcp_data) {
@@ -188,16 +280,21 @@ pub fn tls_record_pad(packet: &[u8], pad_size: usize, _fake_ttl_offset: u8) -> D
         return DesyncResult::passthrough();
     }
 
-    // Случайный padding
-    let padding = crate::desync::rand::random_bytes(pad_size);
-
-    // Модифицируем пакет in-place
-    let mut modified = packet.to_vec();
+    // Модифицируем пакет in-place без heap-выделения Vec<u8> для padding
     let tcp_payload_offset = ip.header_len() + data_offset;
-
-    // Вставляем padding после тела ClientHello
     let insert_pos = tcp_payload_offset + ch_end;
-    modified.splice(insert_pos..insert_pos, padding.iter().copied());
+    let mut modified = bytes::BytesMut::with_capacity(packet.len() + pad_size);
+
+    // Вставляем prefix перед padding
+    modified.extend_from_slice(&packet[..insert_pos]);
+
+    // Вставляем случайный padding
+    let pad_start = modified.len();
+    modified.resize(pad_start + pad_size, 0);
+    crate::desync::rand::fill_random_bytes(&mut modified[pad_start..]);
+
+    // Вставляем суффикс после padding
+    modified.extend_from_slice(&packet[insert_pos..]);
 
     // Обновляем TLS record length (bytes 3-4 в payload)
     let new_record_len = record_len_u16.wrapping_add(pad_size as u16);
@@ -208,8 +305,8 @@ pub fn tls_record_pad(packet: &[u8], pad_size: usize, _fake_ttl_offset: u8) -> D
     let new_total = modified.len() as u16;
     modified[2..4].copy_from_slice(&new_total.to_be_bytes());
 
-    // Пересчитываем IP checksum
-    let ip_csum = crate::desync::ipv4_checksum(&modified[..20]);
+    // Пересчитываем IP checksum (используем ip.header_len() вместо hardcoded 20 для IHL > 5)
+    let ip_csum = crate::desync::ipv4_checksum(&modified[..ip.header_len()]);
     modified[10..12].copy_from_slice(&ip_csum.to_be_bytes());
 
     // Пересчитываем TCP checksum
@@ -224,7 +321,7 @@ pub fn tls_record_pad(packet: &[u8], pad_size: usize, _fake_ttl_offset: u8) -> D
         pad_size, record_len_u16, new_record_len
     );
 
-    DesyncResult::modified_only(modified)
+    DesyncResult::modified_only(modified.freeze())
 }
 
 /// [OM2] SniMicrofrag: микро-фрагментация TLS ClientHello.
@@ -337,7 +434,7 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
         inject,
         inter_delay_us: 0,
         drop: false,
-        is_outbound_inject: false,
+        inject_direction: crate::desync::InjectDirection::PreserveOriginal,
     }
 }
 
@@ -576,7 +673,10 @@ mod tests {
     fn test_tls_record_frag_passthrough() {
         let pkt = build_test_tls_packet();
         let result = tls_record_frag(&pkt, 5, 1);
-        assert!(!result.drop);
+        // P0-11: Фрагменты уже несут все данные — оригинал должен быть дропнут.
+        assert!(result.drop);
+        assert_eq!(result.inject.len(), 2);
+        assert!(result.modified.is_none());
     }
 
     #[test]
@@ -679,6 +779,111 @@ mod tests {
         let csum = crate::desync::ipv4_checksum(&pkt[..20]);
         pkt[10..12].copy_from_slice(&csum.to_be_bytes());
         pkt
+    }
+
+    fn build_tls13_clienthello_with_psk_extensions() -> Vec<u8> {
+        let mut ext_payload = Vec::new();
+        // pre_shared_key (0x0029)
+        ext_payload.extend_from_slice(&0x0029u16.to_be_bytes()); // type
+        ext_payload.extend_from_slice(&5u16.to_be_bytes()); // len
+        ext_payload.extend_from_slice(&[1, 2, 3, 4, 5]);
+
+        // psk_key_exchange_modes (0x002d)
+        ext_payload.extend_from_slice(&0x002du16.to_be_bytes()); // type
+        ext_payload.extend_from_slice(&3u16.to_be_bytes()); // len
+        ext_payload.extend_from_slice(&[6, 7, 8]);
+
+        // early_data (0x002a)
+        ext_payload.extend_from_slice(&0x002au16.to_be_bytes()); // type
+        ext_payload.extend_from_slice(&0u16.to_be_bytes()); // len
+
+        let ext_len = ext_payload.len();
+
+        let mut ch_body = Vec::new();
+        ch_body.extend_from_slice(&[0x03, 0x03]); // ProtocolVersion
+        ch_body.extend_from_slice(&[0u8; 32]); // Random
+        ch_body.push(0); // SessionID len = 0
+        ch_body.extend_from_slice(&2u16.to_be_bytes()); // Cipher suites len = 2
+        ch_body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        ch_body.push(1); // Compression methods len = 1
+        ch_body.push(0); // null compression
+        ch_body.extend_from_slice(&(ext_len as u16).to_be_bytes()); // Extensions len
+        ch_body.extend_from_slice(&ext_payload);
+
+        let ch_len = ch_body.len();
+        let mut handshake = vec![
+            0x01, // ClientHello
+            ((ch_len >> 16) & 0xff) as u8,
+            ((ch_len >> 8) & 0xff) as u8,
+            (ch_len & 0xff) as u8,
+        ];
+        handshake.extend_from_slice(&ch_body);
+
+        let hs_len = handshake.len();
+        let mut record = Vec::new();
+        record.push(0x16); // Handshake record type
+        record.extend_from_slice(&[0x03, 0x01]); // TLS 1.0 (legacy)
+        record.extend_from_slice(&(hs_len as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn fake_ch_is_disabled_for_tls13_psk_shape() {
+        let ch = build_tls13_clienthello_with_psk_extensions();
+        let shape = parse_client_hello_shape(&ch).unwrap();
+        assert!(shape.has_pre_shared_key);
+        assert!(shape.has_psk_key_exchange_modes);
+        assert!(shape.has_early_data);
+        assert_eq!(shape.extension_order.as_slice(), &[0x0029, 0x002D, 0x002A]);
+
+        use crate::desync::group::DesyncGroup;
+        use crate::desync::{DesyncConfig, DesyncTechnique};
+        let mut group = DesyncGroup::new(DesyncConfig::default());
+        group.add(DesyncTechnique::FakeSni);
+
+        let mut ip_tcp_payload = Vec::new();
+        // IPv4 Header (20 bytes)
+        ip_tcp_payload.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x00, // Ver, IHL, Total Len
+            0x00, 0x00, 0x00, 0x00, // Ident, Flags/Offset
+            0x40, 0x06, 0x00, 0x00, // TTL=64, Protocol=TCP
+            0x7f, 0x00, 0x00, 0x01, // Src IP
+            0x7f, 0x00, 0x00, 0x01, // Dst IP
+        ]);
+        // TCP Header (20 bytes)
+        ip_tcp_payload.extend_from_slice(&[
+            0x12, 0x34, // Src Port
+            0x01, 0xbb, // Dst Port
+            0x00, 0x00, 0x00, 0x01, // Seq
+            0x00, 0x00, 0x00, 0x00, // Ack
+            0x50, 0x18, 0x10, 0x00, // Offset=5 (20 bytes), Flags=ACK
+            0x00, 0x00, 0x00, 0x00, // Checksum, Urgent
+        ]);
+        let ch_data = build_tls13_clienthello_with_psk_extensions();
+        ip_tcp_payload.extend_from_slice(&ch_data);
+
+        let total_len = ip_tcp_payload.len() as u16;
+        ip_tcp_payload[2] = (total_len >> 8) as u8;
+        ip_tcp_payload[3] = (total_len & 0xff) as u8;
+
+        let packet = bytes::Bytes::from(ip_tcp_payload);
+
+        let result = group.apply_with_runtime_context(
+            &packet,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(shape),
+        );
+        assert!(
+            result.inject.is_empty(),
+            "FakeSni should be disabled for resumption ClientHello"
+        );
+        assert!(result.modified.is_none());
     }
 }
 

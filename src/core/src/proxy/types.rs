@@ -161,6 +161,7 @@ impl DomainBlocklist {
 pub struct FakeIpManager {
     pub domain_to_ip: DashMap<String, Ipv4Addr>,
     pub ip_to_domain: DashMap<Ipv4Addr, String>,
+    pub last_activity: DashMap<String, Instant>,
     pub next_ip: std::sync::atomic::AtomicU32,
     pub max_entries: usize,
 }
@@ -170,18 +171,43 @@ impl FakeIpManager {
         Self {
             domain_to_ip: DashMap::new(),
             ip_to_domain: DashMap::new(),
+            last_activity: DashMap::new(),
             next_ip: std::sync::atomic::AtomicU32::new(1),
             max_entries,
         }
     }
 
+    pub fn sweep_stale(&self, max_idle: std::time::Duration) -> usize {
+        let now = Instant::now();
+        let mut evicted = 0;
+        let mut to_evict = Vec::new();
+        for r in self.last_activity.iter() {
+            if now.duration_since(*r.value()) > max_idle {
+                to_evict.push(r.key().clone());
+            }
+        }
+        for domain in to_evict {
+            if let Some((_, ip)) = self.domain_to_ip.remove(&domain) {
+                self.ip_to_domain.remove(&ip);
+                self.last_activity.remove(&domain);
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
     pub fn allocate(&self, domain: &str) -> Option<Ipv4Addr> {
         let domain = domain.to_lowercase();
         if let Some(ip) = self.domain_to_ip.get(&domain) {
+            self.last_activity.insert(domain.clone(), Instant::now());
             return Some(*ip);
         }
         if self.domain_to_ip.len() >= self.max_entries {
-            return None;
+            // Evict entries idle for more than 10 minutes
+            self.sweep_stale(std::time::Duration::from_secs(600));
+            if self.domain_to_ip.len() >= self.max_entries {
+                return None;
+            }
         }
         // 10.0.0.0/8 allocation (starting with 10.0.0.1)
         let offset = self
@@ -193,13 +219,21 @@ impl FakeIpManager {
         let ip_val = 0x0A00_0000 | (offset & 0x00FF_FFFF);
         let ip = Ipv4Addr::from(ip_val);
         self.domain_to_ip.insert(domain.clone(), ip);
-        self.ip_to_domain.insert(ip, domain);
+        self.ip_to_domain.insert(ip, domain.clone());
+        self.last_activity.insert(domain, Instant::now());
         Some(ip)
     }
 
     pub fn lookup(&self, ip: &IpAddr) -> Option<String> {
         match ip {
-            IpAddr::V4(v4) => self.ip_to_domain.get(v4).map(|d| d.clone()),
+            IpAddr::V4(v4) => {
+                if let Some(domain) = self.ip_to_domain.get(v4) {
+                    self.last_activity.insert(domain.clone(), Instant::now());
+                    Some(domain.clone())
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -269,5 +303,32 @@ mod tests {
         let ip1 = manager.allocate("netflix.com").unwrap();
         let ip2 = manager.allocate("netflix.com").unwrap();
         assert_eq!(ip1, ip2); // Idempotency
+    }
+
+    #[test]
+    fn test_fake_ip_manager_ttl_eviction() {
+        use std::time::Duration;
+        let manager = FakeIpManager::new(2);
+        let ip1 = manager.allocate("netflix.com").unwrap();
+        let ip2 = manager.allocate("google.com").unwrap();
+
+        // Since max_entries = 2, allocating a 3rd domain will return None
+        assert!(manager.allocate("youtube.com").is_none());
+
+        // Make the first entry stale
+        manager.last_activity.insert(
+            "netflix.com".to_string(),
+            Instant::now() - Duration::from_secs(3600),
+        );
+
+        // Now allocate third domain: netflix.com is evicted and youtube.com is allocated!
+        let ip3 = manager.allocate("youtube.com").unwrap();
+        assert!(manager.domain_to_ip.contains_key("youtube.com"));
+        assert!(!manager.domain_to_ip.contains_key("netflix.com"));
+        assert_eq!(manager.lookup(&IpAddr::V4(ip1)), None);
+        assert_eq!(
+            manager.lookup(&IpAddr::V4(ip3)),
+            Some("youtube.com".to_string())
+        );
     }
 }

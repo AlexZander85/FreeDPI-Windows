@@ -36,8 +36,10 @@ impl RedirectTable {
     }
 
     /// Периодическая очистка устаревших записей (SYN тайм-аут).
-    pub fn sweep_stale(&self, max_age: std::time::Duration) {
+    pub fn sweep_stale(&self, max_age: std::time::Duration) -> usize {
+        let before = self.map.len();
         self.map.retain(|_, e| e.created_at.elapsed() < max_age);
+        before.saturating_sub(self.map.len())
     }
 }
 
