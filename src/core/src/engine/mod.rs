@@ -136,7 +136,8 @@ pub struct ProcessingStats {
     pub total_received: PaddedCounter,
     pub injected_skipped: PaddedCounter,
     pub tls_outbound: PaddedCounter,
-    pub fake_ch_injected: PaddedCounter,
+    pub fake_ch_scheduled: PaddedCounter, // enqueued for inject (intent)
+    pub fake_ch_injected: PaddedCounter,  // successfully sent via WinDivert
     pub forwarded: PaddedCounter,
     pub dropped: PaddedCounter,
     pub errors: PaddedCounter,
@@ -193,6 +194,7 @@ impl ProcessingStats {
             total_received: PaddedCounter::new(0),
             injected_skipped: PaddedCounter::new(0),
             tls_outbound: PaddedCounter::new(0),
+            fake_ch_scheduled: PaddedCounter::new(0),
             fake_ch_injected: PaddedCounter::new(0),
             forwarded: PaddedCounter::new(0),
             dropped: PaddedCounter::new(0),
@@ -264,6 +266,7 @@ impl ProcessingStats {
             total_received: self.total_received.load(Ordering::Relaxed),
             injected_skipped: self.injected_skipped.load(Ordering::Relaxed),
             tls_outbound: self.tls_outbound.load(Ordering::Relaxed),
+            fake_ch_scheduled: self.fake_ch_scheduled.load(Ordering::Relaxed),
             fake_ch_injected: self.fake_ch_injected.load(Ordering::Relaxed),
             forwarded: self.forwarded.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
@@ -335,7 +338,8 @@ pub struct ProcessingStatsSnapshot {
     pub total_received: u64,
     pub injected_skipped: u64,
     pub tls_outbound: u64,
-    pub fake_ch_injected: u64,
+    pub fake_ch_scheduled: u64, // enqueued for inject
+    pub fake_ch_injected: u64,  // successfully sent via WinDivert
     pub forwarded: u64,
     pub dropped: u64,
     pub errors: u64,
@@ -1555,7 +1559,7 @@ impl ProcessingPipeline {
                         }
                         pipeline
                             .stats
-                            .fake_ch_injected
+                            .fake_ch_scheduled
                             .fetch_add(1, Ordering::Relaxed);
                     }
 

@@ -429,8 +429,6 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
         ));
     }
 
-    let remaining_len = payload.len() - micro_count;
-
     debug!(
         "[OM2] SniMicrofrag: {} micro-frag decoys + original passthrough (Variant B)",
         micro_count,

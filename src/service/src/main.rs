@@ -751,8 +751,8 @@ fn start_stats_loop(
                 _ = interval.tick() => {
                     let s = stats.snapshot();
                     info!(
-                        "Stats: recv={} fwd={} inject={}",
-                        s.total_received, s.forwarded, s.fake_ch_injected
+                        "Stats: recv={} fwd={} inject_sched={} inject_sent={}",
+                        s.total_received, s.forwarded, s.fake_ch_scheduled, s.fake_ch_injected
                     );
                 }
                 _ = shutdown_rx_stats.recv() => break,

@@ -1272,6 +1272,14 @@ pub fn mss_clamp(packet: &bytes::Bytes, mss_value: u16, _fake_ttl_offset: u8) ->
 /// Задерживаем отправку ACK после получения данных.
 /// DPI видит established соединение без ACK → считает
 /// что данные не дошли → может сбросить поток.
+/// [W3] AckRstDecoy: инъекция fake RST/ACK с низким TTL для confuse DPI + подавление реального ACK.
+///
+/// ## Принцип
+/// Отправляем RST|ACK с fake TTL до того как реальный ACK дойдёт.
+/// DPI видит RST и считает соединение разорванным. Реальный ACK дропается
+/// (drop_original = true), чтобы не выдать истинное состояние соединения.
+///
+/// Семантика: ForceOutbound — RST идёт в направлении client→server.
 pub fn ack_suppress(
     packet: &bytes::Bytes,
     delay_segments: usize,
@@ -1293,7 +1301,7 @@ pub fn ack_suppress(
         return DesyncResult::passthrough();
     }
 
-    // Отправляем fake RST вместо ACK (с TTL-1)
+    // Fake RST|ACK с fake TTL — decoy для DPI
     let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
     let fake_rst = build_tcp_segment_p3(
         ip.src(),
@@ -1310,11 +1318,16 @@ pub fn ack_suppress(
     );
 
     debug!(
-        "[W3] AckSuppress: {} fake RSTs + suppress real ACK",
+        "[W3] AckRstDecoy: {} fake RST|ACK decoys, drop original ACK",
         delay_segments
     );
 
-    DesyncResult::modify_and_inject(packet.to_vec(), fake_rst)
+    // drop_original=true: реальный ACK подавляется.
+    // Fake RST — ForceOutbound (client→server direction).
+    DesyncResult::drop_original_with_injects(smallvec::smallvec![crate::desync::InjectPacket::tcp(
+        bytes::Bytes::from(fake_rst),
+        crate::desync::InjectDirection::ForceOutbound,
+    )])
 }
 
 /// [W4] PktReorder: отправка 2-3 decoy сегментов с random out-of-window SEQ + garbage payload.
@@ -1565,7 +1578,7 @@ pub fn win_scale_manip(
 /// Разделяем данные на 2 сегмента. Второй отправляем с TTL-1.
 /// DPI видит сегменты в неправильном порядке. Сервер собирает
 /// по SEQ нормально.
-pub fn disorder(packet: &bytes::Bytes, split_at: usize, fake_ttl_offset: u8) -> DesyncResult {
+pub fn disorder(packet: &bytes::Bytes, split_at: usize, _fake_ttl_offset: u8) -> DesyncResult {
     let ip = match parse_ip_header(packet) {
         Some(h) => h,
         None => return DesyncResult::passthrough(),
@@ -1869,7 +1882,15 @@ pub fn fakerst(packet: &bytes::Bytes, fake_ttl_offset: u8) -> DesyncResult {
 
     debug!("[RP7] FakeRst: SEQ={}+10000", tcp.sequence);
 
-    DesyncResult::inject_only(fake_rst)
+    // ForceOutbound: fake RST идёт в направлении client→server (outbound).
+    DesyncResult {
+        modified: None,
+        inject: smallvec::smallvec![crate::desync::InjectPacket::tcp(
+            fake_rst,
+            crate::desync::InjectDirection::ForceOutbound,
+        )],
+        drop_original: false,
+    }
 }
 
 /// [RN1] ByteByByte: отправка первого TCP-сегмента по 1 байту.
@@ -2444,7 +2465,31 @@ mod tests {
         pkt[10..12].copy_from_slice(&csum.to_be_bytes());
         let pkt = bytes::Bytes::from(pkt);
         let result = ack_suppress(&pkt, 2, 1);
-        assert!(!result.inject.is_empty());
+        // AckRstDecoy semantics: real ACK suppressed, fake RST|ACK injected as ForceOutbound decoy
+        assert!(!result.inject.is_empty(), "must inject fake RST|ACK decoy");
+        assert!(
+            result.drop_original,
+            "real ACK must be suppressed (drop_original=true)"
+        );
+        assert!(
+            result.modified.is_none(),
+            "no modified packet — original is dropped"
+        );
+        // Decoy must have fake TTL (< 64 with offset=1)
+        let decoy_ttl = result.inject[0].bytes[8];
+        assert!(
+            decoy_ttl < 64,
+            "RST|ACK decoy must have fake TTL, got {}",
+            decoy_ttl
+        );
+        // Direction must be ForceOutbound
+        assert!(
+            matches!(
+                result.inject[0].direction,
+                crate::desync::InjectDirection::ForceOutbound
+            ),
+            "fake RST must use ForceOutbound"
+        );
     }
 
     #[test]
