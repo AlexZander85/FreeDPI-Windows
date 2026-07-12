@@ -118,7 +118,6 @@ impl PipelineState {
                 None
             },
             inject: self.injects,
-            inter_delay_us: 0,
             drop_original: self.drop,
         }
     }
@@ -1249,7 +1248,6 @@ mod tests {
                 bytes::Bytes::from(vec![1, 2, 3]),
                 crate::desync::InjectDirection::ForceOutbound
             )],
-            inter_delay_us: 0,
             drop_original: false,
         };
 

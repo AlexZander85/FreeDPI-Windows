@@ -156,7 +156,6 @@ pub fn multisplit(
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
         inject: inject_packets,
-        inter_delay_us: 0,
         drop_original: false,
     }
 }
@@ -319,7 +318,6 @@ pub fn tcpseg(packet: &bytes::Bytes, max_seg_size: usize, _fake_ttl_offset: u8) 
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
         inject: inject_packets,
-        inter_delay_us: 0,
         drop_original: false,
     }
 }
@@ -1390,7 +1388,6 @@ pub fn pkt_reorder(packet: &bytes::Bytes, swap_with_next: bool) -> DesyncResult 
     DesyncResult {
         modified: Some(packet.clone()),
         inject,
-        inter_delay_us: 0,
         drop_original: false,
     }
 }
@@ -1588,7 +1585,7 @@ pub fn disorder(packet: &bytes::Bytes, split_at: usize, fake_ttl_offset: u8) -> 
     let ack = tcp.acknowledgment;
     let window = tcp.window;
 
-    // Сегмент 2 (отправляем первым, с TTL-1)
+    // Сегмент 2 (отправляем первым, normal TTL — Variant A: оба сегмента доходят до сервера)
     let seg2_payload = &tcp.payload[split_at..];
     let seg2 = build_tcp_segment_p3(
         ip.src(),
@@ -1600,11 +1597,11 @@ pub fn disorder(packet: &bytes::Bytes, split_at: usize, fake_ttl_offset: u8) -> 
         TcpFlags::PSH | TcpFlags::ACK,
         window,
         seg2_payload,
-        ip.ttl().saturating_sub(fake_ttl_offset),
+        ip.ttl(), // normal TTL — seg2 несёт real bytes
         generate_identification(ip.identification(), 0),
     );
 
-    // Сегмент 1 (отправляем вторым, нормальный TTL)
+    // Сегмент 1 (отправляем вторым, normal TTL)
     let seg1_payload = &tcp.payload[..split_at];
     let modified = build_tcp_segment_p3(
         ip.src(),
@@ -1621,7 +1618,7 @@ pub fn disorder(packet: &bytes::Bytes, split_at: usize, fake_ttl_offset: u8) -> 
     );
 
     debug!(
-        "[RP3] Disorder: split at {}, {}+{} bytes",
+        "[RP3] Disorder: split at {}, {}+{} bytes (both normal TTL, drop original)",
         split_at,
         seg1_payload.len(),
         seg2_payload.len()
@@ -1633,8 +1630,7 @@ pub fn disorder(packet: &bytes::Bytes, split_at: usize, fake_ttl_offset: u8) -> 
             bytes::Bytes::from(seg2),
             crate::desync::InjectDirection::PreserveOriginal
         )],
-        inter_delay_us: 0,
-        drop_original: false,
+        drop_original: true, // Variant A: seg1+seg2 carry all data — original must not duplicate
     }
 }
 
@@ -1734,7 +1730,6 @@ pub fn multidisorder_new(
     DesyncResult {
         modified: Some(bytes::Bytes::from(modified)),
         inject,
-        inter_delay_us: 0,
         drop_original: false,
     }
 }
@@ -1763,7 +1758,8 @@ pub fn disoob(packet: &bytes::Bytes, fake_ttl_offset: u8) -> DesyncResult {
     let split = tcp.payload.len() / 2;
     let fake_ttl = ip.ttl().saturating_sub(fake_ttl_offset);
 
-    // OOB сегмент (URG+PSH) с reordered данными
+    // OOB сегмент (URG+PSH) — decoy для DPI (fake TTL, Variant B)
+    // Real bytes доставляются через оригинальный пакет (drop_original = false)
     let oob_seg = build_tcp_segment_p3(
         ip.src(),
         ip.dst(),
@@ -1774,28 +1770,23 @@ pub fn disoob(packet: &bytes::Bytes, fake_ttl_offset: u8) -> DesyncResult {
         TcpFlags::URG | TcpFlags::PSH | TcpFlags::ACK,
         tcp.window,
         &tcp.payload[split..],
-        fake_ttl,
+        fake_ttl, // fake TTL — только для путаницы DPI
         generate_identification(ip.identification(), 0),
     );
 
-    // Normal сегмент
-    let modified = build_tcp_segment_p3(
-        ip.src(),
-        ip.dst(),
-        tcp.src_port,
-        tcp.dst_port,
-        tcp.sequence,
-        tcp.acknowledgment,
-        TcpFlags::PSH | TcpFlags::ACK,
-        tcp.window,
-        &tcp.payload[..split],
-        ip.ttl(),
-        generate_identification(ip.identification(), 1),
+    debug!(
+        "[RP5] Disoob: URG decoy + original passthrough, {} bytes",
+        tcp.payload.len()
     );
 
-    debug!("[RP5] Disoob: OGB + disorder, {} bytes", tcp.payload.len());
-
-    DesyncResult::modify_and_inject(modified, oob_seg)
+    DesyncResult {
+        modified: None,
+        inject: smallvec::smallvec![crate::desync::InjectPacket::tcp(
+            oob_seg,
+            crate::desync::InjectDirection::PreserveOriginal,
+        )],
+        drop_original: false, // оригинал проходит целиком
+    }
 }
 
 /// [RP6] HostFake: fake SNI с подменой имени хоста.
@@ -1932,31 +1923,16 @@ pub fn byte_by_byte(packet: &bytes::Bytes, max_bytes: usize, fake_ttl_offset: u8
         ));
     }
 
-    // Остаток payload — нормальный сегмент
-    let modified = build_tcp_segment_p3(
-        ip.src(),
-        ip.dst(),
-        tcp.src_port,
-        tcp.dst_port,
-        seq.wrapping_add(byte_count as u32),
-        ack,
-        TcpFlags::PSH | TcpFlags::ACK,
-        window,
-        &tcp.payload[byte_count..],
-        ip.ttl(),
-        generate_identification(ip.identification(), byte_count),
-    );
-
     debug!(
-        "[RN1] ByteByByte: {} bytes individually + {} remaining",
+        "[RN1] ByteByByte: {} decoy bytes + original passthrough (Variant B)",
         byte_count,
-        tcp.payload.len() - byte_count
     );
 
+    // Variant B: injected 1-byte segs are pure decoys (fake TTL).
+    // Оригинальный пакет проходит целиком — сервер всегда получает полный payload.
     DesyncResult {
-        modified: Some(bytes::Bytes::from(modified)),
+        modified: None,
         inject,
-        inter_delay_us: 0,
         drop_original: false,
     }
 }
@@ -2356,7 +2332,27 @@ mod tests {
     fn test_disorder() {
         let pkt = make_data_packet();
         let result = disorder(&pkt, 10, 1);
+        // Variant A: both segments at normal TTL, original dropped
         assert!(result.inject.len() >= 1);
+        assert!(
+            result.modified.is_some(),
+            "disorder must produce modified (seg1)"
+        );
+        assert!(
+            result.drop_original,
+            "disorder must drop original (Variant A)"
+        );
+        // Both seg2 (inject) and seg1 (modified) must have normal TTL = 64
+        let ttl_inject = result.inject[0].bytes[8];
+        let ttl_modified = result.modified.as_ref().unwrap()[8];
+        assert_eq!(
+            ttl_inject, 64,
+            "disorder inject (seg2) must have normal TTL"
+        );
+        assert_eq!(
+            ttl_modified, 64,
+            "disorder modified (seg1) must have normal TTL"
+        );
     }
 
     #[test]
@@ -2384,9 +2380,13 @@ mod tests {
     fn test_byte_by_byte() {
         let pkt = make_data_packet();
         let result = byte_by_byte(&pkt, 5, 1);
-        // 5 individual bytes + remaining
+        // Variant B: inject decoys only, original passes
         assert!(result.inject.len() >= 4);
-        assert!(result.modified.is_some());
+        assert!(
+            result.modified.is_none(),
+            "byte_by_byte must not produce modified (Variant B)"
+        );
+        assert!(!result.drop_original, "byte_by_byte must not drop original");
     }
 
     #[test]
@@ -2563,6 +2563,64 @@ mod tests {
             panic!("multisplit must produce modified segment");
         }
     }
+
+    // === Real-vs-Decoy Invariant Tests ===
+
+    #[test]
+    fn test_disoob_invariant_original_passes() {
+        let pkt = make_data_packet();
+        let result = disoob(&pkt, 1);
+        // Variant B: OOB segment is a decoy (fake TTL), original passes
+        assert_eq!(
+            result.inject.len(),
+            1,
+            "disoob must inject exactly one OOB decoy"
+        );
+        assert!(
+            result.modified.is_none(),
+            "disoob must not produce modified (original passes)"
+        );
+        assert!(!result.drop_original, "disoob must not drop original");
+        // OOB decoy must have fake TTL (< 64 with offset=1)
+        let oob_ttl = result.inject[0].bytes[8];
+        assert!(oob_ttl < 64, "OOB decoy must have fake TTL (< original 64)");
+    }
+
+    #[test]
+    fn test_disorder_invariant_both_real_ttl() {
+        let pkt = make_data_packet();
+        let result = disorder(&pkt, 10, 1);
+        // Variant A: seg2 (inject) and seg1 (modified) both at normal TTL
+        assert!(
+            result.drop_original,
+            "disorder Variant A must drop original"
+        );
+        let seg2_ttl = result.inject[0].bytes[8];
+        assert_eq!(seg2_ttl, 64, "disorder seg2 must have normal TTL");
+        let seg1_ttl = result.modified.as_ref().unwrap()[8];
+        assert_eq!(seg1_ttl, 64, "disorder seg1 must have normal TTL");
+    }
+
+    #[test]
+    fn test_byte_by_byte_invariant_decoys_only() {
+        let pkt = make_data_packet();
+        let result = byte_by_byte(&pkt, 5, 2);
+        // Variant B: all inject packets are decoys (fake TTL)
+        assert!(!result.drop_original, "byte_by_byte must not drop original");
+        assert!(
+            result.modified.is_none(),
+            "byte_by_byte must not produce modified"
+        );
+        for (i, pkt) in result.inject.iter().enumerate() {
+            let ttl = pkt.bytes[8];
+            assert!(
+                ttl < 64,
+                "inject[{}] must have fake TTL (< 64), got {}",
+                i,
+                ttl
+            );
+        }
+    }
 }
 
 // === HostFakeSplit ===
@@ -2708,7 +2766,6 @@ pub fn syn_ack_split(packet: &[u8]) -> DesyncResult {
                 crate::desync::InjectDirection::PreserveOriginal
             ),
         ],
-        inter_delay_us: 0,
         drop_original: false,
     }
 }

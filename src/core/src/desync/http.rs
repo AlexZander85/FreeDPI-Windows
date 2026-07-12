@@ -195,12 +195,17 @@ pub fn h2_hpack_aware(packet: &[u8], split_at: usize, fake_ttl_offset: u8) -> De
         ack,
         window,
         frag2_payload,
-        ip.ttl(),
+        ip.ttl().saturating_sub(fake_ttl_offset), // fake TTL — was real TTL, fix duplicate
         ip.identification().wrapping_add(2),
     );
 
-    debug!("[31] H2HpackAware: HPACK split at {}", split_at);
+    debug!(
+        "[31] H2HpackAware: HPACK split at {}, both frags are decoys (fake TTL)",
+        split_at
+    );
 
+    // Both frags are decoys at fake_ttl. Original passes through (drop_original=false via inject_many).
+    // Avoids real-TTL duplicate of frag2 that was previously sent alongside original.
     DesyncResult::inject_many(vec![frag1, frag2])
 }
 
@@ -967,7 +972,8 @@ pub fn chunk_obfuscation(packet: &[u8], split_count: usize, fake_ttl_offset: u8)
     }
 
     // Проверяем что это chunked transfer
-    if !tcp.payload.windows(14).any(|w| w == b"Transfer-Encoding") {
+    const TE: &[u8] = b"Transfer-Encoding";
+    if !tcp.payload.windows(TE.len()).any(|w| w == TE) {
         return DesyncResult::passthrough();
     }
 
@@ -999,30 +1005,16 @@ pub fn chunk_obfuscation(packet: &[u8], split_count: usize, fake_ttl_offset: u8)
         ));
     }
 
-    // Последний сегмент — modified original
-    let last_start = (split_count - 1) * seg_size;
-    let modified = build_http_segment(
-        ip.src(),
-        ip.dst(),
-        tcp.src_port,
-        tcp.dst_port,
-        tcp.sequence.wrapping_add(last_start as u32),
-        tcp.acknowledgment,
-        tcp.window,
-        &tcp.payload[last_start..],
-        ip.ttl(),
-        ip.identification().wrapping_add(split_count as u16),
-    );
-
     debug!(
-        "[B1] ChunkObfuscation: {} segments × {} bytes",
-        split_count, seg_size
+        "[B1] ChunkObfuscation: {} decoy segments + original passthrough (Variant B)",
+        split_count,
     );
 
+    // Variant B: all chunk segments are decoys (fake TTL).
+    // Original HTTP packet passes through — server always gets complete chunked stream.
     DesyncResult {
-        modified: Some(modified),
+        modified: None,
         inject,
-        inter_delay_us: 0,
         drop_original: false,
     }
 }
@@ -1518,5 +1510,83 @@ mod p4_tests {
         );
         assert!(seg.len() > 40);
         assert_eq!(seg[0] >> 4, 4);
+    }
+
+    // === Real-vs-Decoy Invariant Tests ===
+
+    fn make_chunked_http_packet() -> bytes::Bytes {
+        // HTTP packet with Transfer-Encoding header for chunk_obfuscation to activate
+        let http = b"GET / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\nBODYBODYBODYBODYBODY";
+        let tcp_len = 20 + http.len();
+        let total = 20 + tcp_len;
+        let mut pkt = vec![0u8; total];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&[192, 168, 1, 1]);
+        pkt[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
+        pkt[24..28].copy_from_slice(&1000u32.to_be_bytes());
+        pkt[32] = 0x50;
+        pkt[33] = TcpFlags::PSH | TcpFlags::ACK;
+        pkt[34..36].copy_from_slice(&65535u16.to_be_bytes());
+        pkt[40..40 + http.len()].copy_from_slice(http);
+        let csum = crate::desync::ipv4_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+        bytes::Bytes::from(pkt)
+    }
+
+    #[test]
+    fn test_chunk_obfuscation_invariant_decoys_only() {
+        let pkt = make_chunked_http_packet();
+        let result = chunk_obfuscation(&pkt, 3, 2);
+        // Variant B: all chunks are decoys (fake TTL), original passes
+        assert!(
+            !result.inject.is_empty(),
+            "chunk_obfuscation must produce inject decoys"
+        );
+        assert!(
+            result.modified.is_none(),
+            "chunk_obfuscation must not produce modified (Variant B)"
+        );
+        assert!(
+            !result.drop_original,
+            "chunk_obfuscation must not drop original"
+        );
+        // All injected segments must have fake TTL (< 64 with offset=2)
+        for (i, seg) in result.inject.iter().enumerate() {
+            let ttl = seg.bytes[8];
+            assert!(
+                ttl < 64,
+                "inject[{}] chunk must have fake TTL, got {}",
+                i,
+                ttl
+            );
+        }
+    }
+
+    #[test]
+    fn test_h2_hpack_aware_both_frags_decoy() {
+        let pkt = make_http_packet();
+        let result = h2_hpack_aware(&pkt, 10, 2);
+        // Both frags must be decoys (fake TTL), original passes through
+        assert_eq!(result.inject.len(), 2, "h2_hpack_aware must inject 2 frags");
+        assert!(
+            result.modified.is_none(),
+            "h2_hpack_aware inject_many gives modified=None"
+        );
+        assert!(!result.drop_original, "original must pass through");
+        // Both frags must have fake TTL (< 64 with offset=2)
+        for (i, frag) in result.inject.iter().enumerate() {
+            let ttl = frag.bytes[8];
+            assert!(
+                ttl < 64,
+                "inject[{}] frag must have fake TTL, got {}",
+                i,
+                ttl
+            );
+        }
     }
 }

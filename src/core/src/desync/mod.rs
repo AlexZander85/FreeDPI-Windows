@@ -108,10 +108,8 @@ impl InjectPacket {
 pub struct DesyncResult {
     /// Модифицированный оригинальный пакет (для отправки через WinDivert).
     pub modified: Option<bytes::Bytes>,
-    /// Дополнительные пакеты для инъекции.
+    /// Дополнительные пакеты для инъекции. Задержка между ними хранится в InjectPacket.delay_us.
     pub inject: SmallVec<[InjectPacket; 4]>,
-    /// Задержка между инъекциями (мкс). 0 = без задержки.
-    pub inter_delay_us: u32,
     /// Дропнуть оригинальный пакет (не отправлять).
     pub drop_original: bool,
 }
@@ -121,7 +119,6 @@ impl DesyncResult {
         Self {
             modified: None,
             inject: SmallVec::new(),
-            inter_delay_us: 0,
             drop_original: false,
         }
     }
@@ -130,7 +127,6 @@ impl DesyncResult {
         Self {
             modified: Some(modified.into()),
             inject: SmallVec::new(),
-            inter_delay_us: 0,
             drop_original: false,
         }
     }
@@ -151,7 +147,6 @@ impl DesyncResult {
                 proto,
                 InjectDirection::PreserveOriginal
             )],
-            inter_delay_us: 0,
             drop_original: false,
         }
     }
@@ -175,7 +170,6 @@ impl DesyncResult {
                 proto,
                 InjectDirection::PreserveOriginal
             )],
-            inter_delay_us: 0,
             drop_original: false,
         }
     }
@@ -199,7 +193,6 @@ impl DesyncResult {
         Self {
             modified: None,
             inject: packets,
-            inter_delay_us: 0,
             drop_original: false,
         }
     }
@@ -208,7 +201,6 @@ impl DesyncResult {
         Self {
             modified: None,
             inject: SmallVec::new(),
-            inter_delay_us: 0,
             drop_original: true,
         }
     }
@@ -219,7 +211,6 @@ impl DesyncResult {
         Self {
             modified: None,
             inject,
-            inter_delay_us: 0,
             drop_original: false,
         }
     }
@@ -228,7 +219,6 @@ impl DesyncResult {
         Self {
             modified: None,
             inject,
-            inter_delay_us: 0,
             drop_original: false,
         }
     }
@@ -241,7 +231,6 @@ impl DesyncResult {
         Self {
             modified,
             inject,
-            inter_delay_us: 0,
             drop_original,
         }
     }
@@ -250,7 +239,6 @@ impl DesyncResult {
         Self {
             modified: None,
             inject,
-            inter_delay_us: 0,
             drop_original: true,
         }
     }

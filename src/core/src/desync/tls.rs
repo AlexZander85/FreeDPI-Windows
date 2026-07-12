@@ -429,33 +429,18 @@ pub fn sni_microfrag(packet: &[u8], micro_count: usize, fake_ttl_offset: u8) -> 
         ));
     }
 
-    let remaining = &payload[micro_count..];
-    let last_seq = seq.wrapping_add(micro_count as u32);
-    let modified = crate::desync::tcp::build_ip_tcp_packet_with_options(
-        packet,
-        src,
-        dst,
-        src_port,
-        dst_port,
-        last_seq,
-        ack,
-        TcpFlags::PSH | TcpFlags::ACK,
-        window,
-        remaining,
-        ip.ttl(),
-        ip.identification().wrapping_add(micro_count as u16 + 1),
-    );
+    let remaining_len = payload.len() - micro_count;
 
     debug!(
-        "[OM2] SniMicrofrag: {} micro-frags × 1 byte + {} remaining bytes",
+        "[OM2] SniMicrofrag: {} micro-frag decoys + original passthrough (Variant B)",
         micro_count,
-        remaining.len()
     );
 
+    // Variant B: micro-frags are pure decoys (fake TTL) to confuse DPI SNI detection.
+    // Original TLS ClientHello passes through — server always gets the full TLS record.
     DesyncResult {
-        modified: Some(modified),
+        modified: None,
         inject,
-        inter_delay_us: 0,
         drop_original: false,
     }
 }
@@ -906,6 +891,37 @@ mod tests {
             "FakeSni should be disabled for resumption ClientHello"
         );
         assert!(result.modified.is_none());
+    }
+
+    // === Real-vs-Decoy Invariant Test ===
+
+    #[test]
+    fn test_sni_microfrag_invariant_decoys_only() {
+        let pkt = build_test_tls_ch_packet();
+        let result = sni_microfrag(&pkt, 3, 2);
+        // Variant B: micro-frags are pure decoys, original passes through
+        assert!(
+            !result.inject.is_empty(),
+            "sni_microfrag must produce inject decoys"
+        );
+        assert!(
+            result.modified.is_none(),
+            "sni_microfrag must not produce modified (Variant B)"
+        );
+        assert!(
+            !result.drop_original,
+            "sni_microfrag must not drop original"
+        );
+        // All injected micro-frags must have fake TTL (< 64 with offset=2)
+        for (i, pkt) in result.inject.iter().enumerate() {
+            let ttl = pkt.bytes[8];
+            assert!(
+                ttl < 64,
+                "inject[{}] micro-frag must have fake TTL, got {}",
+                i,
+                ttl
+            );
+        }
     }
 }
 

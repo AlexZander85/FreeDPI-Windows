@@ -1,5 +1,5 @@
 import { useTranslation } from "react-i18next";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { getConfig, saveConfig } from "@/lib/api";
 
 interface Settings {
@@ -148,9 +148,9 @@ export default function SettingsPanel() {
     }
   };
 
-  useState(() => {
+  useEffect(() => {
     load();
-  });
+  }, []);
 
   return (
     <div className="space-y-4">

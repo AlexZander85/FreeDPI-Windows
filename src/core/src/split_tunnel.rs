@@ -276,7 +276,9 @@ impl SplitTunnel {
     pub fn build_win_divert_filter(&self) -> String {
         let base = "(ip or ipv6) && ((outbound && tcp.DstPort == 443 && tcp.PayloadLength > 5 \
                      && tcp.Payload[0] == 0x16 && tcp.Payload[1] == 0x03 && tcp.Payload[5] == 0x01) \
-                     or udp.DstPort == 53 or udp.DstPort == 443)"
+                     or udp.DstPort == 53 \
+                     or (udp.DstPort == 443 && udp.PayloadLength >= 1200 \
+                         && (udp.Payload[0] & 0xC0) == 0xC0 && (udp.Payload[0] & 0x30) == 0x00))"
             .to_string();
 
         match self.mode() {
