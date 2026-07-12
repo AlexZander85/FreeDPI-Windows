@@ -15,6 +15,7 @@
 //! - `GET /api/v1/dns/cache` — DNS кэш
 //! - `POST /api/v1/routing/override` — override маршрута
 //! - `GET /api/v1/health` — health check
+//! - `GET /api/v1/metrics` — ProcessingStats snapshot (inject counters, latency, etc.)
 
 use axum::{
     extract::{Request, State},
@@ -63,6 +64,8 @@ pub trait EngineHandle {
     fn probe_batch(&self, domains: &[&str], full: bool) -> Result<serde_json::Value, String>;
     fn get_presets(&self) -> serde_json::Value;
     fn get_probe_history(&self) -> serde_json::Value;
+    /// Returns a JSON snapshot of all ProcessingStats counters.
+    fn processing_stats(&self) -> serde_json::Value;
 
     // ─── Split Tunnel ─────────────────────────────────────────────────────
     fn split_tunnel_state(&self) -> serde_json::Value;
@@ -172,6 +175,7 @@ pub async fn serve(engine: Arc<dyn EngineHandle + Send + Sync>, api_key: String,
         .route("/api/v1/probe/batch", post(batch_probe_handler))
         .route("/api/v1/probe/presets", get(presets_handler))
         .route("/api/v1/probe/history", get(history_handler))
+        .route("/api/v1/metrics", get(metrics_handler))
         .route("/api/v1/splittunnel", get(split_tunnel_state_handler))
         .route(
             "/api/v1/splittunnel/mode",
@@ -303,6 +307,17 @@ async fn health_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse
         "raw_socket_ok": state.engine.raw_socket_ok(),
         "uptime_seconds": state.engine.uptime(),
     }))
+}
+
+/// `GET /api/v1/metrics` — полный снимок ProcessingStats.
+///
+/// Возвращает все счётчики движка, включая:
+/// - `inject_scheduled` / `inject_sent`: разделённые метрики инъекций
+/// - `desync_latency_us_p50/p95/p99`: перцентили задержки применения техник
+/// - `capture_*`: классификация пойманных пакетов
+/// - `invariant_*`: счётчики отброшенных невалидных пакетов
+async fn metrics_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(state.engine.processing_stats())
 }
 
 /// `POST /api/v1/probe/batch` — batch probe для нескольких доменов.
@@ -587,6 +602,16 @@ mod tests {
         fn get_probe_history(&self) -> serde_json::Value {
             serde_json::json!([])
         }
+        fn processing_stats(&self) -> serde_json::Value {
+            serde_json::json!({
+                "total_received": 0u64,
+                "inject_scheduled": 0u64,
+                "inject_sent": 0u64,
+                "forwarded": 0u64,
+                "dropped": 0u64,
+                "errors": 0u64,
+            })
+        }
         fn split_tunnel_state(&self) -> serde_json::Value {
             serde_json::json!({
                 "mode": "BlacklistOnly",
@@ -664,5 +689,28 @@ mod tests {
         assert_eq!(params.domain, "example.com");
         assert_eq!(params.strategy_id, 42);
         assert_eq!(params.timeout_ms, 3000);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint() {
+        let engine = Arc::new(MockEngine);
+        let state = Arc::new(ApiState {
+            engine,
+            api_key: "test-key".to_string(),
+        });
+
+        let response = metrics_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify body contains inject counters
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("inject_scheduled").is_some() || json.get("total_received").is_some(),
+            "metrics response must contain packet counters, got: {}",
+            json
+        );
     }
 }

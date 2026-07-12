@@ -1392,14 +1392,14 @@ pub fn pkt_reorder(packet: &bytes::Bytes, swap_with_next: bool) -> DesyncResult 
         ));
     }
 
-    // Original packet passes through unchanged
+    // Original packet passes through unchanged via Forward path (modified=None, drop_original=false)
     debug!(
         "[W4] PktReorder: {} decoy segs with random out-of-window SEQ + garbage",
         decoy_count
     );
 
     DesyncResult {
-        modified: Some(packet.clone()),
+        modified: None,
         inject,
         drop_original: false,
     }
@@ -2496,14 +2496,94 @@ mod tests {
     fn test_pkt_reorder() {
         let pkt = make_data_packet();
         let result = pkt_reorder(&pkt, true);
-        // Generates random 2-3 decoy segments with random out-of-window SEQ
-        // Accept wide range due to global RNG sharing between tests
         assert!(
             result.inject.len() >= 1,
             "expected >=1 inject, got {}",
             result.inject.len()
         );
-        assert!(result.modified.is_some());
+        // pkt_reorder is decoy-only: original passes via Forward (modified=None, drop_original=false)
+        assert!(
+            result.modified.is_none(),
+            "pkt_reorder must not produce modified — original passes via Forward"
+        );
+        assert!(!result.drop_original, "original must pass through");
+        // All decoys must have fake TTL (< 64, fake_ttl = ttl.saturating_sub(1))
+        for (i, seg) in result.inject.iter().enumerate() {
+            assert!(seg.bytes[8] < 64, "inject[{}] must have fake TTL", i);
+        }
+    }
+
+    #[test]
+    fn test_synhide_invariant() {
+        // SYN packet WITH payload — required for synhide to activate
+        let mut pkt = vec![0u8; 60];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&60u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&[192, 168, 1, 1]);
+        pkt[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
+        pkt[24..28].copy_from_slice(&1000u32.to_be_bytes());
+        pkt[32] = 0x50;
+        pkt[33] = TcpFlags::SYN;
+        pkt[34..36].copy_from_slice(&65535u16.to_be_bytes());
+        pkt[40..60].copy_from_slice(b"TLSClientHelloHere!!");
+        let csum = crate::desync::ipv4_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+        let pkt = bytes::Bytes::from(pkt);
+
+        let result = synhide(&pkt, 1);
+        assert!(
+            result.modified.is_some(),
+            "synhide must produce modified SYN"
+        );
+        assert_eq!(result.inject.len(), 1, "synhide must inject 1 data seg");
+        assert!(!result.drop_original);
+        // Injected data seg must have fake TTL (< 64 with offset=1)
+        let inject_ttl = result.inject[0].bytes[8];
+        assert!(
+            inject_ttl < 64,
+            "inject must have fake TTL, got {}",
+            inject_ttl
+        );
+        // Modified SYN must preserve SYN flag
+        let modified_flags = result.modified.as_ref().unwrap()[33];
+        assert_eq!(
+            modified_flags & TcpFlags::SYN,
+            TcpFlags::SYN,
+            "modified must keep SYN"
+        );
+    }
+
+    #[test]
+    fn test_drop_original_with_injects() {
+        use crate::desync::{InjectDirection, InjectPacket, InjectProtocol};
+        let mut fake = vec![0u8; 40];
+        fake[0] = 0x45;
+        fake[2..4].copy_from_slice(&40u16.to_be_bytes());
+        fake[8] = 30;
+        fake[9] = 6;
+        fake[32] = 0x50;
+        fake[33] = TcpFlags::RST;
+        let fake_bytes = bytes::Bytes::from(fake);
+
+        let inject_pkt = InjectPacket::new(
+            fake_bytes.clone(),
+            InjectProtocol::Tcp,
+            InjectDirection::ForceOutbound,
+        );
+        let result = DesyncResult::drop_original_with_injects(smallvec::smallvec![inject_pkt]);
+
+        assert!(result.drop_original, "drop_original must be true");
+        assert!(result.modified.is_none(), "no modified packet");
+        assert_eq!(result.inject.len(), 1, "exactly 1 inject");
+        assert_eq!(result.inject[0].bytes, fake_bytes, "inject bytes match");
+        assert!(
+            matches!(result.inject[0].direction, InjectDirection::ForceOutbound),
+            "direction must be ForceOutbound"
+        );
     }
 
     #[test]

@@ -284,6 +284,21 @@ impl EngineHandle for ServiceEngine {
         }
     }
 
+    fn processing_stats(&self) -> serde_json::Value {
+        match self.pipeline.get() {
+            Some(pipeline) => {
+                let snap = pipeline.stats().snapshot();
+                serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}))
+            }
+            None => serde_json::json!({
+                "status": "pipeline_not_started",
+                "total_received": 0,
+                "inject_scheduled": 0,
+                "inject_sent": 0,
+            }),
+        }
+    }
+
     fn probe_batch(&self, preset_ids: &[&str], _full: bool) -> Result<serde_json::Value, String> {
         use freedpi_core::probe::presets::get_domains_by_ids;
         use freedpi_core::probe::strategy_map::recommend;
