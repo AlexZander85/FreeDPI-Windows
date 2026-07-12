@@ -3,7 +3,6 @@ import { useState, useEffect } from "react";
 import { getConfig, saveConfig } from "@/lib/api";
 
 interface Settings {
-  windivert_filter: string;
   split_size: number;
   split_count: number;
   fake_sni: string;
@@ -18,7 +17,6 @@ interface Settings {
 }
 
 const DEFAULT_SETTINGS: Settings = {
-  windivert_filter: "",
   split_size: 1,
   split_count: 3,
   fake_sni: "www.google.com",
@@ -60,8 +58,6 @@ function parseTomlToSettings(raw: string): Partial<Settings> {
     if (currentSection === "api") {
       if (key === "port") result.api_port = val as number;
       if (key === "api_key") result.api_key = val as string;
-    } else if (currentSection === "windivert" && key === "filter") {
-      result.windivert_filter = val as string;
     } else if (currentSection === "dns") {
       if (key === "doh_url") result.dns_doh_url = val as string;
       if (key === "dot_addr") result.dns_dot_addr = val as string;
@@ -88,15 +84,11 @@ enabled = true
     apiBlock += `api_key = "${s.api_key}"\n`;
   }
 
-  let windivertBlock = `[windivert]\n`;
-  if (s.windivert_filter) {
-    windivertBlock += `filter = "${s.windivert_filter}"\n`;
-  } else {
-    windivertBlock += `# filter = "" # empty = dynamic safe filter\n`;
-  }
+  // [windivert] section intentionally omitted:
+  // the service builds the WinDivert filter dynamically via build_win_divert_filter()
+  // based on enabled features. Writing a static filter here would override it.
 
   return `${apiBlock}
-${windivertBlock}
 [dns]
 doh_url = "${s.dns_doh_url}"
 dot_addr = "${s.dns_dot_addr}"
@@ -188,12 +180,6 @@ export default function SettingsPanel() {
         </SettingGroup>
 
         <SettingGroup title={t("settings.advanced")}>
-          <SettingInput
-            label={t("settings.windivert_filter")}
-            value={settings.windivert_filter}
-            onChange={(v) => update("windivert_filter", v)}
-            placeholder={t("settings.windivert_filter_placeholder")}
-          />
           <div className="grid grid-cols-2 gap-3">
             <SettingNumber
               label={t("settings.split_size")}
