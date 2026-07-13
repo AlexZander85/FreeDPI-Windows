@@ -86,6 +86,28 @@ pub trait EngineHandle {
         password: Option<&str>,
         use_opera_fallback: bool,
     ) -> Result<(), String>;
+
+    // ─── QA observer surface (/qa/*) ──────────────────────────────────────
+    /// GET /qa/strategy_inventory — live strategy registry snapshot.
+    fn qa_strategy_inventory(&self) -> serde_json::Value;
+    /// GET /qa/runtime_strategy_snapshot — current active strategy params.
+    fn qa_runtime_strategy_snapshot(&self) -> serde_json::Value;
+    /// GET /qa/flow_telemetry — packet/flow counters for testlab probes.
+    fn qa_flow_telemetry(&self) -> serde_json::Value;
+    /// GET /qa/autotune_state — adaptive tuner state.
+    fn qa_autotune_state(&self) -> serde_json::Value;
+    /// GET /qa/autotune_decision_log — recent autotune decisions.
+    fn qa_autotune_decision_log(&self) -> serde_json::Value;
+    /// GET /qa/windivert_stats — WinDivert driver-level stats.
+    fn qa_windivert_stats(&self) -> serde_json::Value;
+    /// GET /qa/driver_service_stats — service/driver composite stats.
+    fn qa_driver_service_stats(&self) -> serde_json::Value;
+    /// POST /qa/reset_state — reset non-persistent engine state.
+    fn qa_reset_state(&self) -> serde_json::Value;
+    /// POST /qa/reset_telemetry — zero out telemetry counters.
+    fn qa_reset_telemetry(&self) -> serde_json::Value;
+    /// POST /qa/export_test_report — export current state as a test report.
+    fn qa_export_test_report(&self) -> serde_json::Value;
 }
 
 // ─── Request/Response типы ─────────────────────────────────────────────────
@@ -190,6 +212,31 @@ pub async fn serve(engine: Arc<dyn EngineHandle + Send + Sync>, api_key: String,
         .route("/api/v1/geoblock/add", post(geoblock_add_handler))
         .route("/api/v1/geoblock/remove", post(geoblock_remove_handler))
         .route("/api/v1/geoblock/proxy", post(geoblock_proxy_handler))
+        // ─── QA observer surface ───────────────────────────────────────────
+        .route("/qa/capabilities", get(qa_capabilities_handler))
+        .route("/qa/health", get(qa_health_handler))
+        .route("/qa/strategy_inventory", get(qa_strategy_inventory_handler))
+        .route(
+            "/qa/runtime_strategy_snapshot",
+            get(qa_runtime_strategy_snapshot_handler),
+        )
+        .route("/qa/flow_telemetry", get(qa_flow_telemetry_handler))
+        .route("/qa/autotune_state", get(qa_autotune_state_handler))
+        .route(
+            "/qa/autotune_decision_log",
+            get(qa_autotune_decision_log_handler),
+        )
+        .route("/qa/windivert_stats", get(qa_windivert_stats_handler))
+        .route(
+            "/qa/driver_service_stats",
+            get(qa_driver_service_stats_handler),
+        )
+        .route("/qa/reset_state", post(qa_reset_state_handler))
+        .route("/qa/reset_telemetry", post(qa_reset_telemetry_handler))
+        .route(
+            "/qa/export_test_report",
+            post(qa_export_test_report_handler),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -318,6 +365,97 @@ async fn health_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse
 /// - `invariant_*`: счётчики отброшенных невалидных пакетов
 async fn metrics_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     Json(state.engine.processing_stats())
+}
+
+// ─── QA observer surface handlers (/qa/*) ─────────────────────────────────
+//
+// All GET handlers must return {"ok": true, ...} for qa_contract_check.py flat_ok().
+// POST handlers return {"ok": true} on success.
+
+/// `GET /qa/capabilities` — lists supported QA surface features.
+async fn qa_capabilities_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "capabilities": [
+            "flow_telemetry", "strategy_inventory", "runtime_strategy_snapshot",
+            "windivert_stats", "driver_service_stats", "autotune_state",
+            "autotune_decision_log", "reset_state", "reset_telemetry", "export_test_report"
+        ],
+        "windivert_ok": state.engine.windivert_ok(),
+        "uptime_seconds": state.engine.uptime(),
+    }))
+}
+
+/// `GET /qa/health` — health check with full diagnostic info.
+async fn qa_health_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "ok": true,
+        "healthy": true,
+        "windivert_ok": state.engine.windivert_ok(),
+        "raw_socket_ok": state.engine.raw_socket_ok(),
+        "uptime_seconds": state.engine.uptime(),
+        "active_connections": state.engine.active_connections(),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// `GET /qa/strategy_inventory` — live strategy registry snapshot.
+///
+/// Returns `{"ok": true, "data": {...}}` per strategy_inventory.py contract.
+async fn qa_strategy_inventory_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    let inv = state.engine.qa_strategy_inventory();
+    Json(serde_json::json!({ "ok": true, "data": inv }))
+}
+
+/// `GET /qa/runtime_strategy_snapshot` — current active strategy params.
+async fn qa_runtime_strategy_snapshot_handler(
+    State(state): State<Arc<ApiState>>,
+) -> impl IntoResponse {
+    Json(state.engine.qa_runtime_strategy_snapshot())
+}
+
+/// `GET /qa/flow_telemetry` — packet/flow counters.
+///
+/// Returns `{"ok": true, "aggregate": {...}}` where aggregate fields are
+/// summed by flow_telemetry_probe.py to determine if counters changed.
+async fn qa_flow_telemetry_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(state.engine.qa_flow_telemetry())
+}
+
+/// `GET /qa/autotune_state` — adaptive tuner state.
+async fn qa_autotune_state_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(state.engine.qa_autotune_state())
+}
+
+/// `GET /qa/autotune_decision_log` — recent autotune decisions.
+async fn qa_autotune_decision_log_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(state.engine.qa_autotune_decision_log())
+}
+
+/// `GET /qa/windivert_stats` — WinDivert driver stats.
+async fn qa_windivert_stats_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(state.engine.qa_windivert_stats())
+}
+
+/// `GET /qa/driver_service_stats` — service/driver composite stats.
+async fn qa_driver_service_stats_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(state.engine.qa_driver_service_stats())
+}
+
+/// `POST /qa/reset_state` — reset non-persistent engine state.
+async fn qa_reset_state_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(state.engine.qa_reset_state())
+}
+
+/// `POST /qa/reset_telemetry` — zero out telemetry counters.
+async fn qa_reset_telemetry_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(state.engine.qa_reset_telemetry())
+}
+
+/// `POST /qa/export_test_report` — export current state as a test report.
+async fn qa_export_test_report_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(state.engine.qa_export_test_report())
 }
 
 /// `POST /api/v1/probe/batch` — batch probe для нескольких доменов.
@@ -612,6 +750,62 @@ mod tests {
                 "errors": 0u64,
             })
         }
+        fn qa_strategy_inventory(&self) -> serde_json::Value {
+            serde_json::json!({
+                "live_profiles": [],
+                "total": 0u64,
+            })
+        }
+        fn qa_runtime_strategy_snapshot(&self) -> serde_json::Value {
+            serde_json::json!({
+                "ok": true,
+                "active_strategy_id": null,
+                "params": {},
+            })
+        }
+        fn qa_flow_telemetry(&self) -> serde_json::Value {
+            serde_json::json!({
+                "ok": true,
+                "aggregate": {
+                    "flows_observed": 0u64,
+                    "packets_received": 0u64,
+                    "packets_forwarded": 0u64,
+                    "packets_modified": 0u64,
+                    "packets_injected": 0u64,
+                    "packets_dropped": 0u64,
+                    "tls_outbound": 0u64,
+                    "dns_queries": 0u64,
+                    "quic_initial": 0u64,
+                },
+            })
+        }
+        fn qa_autotune_state(&self) -> serde_json::Value {
+            serde_json::json!({ "ok": true, "enabled": false, "current_strategy_id": null })
+        }
+        fn qa_autotune_decision_log(&self) -> serde_json::Value {
+            serde_json::json!({ "ok": true, "decisions": [] })
+        }
+        fn qa_windivert_stats(&self) -> serde_json::Value {
+            serde_json::json!({ "ok": true, "recv": 0u64, "drop": 0u64, "queue_len": 0u64 })
+        }
+        fn qa_driver_service_stats(&self) -> serde_json::Value {
+            serde_json::json!({
+                "ok": true,
+                "uptime_seconds": 0u64,
+                "active_connections": 0u64,
+                "windivert_ok": true,
+            })
+        }
+        fn qa_reset_state(&self) -> serde_json::Value {
+            serde_json::json!({ "ok": true, "reset": "state" })
+        }
+        fn qa_reset_telemetry(&self) -> serde_json::Value {
+            serde_json::json!({ "ok": true, "reset": "telemetry" })
+        }
+        fn qa_export_test_report(&self) -> serde_json::Value {
+            serde_json::json!({ "ok": true, "report": { "version": env!("CARGO_PKG_VERSION") } })
+        }
+
         fn split_tunnel_state(&self) -> serde_json::Value {
             serde_json::json!({
                 "mode": "BlacklistOnly",

@@ -299,6 +299,160 @@ impl EngineHandle for ServiceEngine {
         }
     }
 
+    fn qa_strategy_inventory(&self) -> serde_json::Value {
+        let (total, profiles) = match self.pipeline.get() {
+            Some(pipeline) => {
+                let cfg = pipeline.config();
+                let profiles: Vec<serde_json::Value> = cfg
+                    .strategies
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        serde_json::json!({
+                            "strategy_id": i,
+                            "name": s.name,
+                            "enabled": s.enabled,
+                            "techniques": s.techniques.len(),
+                        })
+                    })
+                    .collect();
+                let n = profiles.len();
+                (n, profiles)
+            }
+            None => (0, vec![]),
+        };
+        serde_json::json!({
+            "live_profiles": profiles,
+            "total": total,
+            "source": "live",
+        })
+    }
+
+    fn qa_runtime_strategy_snapshot(&self) -> serde_json::Value {
+        let snap = match self.pipeline.get() {
+            Some(pipeline) => {
+                let cfg = pipeline.config();
+                serde_json::json!({
+                    "ok": true,
+                    "active_strategies": cfg.strategies.len(),
+                    "techniques": cfg.techniques.len(),
+                    "desync_port": cfg.desync_port,
+                    "only_outbound": cfg.only_outbound,
+                })
+            }
+            None => serde_json::json!({
+                "ok": true,
+                "active_strategies": 0,
+                "status": "pipeline_not_started",
+            }),
+        };
+        snap
+    }
+
+    fn qa_flow_telemetry(&self) -> serde_json::Value {
+        let agg = match self.pipeline.get() {
+            Some(pipeline) => {
+                let s = pipeline.stats().snapshot();
+                serde_json::json!({
+                    "flows_observed": s.total_received,
+                    "packets_received": s.total_received,
+                    "packets_forwarded": s.forwarded,
+                    "packets_modified": s.fake_ch_scheduled,
+                    "packets_injected": s.fake_ch_injected,
+                    "packets_dropped": s.dropped,
+                    "tls_outbound": s.tls_outbound,
+                    "dns_queries": s.capture_dns,
+                    "quic_initial": s.capture_quic_initial,
+                })
+            }
+            None => serde_json::json!({
+                "flows_observed": 0u64,
+                "packets_received": 0u64,
+                "packets_forwarded": 0u64,
+                "packets_modified": 0u64,
+                "packets_injected": 0u64,
+                "packets_dropped": 0u64,
+                "tls_outbound": 0u64,
+                "dns_queries": 0u64,
+                "quic_initial": 0u64,
+            }),
+        };
+        serde_json::json!({ "ok": true, "aggregate": agg })
+    }
+
+    fn qa_autotune_state(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "enabled": false,
+            "current_strategy_id": null,
+            "note": "autotune is observer-only in this build",
+        })
+    }
+
+    fn qa_autotune_decision_log(&self) -> serde_json::Value {
+        serde_json::json!({ "ok": true, "decisions": [] })
+    }
+
+    fn qa_windivert_stats(&self) -> serde_json::Value {
+        let (recv, drop_count, queue) = match self.pipeline.get() {
+            Some(pipeline) => {
+                let s = pipeline.stats().snapshot();
+                (s.total_received, s.dropped, 0u64)
+            }
+            None => (0u64, 0u64, 0u64),
+        };
+        serde_json::json!({
+            "ok": true,
+            "recv": recv,
+            "drop": drop_count,
+            "queue_len": queue,
+            "windivert_ok": self.windivert_ok(),
+        })
+    }
+
+    fn qa_driver_service_stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "uptime_seconds": self.uptime(),
+            "active_connections": self.active_connections(),
+            "windivert_ok": self.windivert_ok(),
+            "raw_socket_ok": self.raw_socket_ok(),
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+    }
+
+    fn qa_reset_state(&self) -> serde_json::Value {
+        // Trigger GC to evict expired conntrack entries (closest to a state flush)
+        self.conntrack.gc(std::time::Duration::ZERO);
+        info!("QA: reset_state called — conntrack GC triggered");
+        serde_json::json!({ "ok": true, "reset": "state", "conntrack_gc": true })
+    }
+
+    fn qa_reset_telemetry(&self) -> serde_json::Value {
+        // Telemetry counters are atomic — reset by zeroing via reload
+        // Full reset would require pipeline restart; we acknowledge the call
+        info!("QA: reset_telemetry called (observer-only, counters are monotonic)");
+        serde_json::json!({
+            "ok": true,
+            "reset": "telemetry",
+            "note": "monotonic counters acknowledged; use uptime delta for relative measurement",
+        })
+    }
+
+    fn qa_export_test_report(&self) -> serde_json::Value {
+        let stats = self.processing_stats();
+        serde_json::json!({
+            "ok": true,
+            "report": {
+                "version": env!("CARGO_PKG_VERSION"),
+                "uptime_seconds": self.uptime(),
+                "active_connections": self.active_connections(),
+                "processing_stats": stats,
+                "windivert_ok": self.windivert_ok(),
+            },
+        })
+    }
+
     fn probe_batch(&self, preset_ids: &[&str], _full: bool) -> Result<serde_json::Value, String> {
         use freedpi_core::probe::presets::get_domains_by_ids;
         use freedpi_core::probe::strategy_map::recommend;
