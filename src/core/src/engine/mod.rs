@@ -465,6 +465,15 @@ pub struct ProcessingPipeline {
     fallback_chain: Arc<std::sync::Mutex<crate::adaptive::fallback::FallbackChain>>,
     target_escalator: Arc<std::sync::Mutex<crate::adaptive::target_escalate::TargetEscalation>>,
     tls_reassembler: Arc<crate::tls_reassembly::TlsReassembler>,
+    #[cfg(feature = "qa")]
+    pub qa_recent_flows:
+        std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>>,
+    #[cfg(feature = "qa")]
+    pub qa_strategy_generation: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    #[cfg(feature = "qa")]
+    pub qa_last_tuned_strategy_id: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    #[cfg(feature = "qa")]
+    pub qa_last_tuned_time_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Проверяет, содержит ли TLS ClientHello non-empty session_ticket extension.
@@ -780,6 +789,16 @@ impl ProcessingPipeline {
             fallback_chain,
             target_escalator,
             tls_reassembler,
+            #[cfg(feature = "qa")]
+            qa_recent_flows: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::with_capacity(50),
+            )),
+            #[cfg(feature = "qa")]
+            qa_strategy_generation: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(feature = "qa")]
+            qa_last_tuned_strategy_id: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1)),
+            #[cfg(feature = "qa")]
+            qa_last_tuned_time_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -915,6 +934,16 @@ impl ProcessingPipeline {
                 crate::adaptive::target_escalate::TargetEscalation::new(10, 30, 30),
             )),
             tls_reassembler,
+            #[cfg(feature = "qa")]
+            qa_recent_flows: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::with_capacity(50),
+            )),
+            #[cfg(feature = "qa")]
+            qa_strategy_generation: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(feature = "qa")]
+            qa_last_tuned_strategy_id: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1)),
+            #[cfg(feature = "qa")]
+            qa_last_tuned_time_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -975,6 +1004,14 @@ impl ProcessingPipeline {
             }
         }
         self.auto_tune.set_override(&profile.name, params);
+        #[cfg(feature = "qa")]
+        {
+            self.qa_strategy_generation.fetch_add(1, Ordering::Relaxed);
+            self.qa_last_tuned_strategy_id
+                .store(strategy_id as i32, Ordering::Relaxed);
+            let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+            self.qa_last_tuned_time_ms.store(now_ms, Ordering::Relaxed);
+        }
         tracing::info!(
             "apply_strategy_tune: id={} → активный профиль для {:?} = '{}'",
             strategy_id,
@@ -1009,6 +1046,12 @@ impl ProcessingPipeline {
             }
         }
         self.auto_tune.clear_override(&profile.name);
+        #[cfg(feature = "qa")]
+        {
+            self.qa_strategy_generation.fetch_add(1, Ordering::Relaxed);
+            self.qa_last_tuned_strategy_id.store(-1, Ordering::Relaxed);
+            self.qa_last_tuned_time_ms.store(0, Ordering::Relaxed);
+        }
         tracing::info!(
             "clear_strategy_tune: id={} — сброшен к default профилю категории",
             strategy_id
@@ -1698,7 +1741,12 @@ impl ProcessingPipeline {
 
     /// Sync version: process_one (calls sync sub-methods directly).
     fn process_one_sync(&self, captured: &CapturedPacket) -> Result<PacketDecision, anyhow::Error> {
-        self.process_one_sync_dispatch(captured)
+        let res = self.process_one_sync_dispatch(captured);
+        #[cfg(feature = "qa")]
+        if let Ok(ref decision) = res {
+            self.qa_log_flow(captured, decision);
+        }
+        res
     }
 
     /// P0-07: Наблюдает сетевые исходы для соединений, к которым применялся desync.
@@ -2818,6 +2866,238 @@ impl ProcessingPipeline {
     pub fn config(&self) -> &ProcessingConfig {
         &self.config
     }
+
+    #[cfg(feature = "qa")]
+    pub fn qa_reset_state(&self) {
+        self.conntrack.gc(std::time::Duration::ZERO);
+        self.injected_seqs.clear();
+        if let Ok(mut flows) = self.qa_recent_flows.lock() {
+            flows.clear();
+        }
+    }
+
+    #[cfg(feature = "qa")]
+    pub fn active_profile_id(&self, category: crate::adaptive::strategy::StrategyCategory) -> u32 {
+        use std::sync::atomic::Ordering;
+        match category {
+            crate::adaptive::strategy::StrategyCategory::Tls => {
+                self.active_profile_tls.load(Ordering::Relaxed)
+            }
+            crate::adaptive::strategy::StrategyCategory::Quic => {
+                self.active_profile_quic.load(Ordering::Relaxed)
+            }
+            crate::adaptive::strategy::StrategyCategory::Http => {
+                self.active_profile_http.load(Ordering::Relaxed)
+            }
+            _ => 0,
+        }
+    }
+
+    #[cfg(feature = "qa")]
+    fn qa_log_flow(&self, captured: &CapturedPacket, decision: &PacketDecision) {
+        use std::sync::atomic::Ordering;
+        let classification = Classifier::classify(&captured.data);
+
+        let cp_opt = match &classification {
+            Classification::Tls(cp) => Some(cp),
+            Classification::Quic(cp) => Some(cp),
+            Classification::Dns(cp) => Some(cp),
+            Classification::Http(cp) => Some(cp),
+            Classification::Other(cp) => Some(cp),
+            Classification::Unknown => None,
+        };
+
+        let Some(cp) = cp_opt else {
+            return;
+        };
+
+        let protocol = match cp.protocol {
+            6 => "tcp",
+            17 => "udp",
+            _ => "unknown",
+        };
+
+        let classifier_name = match classification {
+            Classification::Tls(_) => "TLS_CLIENT_HELLO",
+            Classification::Quic(_) => "QUIC_INITIAL",
+            Classification::Dns(_) => "DNS_QUERY",
+            Classification::Http(_) => "HTTP_GET",
+            Classification::Other(_) => "OTHER",
+            Classification::Unknown => "UNKNOWN",
+        };
+
+        let mut domain = self.fake_ip.lookup(&cp.dst_ip);
+
+        if domain.is_none() {
+            if let Some(payload) = captured.data.get(cp.payload_offset..) {
+                domain = match classification {
+                    Classification::Tls(_) => parse_tls_sni(payload),
+                    Classification::Http(_) => parse_http_host(payload),
+                    _ => None,
+                };
+            }
+        }
+
+        let target_str = domain.clone().unwrap_or_else(|| cp.dst_ip.to_string());
+        let target_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            target_str.hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        };
+
+        let flow_id = format!(
+            "{}:{}->{}:{}",
+            cp.src_ip, cp.src_port, cp.dst_ip, cp.dst_port
+        );
+
+        let (decision_str, inject_count, modified, drop_original) = match decision {
+            PacketDecision::Forward => ("forward", 0, false, false),
+            PacketDecision::Drop => ("drop", 0, false, true),
+            PacketDecision::Modify(_) => ("modify", 0, true, false),
+            PacketDecision::Desync {
+                inject,
+                modified,
+                drop_original,
+            } => ("desync", inject.len(), modified.is_some(), *drop_original),
+        };
+
+        let active_profile_id = match cp.protocol {
+            6 => {
+                if classifier_name == "TLS_CLIENT_HELLO" {
+                    self.active_profile_tls.load(Ordering::Relaxed)
+                } else if classifier_name == "HTTP_GET" {
+                    self.active_profile_http.load(Ordering::Relaxed)
+                } else {
+                    0
+                }
+            }
+            17 => {
+                if classifier_name == "QUIC_INITIAL" {
+                    self.active_profile_quic.load(Ordering::Relaxed)
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+
+        let active_profile_name = if active_profile_id > 0 {
+            self.profile_registry
+                .get_by_profile_id(crate::adaptive::strategy_profile::ProfileId(
+                    active_profile_id,
+                ))
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "unknown".to_string())
+        } else {
+            "default".to_string()
+        };
+
+        let record = serde_json::json!({
+            "flow_id": flow_id,
+            "target_hash": target_hash,
+            "protocol": protocol,
+            "observed_by_windivert": true,
+            "classifier": classifier_name,
+            "runtime_profile_id": active_profile_id,
+            "runtime_profile_name": active_profile_name,
+            "strategy_generation": self.qa_strategy_generation.load(Ordering::Relaxed),
+            "decision": decision_str,
+            "inject_count": inject_count,
+            "modified": modified,
+            "drop_original": drop_original,
+            "timestamp_utc": chrono::Utc::now().to_rfc3339(),
+        });
+
+        let mut flows = self.qa_recent_flows.lock().unwrap();
+        if flows.len() >= 50 {
+            flows.pop_front();
+        }
+        flows.push_back(record);
+    }
+}
+
+#[cfg(feature = "qa")]
+fn parse_tls_sni(payload: &[u8]) -> Option<String> {
+    if payload.len() < 5 || payload[0] != 0x16 {
+        return None;
+    }
+    let handshake = &payload[5..];
+    if handshake.len() < 4 || handshake[0] != 0x01 {
+        return None;
+    }
+    if handshake.len() < 44 {
+        return None;
+    }
+    let session_id_len = handshake[43] as usize;
+    let mut pos = 44 + session_id_len;
+    if handshake.len() < pos + 2 {
+        return None;
+    }
+    let cipher_suites_len = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]) as usize;
+    pos += 2 + cipher_suites_len;
+    if handshake.len() < pos + 1 {
+        return None;
+    }
+    let compression_methods_len = handshake[pos] as usize;
+    pos += 1 + compression_methods_len;
+    if handshake.len() < pos + 2 {
+        return None;
+    }
+    let extensions_len = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]) as usize;
+    pos += 2;
+    let end_ext = pos + extensions_len;
+    if handshake.len() < end_ext {
+        return None;
+    }
+    while pos + 4 <= end_ext {
+        let ext_type = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]);
+        let ext_len = u16::from_be_bytes([handshake[pos + 2], handshake[pos + 3]]) as usize;
+        pos += 4;
+        if pos + ext_len > end_ext {
+            return None;
+        }
+        if ext_type == 0x0000 {
+            let mut sni_pos = pos;
+            if sni_pos + 2 > pos + ext_len {
+                return None;
+            }
+            let list_len =
+                u16::from_be_bytes([handshake[sni_pos], handshake[sni_pos + 1]]) as usize;
+            sni_pos += 2;
+            if sni_pos + list_len > pos + ext_len {
+                return None;
+            }
+            while sni_pos + 3 <= pos + ext_len {
+                let name_type = handshake[sni_pos];
+                let name_len =
+                    u16::from_be_bytes([handshake[sni_pos + 1], handshake[sni_pos + 2]]) as usize;
+                sni_pos += 3;
+                if sni_pos + name_len > pos + ext_len {
+                    return None;
+                }
+                if name_type == 0x00 {
+                    if let Ok(s) = std::str::from_utf8(&handshake[sni_pos..sni_pos + name_len]) {
+                        return Some(s.to_string());
+                    }
+                }
+                sni_pos += name_len;
+            }
+        }
+        pos += ext_len;
+    }
+    None
+}
+
+#[cfg(feature = "qa")]
+fn parse_http_host(payload: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(payload).ok()?;
+    for line in s.lines() {
+        if line.to_lowercase().starts_with("host:") {
+            return Some(line["host:".len()..].trim().to_string());
+        }
+    }
+    None
 }
 
 #[derive(Clone)]

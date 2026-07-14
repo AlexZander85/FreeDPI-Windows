@@ -49,9 +49,22 @@ def main():
     time.sleep(0.5)
     after=api_get(a.base,'/qa/flow_telemetry',a.api_key)
     b=total_counter(before.get('body')); c=total_counter(after.get('body')) if after.get('ok') else b
-    status='pass' if c>b else 'fail'
-    out={'status':status,'before_score':b,'after_score':c,'traffic_returncode':traffic.returncode,'traffic_stdout':traffic.stdout[-4000:],'traffic_stderr':traffic.stderr[-4000:],'before':before,'after':after}
+    
+    # Check recent flows for causal verification
+    recent_ok = False
+    if after.get('ok') and isinstance(after['body'], dict):
+        recent_flows = after['body'].get('recent_flows', [])
+        expected_proto = 'tcp' if a.scenario in ['tcp-connect', 'http-get', 'tls-handshake'] else 'udp'
+        for flow in recent_flows:
+            if isinstance(flow, dict):
+                if flow.get('protocol') == expected_proto and flow.get('observed_by_windivert') is True:
+                    recent_ok = True
+                    break
+
+    # Pass only if counters grew and a matching recent flow was recorded in the ring buffer
+    status='pass' if (c>b and recent_ok) else 'fail'
+    out={'status':status,'before_score':b,'after_score':c,'recent_flow_matched':recent_ok,'traffic_returncode':traffic.returncode,'traffic_stdout':traffic.stdout[-4000:],'traffic_stderr':traffic.stderr[-4000:],'before':before,'after':after}
     Path(a.json_out).write_text(json.dumps(out,indent=2,ensure_ascii=False),encoding='utf-8')
-    print(json.dumps({'status':status,'before_score':b,'after_score':c},indent=2))
+    print(json.dumps({'status':status,'before_score':b,'after_score':c,'recent_flow_matched':recent_ok},indent=2))
     return 0 if status=='pass' else 1
 if __name__=='__main__': raise SystemExit(main())

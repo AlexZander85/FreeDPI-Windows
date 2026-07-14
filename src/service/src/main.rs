@@ -299,56 +299,196 @@ impl EngineHandle for ServiceEngine {
         }
     }
 
+    #[cfg(feature = "qa")]
     fn qa_strategy_inventory(&self) -> serde_json::Value {
-        let (total, profiles) = match self.pipeline.get() {
-            Some(pipeline) => {
-                let cfg = pipeline.config();
-                let profiles: Vec<serde_json::Value> = cfg
-                    .strategies
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        serde_json::json!({
-                            "strategy_id": i,
-                            "name": s.name,
-                            "enabled": s.enabled,
-                            "techniques": s.techniques.len(),
-                        })
-                    })
-                    .collect();
-                let n = profiles.len();
-                (n, profiles)
+        let mut live_profiles = vec![];
+        let mut probe_numeric_ids = vec![];
+        let mut unresolved_count = 0;
+        let mut unmapped_probe_ids = vec![];
+
+        if let Some(pipeline) = self.pipeline.get() {
+            let registry = pipeline.profile_registry();
+            for p in registry.all_profiles() {
+                live_profiles.push(serde_json::json!({
+                    "name": p.name,
+                    "strategy_id": p.strategy_id,
+                    "category": format!("{:?}", p.category),
+                    "techniques": p.techniques.iter().map(|t| format!("{:?}", t)).collect::<Vec<_>>(),
+                    "description": p.description,
+                    "source": "builtin",
+                    "runtime_status": "live",
+                    "force_selectable": true,
+                    "auto_selectable": true,
+                    "unsupported_reasons": serde_json::json!([]),
+                }));
             }
-            None => (0, vec![]),
-        };
+
+            let recommended_ids = vec![1, 3, 4, 6, 7, 8, 9, 15, 35, 50, 60, 61, 70, 100];
+            for &rid in &recommended_ids {
+                if let Some(p) = registry.get_by_id(rid) {
+                    probe_numeric_ids.push(serde_json::json!({
+                        "strategy_id": rid,
+                        "mapped_profile_name": p.name,
+                        "status": "mapped",
+                    }));
+                } else {
+                    probe_numeric_ids.push(serde_json::json!({
+                        "strategy_id": rid,
+                        "mapped_profile_name": serde_json::Value::Null,
+                        "status": "unresolved",
+                        "unsupported_reasons": ["unmapped_probe_strategy_id"],
+                    }));
+                    unresolved_count += 1;
+                    unmapped_probe_ids.push(rid);
+                }
+            }
+        }
+
+        let mut duplicate_ids = vec![];
+        let mut seen_ids = std::collections::HashSet::new();
+        for p in &live_profiles {
+            if let Some(id) = p.get("strategy_id").and_then(|i| i.as_u64()) {
+                if !seen_ids.insert(id) {
+                    duplicate_ids.push(id);
+                }
+            }
+        }
+
+        let mut findings = vec![];
+        if !duplicate_ids.is_empty() {
+            findings.push(serde_json::json!({
+                "severity": "fail",
+                "message": format!("duplicate live strategy ids: {:?}", duplicate_ids),
+            }));
+        }
+        if unresolved_count > 0 {
+            findings.push(serde_json::json!({
+                "severity": "warn",
+                "message": format!("{} probe numeric ids do not map to live profiles: {:?}", unresolved_count, unmapped_probe_ids),
+            }));
+        }
+
         serde_json::json!({
-            "live_profiles": profiles,
-            "total": total,
-            "source": "live",
+            "live_profiles": live_profiles,
+            "probe_numeric_ids": probe_numeric_ids,
+            "dead_registry_entries": serde_json::json!([]),
+            "reconciliation": {
+                "live_profiles": live_profiles,
+                "probe_numeric_ids": probe_numeric_ids,
+                "dead_trait_registry": serde_json::json!([]),
+                "unmapped_probe_ids": unmapped_probe_ids,
+                "duplicate_ids": duplicate_ids,
+                "findings": findings,
+                "numeric_ids_unresolved": unresolved_count,
+                "live_profiles_unreachable_by_any_numeric_id": serde_json::json!([]),
+            }
         })
     }
 
+    #[cfg(feature = "qa")]
     fn qa_runtime_strategy_snapshot(&self) -> serde_json::Value {
-        let snap = match self.pipeline.get() {
-            Some(pipeline) => {
-                let cfg = pipeline.config();
-                serde_json::json!({
-                    "ok": true,
-                    "active_strategies": cfg.strategies.len(),
-                    "techniques": cfg.techniques.len(),
-                    "desync_port": cfg.desync_port,
-                    "only_outbound": cfg.only_outbound,
-                })
+        if let Some(pipeline) = self.pipeline.get() {
+            let registry = pipeline.profile_registry();
+            let tls_id =
+                pipeline.active_profile_id(freedpi_core::adaptive::strategy::StrategyCategory::Tls);
+            let quic_id = pipeline
+                .active_profile_id(freedpi_core::adaptive::strategy::StrategyCategory::Quic);
+            let http_id = pipeline
+                .active_profile_id(freedpi_core::adaptive::strategy::StrategyCategory::Http);
+
+            let tls_profile = registry
+                .get_by_profile_id(freedpi_core::adaptive::strategy_profile::ProfileId(tls_id));
+            let quic_profile = registry
+                .get_by_profile_id(freedpi_core::adaptive::strategy_profile::ProfileId(quic_id));
+            let http_profile = registry
+                .get_by_profile_id(freedpi_core::adaptive::strategy_profile::ProfileId(http_id));
+
+            let forced_id = pipeline
+                .qa_last_tuned_strategy_id
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let is_forced = forced_id != -1;
+
+            let mut forced_profile_name = "n/a".to_string();
+            let mut tls_src = "config";
+            let mut quic_src = "config";
+            let mut http_src = "config";
+
+            if is_forced {
+                if let Some(p) = registry.get_by_id(forced_id as u32) {
+                    forced_profile_name = p.name.clone();
+                    match p.category {
+                        freedpi_core::adaptive::strategy::StrategyCategory::Tls => {
+                            tls_src = "forced"
+                        }
+                        freedpi_core::adaptive::strategy::StrategyCategory::Quic => {
+                            quic_src = "forced"
+                        }
+                        freedpi_core::adaptive::strategy::StrategyCategory::Http => {
+                            http_src = "forced"
+                        }
+                        _ => {}
+                    }
+                }
             }
-            None => serde_json::json!({
+
+            let timestamp_utc = {
+                let ms = pipeline
+                    .qa_last_tuned_time_ms
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if ms > 0 {
+                    chrono::DateTime::from_timestamp(
+                        (ms / 1000) as i64,
+                        ((ms % 1000) * 1_000_000) as u32,
+                    )
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| "n/a".to_string())
+                } else {
+                    "n/a".to_string()
+                }
+            };
+
+            serde_json::json!({
                 "ok": true,
-                "active_strategies": 0,
-                "status": "pipeline_not_started",
-            }),
-        };
-        snap
+                "generation": pipeline.qa_strategy_generation.load(std::sync::atomic::Ordering::Relaxed),
+                "active_profiles": {
+                    "tls": {
+                        "profile_id": tls_profile.map(|p| p.strategy_id).unwrap_or(0),
+                        "name": tls_profile.map(|p| p.name.as_str()).unwrap_or("unknown"),
+                        "source": tls_src,
+                    },
+                    "quic": {
+                        "profile_id": quic_profile.map(|p| p.strategy_id).unwrap_or(0),
+                        "name": quic_profile.map(|p| p.name.as_str()).unwrap_or("unknown"),
+                        "source": quic_src,
+                    },
+                    "http": {
+                        "profile_id": http_profile.map(|p| p.strategy_id).unwrap_or(0),
+                        "name": http_profile.map(|p| p.name.as_str()).unwrap_or("unknown"),
+                        "source": http_src,
+                    }
+                },
+                "forced": {
+                    "enabled": is_forced,
+                    "strategy_id": if is_forced { serde_json::Value::Number(forced_id.into()) } else { serde_json::Value::Null },
+                    "profile_name": forced_profile_name,
+                    "expires_at": serde_json::Value::Null,
+                },
+                "last_strategy_update": {
+                    "strategy_id": if is_forced { serde_json::Value::Number(forced_id.into()) } else { serde_json::Value::Null },
+                    "params_hash": "n/a",
+                    "timestamp_utc": timestamp_utc
+                }
+            })
+        } else {
+            serde_json::json!({
+                "ok": true,
+                "generation": 0,
+                "status": "pipeline_not_started"
+            })
+        }
     }
 
+    #[cfg(feature = "qa")]
     fn qa_flow_telemetry(&self) -> serde_json::Value {
         let agg = match self.pipeline.get() {
             Some(pipeline) => {
@@ -377,22 +517,41 @@ impl EngineHandle for ServiceEngine {
                 "quic_initial": 0u64,
             }),
         };
-        serde_json::json!({ "ok": true, "aggregate": agg })
-    }
 
-    fn qa_autotune_state(&self) -> serde_json::Value {
+        let recent = match self.pipeline.get() {
+            Some(pipeline) => {
+                let flows = pipeline.qa_recent_flows.lock().unwrap();
+                flows.iter().cloned().collect::<Vec<_>>()
+            }
+            None => vec![],
+        };
+
         serde_json::json!({
             "ok": true,
-            "enabled": false,
-            "current_strategy_id": null,
-            "note": "autotune is observer-only in this build",
+            "aggregate": agg,
+            "recent_flows": recent,
         })
     }
 
-    fn qa_autotune_decision_log(&self) -> serde_json::Value {
-        serde_json::json!({ "ok": true, "decisions": [] })
+    #[cfg(feature = "qa")]
+    fn qa_autotune_state(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ok": false,
+            "unsupported": true,
+            "reason": "autotune_state_not_implemented",
+        })
     }
 
+    #[cfg(feature = "qa")]
+    fn qa_autotune_decision_log(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ok": false,
+            "unsupported": true,
+            "reason": "autotune_decision_log_not_implemented",
+        })
+    }
+
+    #[cfg(feature = "qa")]
     fn qa_windivert_stats(&self) -> serde_json::Value {
         let (recv, drop_count, queue) = match self.pipeline.get() {
             Some(pipeline) => {
@@ -410,6 +569,7 @@ impl EngineHandle for ServiceEngine {
         })
     }
 
+    #[cfg(feature = "qa")]
     fn qa_driver_service_stats(&self) -> serde_json::Value {
         serde_json::json!({
             "ok": true,
@@ -421,24 +581,27 @@ impl EngineHandle for ServiceEngine {
         })
     }
 
+    #[cfg(feature = "qa")]
     fn qa_reset_state(&self) -> serde_json::Value {
-        // Trigger GC to evict expired conntrack entries (closest to a state flush)
         self.conntrack.gc(std::time::Duration::ZERO);
-        info!("QA: reset_state called — conntrack GC triggered");
+        if let Some(pipeline) = self.pipeline.get() {
+            pipeline.qa_reset_state();
+        }
+        info!("QA: reset_state called — conntrack GC and pipeline state cleared");
         serde_json::json!({ "ok": true, "reset": "state", "conntrack_gc": true })
     }
 
+    #[cfg(feature = "qa")]
     fn qa_reset_telemetry(&self) -> serde_json::Value {
-        // Telemetry counters are atomic — reset by zeroing via reload
-        // Full reset would require pipeline restart; we acknowledge the call
-        info!("QA: reset_telemetry called (observer-only, counters are monotonic)");
+        info!("QA: reset_telemetry called (counters are monotonic, returns unsupported)");
         serde_json::json!({
-            "ok": true,
-            "reset": "telemetry",
-            "note": "monotonic counters acknowledged; use uptime delta for relative measurement",
+            "ok": false,
+            "unsupported": true,
+            "reason": "telemetry_counters_are_monotonic",
         })
     }
 
+    #[cfg(feature = "qa")]
     fn qa_export_test_report(&self) -> serde_json::Value {
         let stats = self.processing_stats();
         serde_json::json!({

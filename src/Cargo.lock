@@ -772,6 +772,7 @@ name = "freedpi-service"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "freedpi-api",
  "freedpi-core",

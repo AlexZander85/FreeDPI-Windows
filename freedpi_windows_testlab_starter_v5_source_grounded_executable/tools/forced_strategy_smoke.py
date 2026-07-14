@@ -51,7 +51,13 @@ def main():
         elif not telemetry_after.get('ok'):
             status='unsupported'; reasons=['flow_telemetry_missing']
         else:
-            status='pass'; reasons=[]
+            forced = snap.get('body', {}).get('forced', {})
+            if forced.get('strategy_id') != sid:
+                status='fail'
+                reasons=['forced_strategy_id_mismatch']
+            else:
+                status='pass'
+                reasons=[]
         rows.append({'strategy_id':sid,'name':name,'status':status,'unsupported_reasons':reasons,'tune':tune,'snapshot':snap,'traffic_rc':traffic.returncode,'telemetry_before':telemetry_before,'telemetry_after':telemetry_after})
     report={'total':len(rows),'pass':sum(1 for r in rows if r['status']=='pass'),'unsupported':sum(1 for r in rows if r['status']=='unsupported'),'rows':rows}
     (outdir/'forced_strategy_smoke.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf-8')

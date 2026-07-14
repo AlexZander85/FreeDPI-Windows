@@ -89,24 +89,34 @@ pub trait EngineHandle {
 
     // ─── QA observer surface (/qa/*) ──────────────────────────────────────
     /// GET /qa/strategy_inventory — live strategy registry snapshot.
+    #[cfg(feature = "qa")]
     fn qa_strategy_inventory(&self) -> serde_json::Value;
     /// GET /qa/runtime_strategy_snapshot — current active strategy params.
+    #[cfg(feature = "qa")]
     fn qa_runtime_strategy_snapshot(&self) -> serde_json::Value;
     /// GET /qa/flow_telemetry — packet/flow counters for testlab probes.
+    #[cfg(feature = "qa")]
     fn qa_flow_telemetry(&self) -> serde_json::Value;
     /// GET /qa/autotune_state — adaptive tuner state.
+    #[cfg(feature = "qa")]
     fn qa_autotune_state(&self) -> serde_json::Value;
     /// GET /qa/autotune_decision_log — recent autotune decisions.
+    #[cfg(feature = "qa")]
     fn qa_autotune_decision_log(&self) -> serde_json::Value;
     /// GET /qa/windivert_stats — WinDivert driver-level stats.
+    #[cfg(feature = "qa")]
     fn qa_windivert_stats(&self) -> serde_json::Value;
     /// GET /qa/driver_service_stats — service/driver composite stats.
+    #[cfg(feature = "qa")]
     fn qa_driver_service_stats(&self) -> serde_json::Value;
     /// POST /qa/reset_state — reset non-persistent engine state.
+    #[cfg(feature = "qa")]
     fn qa_reset_state(&self) -> serde_json::Value;
     /// POST /qa/reset_telemetry — zero out telemetry counters.
+    #[cfg(feature = "qa")]
     fn qa_reset_telemetry(&self) -> serde_json::Value;
     /// POST /qa/export_test_report — export current state as a test report.
+    #[cfg(feature = "qa")]
     fn qa_export_test_report(&self) -> serde_json::Value;
 }
 
@@ -211,9 +221,25 @@ pub async fn serve(engine: Arc<dyn EngineHandle + Send + Sync>, api_key: String,
         .route("/api/v1/geoblock", get(geoblock_state_handler))
         .route("/api/v1/geoblock/add", post(geoblock_add_handler))
         .route("/api/v1/geoblock/remove", post(geoblock_remove_handler))
-        .route("/api/v1/geoblock/proxy", post(geoblock_proxy_handler))
-        // ─── QA observer surface ───────────────────────────────────────────
-        .route("/qa/capabilities", get(qa_capabilities_handler))
+        .route("/api/v1/geoblock/proxy", post(geoblock_proxy_handler));
+
+    let app = add_qa_routes(app)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .with_state(state);
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    info!("API server listening on http://{}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(feature = "qa")]
+fn add_qa_routes(app: Router<Arc<ApiState>>) -> Router<Arc<ApiState>> {
+    app.route("/qa/capabilities", get(qa_capabilities_handler))
         .route("/qa/health", get(qa_health_handler))
         .route("/qa/strategy_inventory", get(qa_strategy_inventory_handler))
         .route(
@@ -237,17 +263,11 @@ pub async fn serve(engine: Arc<dyn EngineHandle + Send + Sync>, api_key: String,
             "/qa/export_test_report",
             post(qa_export_test_report_handler),
         )
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
-        .with_state(state);
+}
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    info!("API server listening on http://{}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+#[cfg(not(feature = "qa"))]
+fn add_qa_routes(app: Router<Arc<ApiState>>) -> Router<Arc<ApiState>> {
+    app
 }
 
 // ─── Auth Middleware ───────────────────────────────────────────────────────
@@ -373,14 +393,15 @@ async fn metrics_handler(State(state): State<Arc<ApiState>>) -> impl IntoRespons
 // POST handlers return {"ok": true} on success.
 
 /// `GET /qa/capabilities` — lists supported QA surface features.
+#[cfg(feature = "qa")]
 async fn qa_capabilities_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "capabilities": [
             "flow_telemetry", "strategy_inventory", "runtime_strategy_snapshot",
-            "windivert_stats", "driver_service_stats", "autotune_state",
-            "autotune_decision_log", "reset_state", "reset_telemetry", "export_test_report"
+            "windivert_stats", "driver_service_stats",
+            "reset_state", "reset_telemetry", "export_test_report"
         ],
         "windivert_ok": state.engine.windivert_ok(),
         "uptime_seconds": state.engine.uptime(),
@@ -388,6 +409,7 @@ async fn qa_capabilities_handler(State(state): State<Arc<ApiState>>) -> impl Int
 }
 
 /// `GET /qa/health` — health check with full diagnostic info.
+#[cfg(feature = "qa")]
 async fn qa_health_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "ok": true,
@@ -403,12 +425,18 @@ async fn qa_health_handler(State(state): State<Arc<ApiState>>) -> impl IntoRespo
 /// `GET /qa/strategy_inventory` — live strategy registry snapshot.
 ///
 /// Returns `{"ok": true, "data": {...}}` per strategy_inventory.py contract.
+#[cfg(feature = "qa")]
 async fn qa_strategy_inventory_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     let inv = state.engine.qa_strategy_inventory();
-    Json(serde_json::json!({ "ok": true, "data": inv }))
+    // Return BOTH at root and inside data to satisfy all tools (reconcile vs inventory)
+    let mut map = inv.as_object().cloned().unwrap_or_default();
+    map.insert("ok".to_string(), serde_json::Value::Bool(true));
+    map.insert("data".to_string(), inv.clone());
+    Json(serde_json::Value::Object(map))
 }
 
 /// `GET /qa/runtime_strategy_snapshot` — current active strategy params.
+#[cfg(feature = "qa")]
 async fn qa_runtime_strategy_snapshot_handler(
     State(state): State<Arc<ApiState>>,
 ) -> impl IntoResponse {
@@ -419,41 +447,49 @@ async fn qa_runtime_strategy_snapshot_handler(
 ///
 /// Returns `{"ok": true, "aggregate": {...}}` where aggregate fields are
 /// summed by flow_telemetry_probe.py to determine if counters changed.
+#[cfg(feature = "qa")]
 async fn qa_flow_telemetry_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     Json(state.engine.qa_flow_telemetry())
 }
 
 /// `GET /qa/autotune_state` — adaptive tuner state.
+#[cfg(feature = "qa")]
 async fn qa_autotune_state_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     Json(state.engine.qa_autotune_state())
 }
 
 /// `GET /qa/autotune_decision_log` — recent autotune decisions.
+#[cfg(feature = "qa")]
 async fn qa_autotune_decision_log_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     Json(state.engine.qa_autotune_decision_log())
 }
 
 /// `GET /qa/windivert_stats` — WinDivert driver stats.
+#[cfg(feature = "qa")]
 async fn qa_windivert_stats_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     Json(state.engine.qa_windivert_stats())
 }
 
 /// `GET /qa/driver_service_stats` — service/driver composite stats.
+#[cfg(feature = "qa")]
 async fn qa_driver_service_stats_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     Json(state.engine.qa_driver_service_stats())
 }
 
 /// `POST /qa/reset_state` — reset non-persistent engine state.
+#[cfg(feature = "qa")]
 async fn qa_reset_state_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     Json(state.engine.qa_reset_state())
 }
 
 /// `POST /qa/reset_telemetry` — zero out telemetry counters.
+#[cfg(feature = "qa")]
 async fn qa_reset_telemetry_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     Json(state.engine.qa_reset_telemetry())
 }
 
 /// `POST /qa/export_test_report` — export current state as a test report.
+#[cfg(feature = "qa")]
 async fn qa_export_test_report_handler(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     Json(state.engine.qa_export_test_report())
 }
@@ -750,12 +786,14 @@ mod tests {
                 "errors": 0u64,
             })
         }
+        #[cfg(feature = "qa")]
         fn qa_strategy_inventory(&self) -> serde_json::Value {
             serde_json::json!({
                 "live_profiles": [],
                 "total": 0u64,
             })
         }
+        #[cfg(feature = "qa")]
         fn qa_runtime_strategy_snapshot(&self) -> serde_json::Value {
             serde_json::json!({
                 "ok": true,
@@ -763,6 +801,7 @@ mod tests {
                 "params": {},
             })
         }
+        #[cfg(feature = "qa")]
         fn qa_flow_telemetry(&self) -> serde_json::Value {
             serde_json::json!({
                 "ok": true,
@@ -779,15 +818,19 @@ mod tests {
                 },
             })
         }
+        #[cfg(feature = "qa")]
         fn qa_autotune_state(&self) -> serde_json::Value {
             serde_json::json!({ "ok": true, "enabled": false, "current_strategy_id": null })
         }
+        #[cfg(feature = "qa")]
         fn qa_autotune_decision_log(&self) -> serde_json::Value {
             serde_json::json!({ "ok": true, "decisions": [] })
         }
+        #[cfg(feature = "qa")]
         fn qa_windivert_stats(&self) -> serde_json::Value {
             serde_json::json!({ "ok": true, "recv": 0u64, "drop": 0u64, "queue_len": 0u64 })
         }
+        #[cfg(feature = "qa")]
         fn qa_driver_service_stats(&self) -> serde_json::Value {
             serde_json::json!({
                 "ok": true,
@@ -796,12 +839,15 @@ mod tests {
                 "windivert_ok": true,
             })
         }
+        #[cfg(feature = "qa")]
         fn qa_reset_state(&self) -> serde_json::Value {
             serde_json::json!({ "ok": true, "reset": "state" })
         }
+        #[cfg(feature = "qa")]
         fn qa_reset_telemetry(&self) -> serde_json::Value {
             serde_json::json!({ "ok": true, "reset": "telemetry" })
         }
+        #[cfg(feature = "qa")]
         fn qa_export_test_report(&self) -> serde_json::Value {
             serde_json::json!({ "ok": true, "report": { "version": env!("CARGO_PKG_VERSION") } })
         }

@@ -473,6 +473,10 @@ impl StrategyProfileRegistry {
     pub fn is_empty(&self) -> bool {
         self.profiles.is_empty()
     }
+
+    pub fn all_profiles(&self) -> &[StrategyProfile] {
+        &self.profiles
+    }
 }
 
 impl Default for StrategyProfileRegistry {
