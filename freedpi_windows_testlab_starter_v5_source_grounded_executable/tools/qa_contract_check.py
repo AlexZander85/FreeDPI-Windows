@@ -26,22 +26,41 @@ def call(base, method, path, data=None, api_key=''):
     except Exception as e:
         return {'reachable':False,'error':repr(e)}
 
-def flat_ok(res: dict[str,Any]) -> bool:
+def check_response(path: str, res: dict[str, Any], supported_map: dict[str, bool]) -> bool:
+    if not res.get('reachable'): return False
     b=res.get('body')
-    return bool(res.get('reachable') and isinstance(b,dict) and b.get('ok') is True)
+    if not isinstance(b,dict): return False
+    cap_name=path.replace('/qa/','')
+    if cap_name in supported_map and not supported_map[cap_name]:
+        return b.get('ok') is False and b.get('unsupported') is True
+    return b.get('ok') is True
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--base',default='http://127.0.0.1:11337'); ap.add_argument('--api-key',default=''); ap.add_argument('--json-out',default='qa_contract.json')
     a=ap.parse_args(); rows=[]
+    
+    # 1. Fetch capabilities first
+    cap_res=call(a.base,'GET','/qa/capabilities',api_key=a.api_key)
+    supported_map={}
+    if cap_res.get('reachable') and isinstance(cap_res.get('body'), dict):
+        caps=cap_res['body'].get('capabilities', [])
+        for cap in caps:
+            if isinstance(cap, dict) and 'name' in cap and 'supported' in cap:
+                supported_map[cap['name']]=cap['supported']
+
     for p in REQUIRED_GET:
-        r=call(a.base,'GET',p,api_key=a.api_key); rows.append({'method':'GET','path':p,'required':True,'flat_ok':flat_ok(r),'result':r})
+        r=call(a.base,'GET',p,api_key=a.api_key)
+        rows.append({'method':'GET','path':p,'required':True,'flat_ok':check_response(p,r,supported_map),'result':r})
     for p in REQUIRED_POST:
-        r=call(a.base,'POST',p,{},api_key=a.api_key); rows.append({'method':'POST','path':p,'required':True,'flat_ok':flat_ok(r),'result':r})
+        r=call(a.base,'POST',p,{},api_key=a.api_key)
+        rows.append({'method':'POST','path':p,'required':True,'flat_ok':check_response(p,r,supported_map),'result':r})
+        
     forbidden=[]
     for p in FORBIDDEN:
         for m in ('GET','POST'):
             r=call(a.base,m,p,{},api_key=a.api_key)
             if r.get('reachable'): forbidden.append({'method':m,'path':p,'result':r})
+            
     summary={'required_total':len(rows),'required_flat_ok':sum(1 for r in rows if r['flat_ok']),'forbidden_reachable':len(forbidden)}
     out={'ok':summary['required_total']==summary['required_flat_ok'] and not forbidden,'summary':summary,'endpoints':rows,'forbidden':forbidden}
     Path(a.json_out).write_text(json.dumps(out,indent=2,ensure_ascii=False),encoding='utf-8')

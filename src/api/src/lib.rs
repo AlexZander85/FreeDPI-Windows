@@ -399,9 +399,16 @@ async fn qa_capabilities_handler(State(state): State<Arc<ApiState>>) -> impl Int
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "capabilities": [
-            "flow_telemetry", "strategy_inventory", "runtime_strategy_snapshot",
-            "windivert_stats", "driver_service_stats",
-            "reset_state", "reset_telemetry", "export_test_report"
+            {"name": "flow_telemetry", "supported": true, "reason": serde_json::Value::Null},
+            {"name": "strategy_inventory", "supported": true, "reason": serde_json::Value::Null},
+            {"name": "runtime_strategy_snapshot", "supported": true, "reason": serde_json::Value::Null},
+            {"name": "windivert_stats", "supported": true, "reason": serde_json::Value::Null},
+            {"name": "driver_service_stats", "supported": true, "reason": serde_json::Value::Null},
+            {"name": "reset_state", "supported": true, "reason": serde_json::Value::Null},
+            {"name": "reset_telemetry", "supported": false, "reason": "telemetry_counters_are_monotonic"},
+            {"name": "autotune_state", "supported": false, "reason": "autotune_state_not_implemented"},
+            {"name": "autotune_decision_log", "supported": false, "reason": "autotune_decision_log_not_implemented"},
+            {"name": "export_test_report", "supported": true, "reason": serde_json::Value::Null}
         ],
         "windivert_ok": state.engine.windivert_ok(),
         "uptime_seconds": state.engine.uptime(),

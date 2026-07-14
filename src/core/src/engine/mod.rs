@@ -474,6 +474,10 @@ pub struct ProcessingPipeline {
     pub qa_last_tuned_strategy_id: std::sync::Arc<std::sync::atomic::AtomicI32>,
     #[cfg(feature = "qa")]
     pub qa_last_tuned_time_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "qa")]
+    pub qa_session_salt: u64,
+    #[cfg(feature = "qa")]
+    pub qa_salt_id: String,
 }
 
 /// Проверяет, содержит ли TLS ClientHello non-empty session_ticket extension.
@@ -799,6 +803,15 @@ impl ProcessingPipeline {
             qa_last_tuned_strategy_id: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1)),
             #[cfg(feature = "qa")]
             qa_last_tuned_time_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "qa")]
+            qa_session_salt: {
+                let bytes = uuid::Uuid::new_v4().into_bytes();
+                u64::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ])
+            },
+            #[cfg(feature = "qa")]
+            qa_salt_id: uuid::Uuid::new_v4().to_string(),
         })
     }
 
@@ -944,6 +957,15 @@ impl ProcessingPipeline {
             qa_last_tuned_strategy_id: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1)),
             #[cfg(feature = "qa")]
             qa_last_tuned_time_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "qa")]
+            qa_session_salt: {
+                let bytes = uuid::Uuid::new_v4().into_bytes();
+                u64::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ])
+            },
+            #[cfg(feature = "qa")]
+            qa_salt_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -2942,6 +2964,7 @@ impl ProcessingPipeline {
         let target_hash = {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.qa_session_salt.hash(&mut hasher);
             target_str.hash(&mut hasher);
             format!("{:016x}", hasher.finish())
         };
@@ -2996,6 +3019,7 @@ impl ProcessingPipeline {
         let record = serde_json::json!({
             "flow_id": flow_id,
             "target_hash": target_hash,
+            "salt_id": self.qa_salt_id.clone(),
             "protocol": protocol,
             "observed_by_windivert": true,
             "classifier": classifier_name,

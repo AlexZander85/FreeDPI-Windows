@@ -36,16 +36,37 @@ def main():
     profiles=[p for p in inv.get('live_profiles',[]) if p.get('strategy_id') is not None]
     if a.limit: profiles=profiles[:a.limit]
     for p in profiles:
-        sid=p['strategy_id']; name=p.get('name')
+        sid=p['strategy_id']; name=p.get('name'); category=p.get('category','')
         tune=call(a.base,'POST','/api/v1/strategies/tune',a.api_key,{'strategy_id':sid,'params':{},'persist':False})
         if not tune.get('ok'):
             rows.append({'strategy_id':sid,'name':name,'status':'unsupported','unsupported_reasons':['production_tune_endpoint_unreachable'],'details':tune}); continue
         snap=call(a.base,'GET','/qa/runtime_strategy_snapshot',a.api_key)
         telemetry_before=call(a.base,'GET','/qa/flow_telemetry',a.api_key)
         tg=Path(__file__).with_name('trafficgen_client.py')
-        traffic=subprocess.run([sys.executable,str(tg),'tcp-connect','--host','127.0.0.1','--port','80'],text=True,capture_output=True,timeout=15)
+        
+        # 1. Select scenario by category
+        if category == 'Tls':
+            scenario = 'tls-handshake'
+            traffic_args = ['--host', '127.0.0.1', '--port', '443', '--server-name', 'localhost']
+        elif category == 'Quic':
+            scenario = 'udp-quic-like'
+            traffic_args = ['--host', '127.0.0.1', '--port', '443']
+        elif category == 'Dns':
+            scenario = 'dns-udp'
+            traffic_args = ['--server', '127.0.0.1', '--port', '53', '--qname', 'example.com']
+        elif category == 'Http':
+            scenario = 'http-get'
+            traffic_args = ['--url', 'http://127.0.0.1:8080/']
+        else:
+            scenario = 'tcp-connect'
+            traffic_args = ['--host', '127.0.0.1', '--port', '80']
+
+        cmd = [sys.executable, str(tg), scenario] + traffic_args
+        traffic = subprocess.run(cmd, text=True, capture_output=True, timeout=15)
         time.sleep(0.2)
         telemetry_after=call(a.base,'GET','/qa/flow_telemetry',a.api_key)
+        
+        reasons=[]
         if not snap.get('ok'):
             status='unsupported'; reasons=['runtime_snapshot_missing']
         elif not telemetry_after.get('ok'):
@@ -56,8 +77,22 @@ def main():
                 status='fail'
                 reasons=['forced_strategy_id_mismatch']
             else:
-                status='pass'
-                reasons=[]
+                # 2. Check recent_flows for causal verification
+                generation = snap['body'].get('generation')
+                recent_flows = telemetry_after['body'].get('recent_flows', [])
+                is_switchable = category in ['Tls', 'Quic', 'Http']
+                recent_ok = False
+                for flow in recent_flows:
+                    if isinstance(flow, dict) and flow.get('observed_by_windivert') is True:
+                        if flow.get('strategy_generation') == generation:
+                            if not is_switchable or flow.get('runtime_profile_id') == sid:
+                                recent_ok = True
+                                break
+                if recent_ok:
+                    status='pass'
+                else:
+                    status='fail'
+                    reasons=['causal_flow_record_missing_in_telemetry']
         rows.append({'strategy_id':sid,'name':name,'status':status,'unsupported_reasons':reasons,'tune':tune,'snapshot':snap,'traffic_rc':traffic.returncode,'telemetry_before':telemetry_before,'telemetry_after':telemetry_after})
     report={'total':len(rows),'pass':sum(1 for r in rows if r['status']=='pass'),'unsupported':sum(1 for r in rows if r['status']=='unsupported'),'rows':rows}
     (outdir/'forced_strategy_smoke.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf-8')

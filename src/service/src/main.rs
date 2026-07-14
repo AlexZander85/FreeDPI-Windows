@@ -309,6 +309,34 @@ impl EngineHandle for ServiceEngine {
         if let Some(pipeline) = self.pipeline.get() {
             let registry = pipeline.profile_registry();
             for p in registry.all_profiles() {
+                let (force_sel, run_switch, run_switch_reason, unsupported_reasons) =
+                    match p.category {
+                        freedpi_core::adaptive::strategy::StrategyCategory::Tls => (
+                            true,
+                            true,
+                            serde_json::json!("active_profile_slot_tls"),
+                            serde_json::json!([]),
+                        ),
+                        freedpi_core::adaptive::strategy::StrategyCategory::Quic => (
+                            true,
+                            true,
+                            serde_json::json!("active_profile_slot_quic"),
+                            serde_json::json!([]),
+                        ),
+                        freedpi_core::adaptive::strategy::StrategyCategory::Http => (
+                            true,
+                            true,
+                            serde_json::json!("active_profile_slot_http"),
+                            serde_json::json!([]),
+                        ),
+                        _ => (
+                            false,
+                            false,
+                            serde_json::Value::Null,
+                            serde_json::json!(["no_active_profile_slot_for_category"]),
+                        ),
+                    };
+
                 live_profiles.push(serde_json::json!({
                     "name": p.name,
                     "strategy_id": p.strategy_id,
@@ -317,14 +345,16 @@ impl EngineHandle for ServiceEngine {
                     "description": p.description,
                     "source": "builtin",
                     "runtime_status": "live",
-                    "force_selectable": true,
+                    "force_selectable": force_sel,
+                    "runtime_switchable": run_switch,
+                    "runtime_switch_reason": run_switch_reason,
                     "auto_selectable": true,
-                    "unsupported_reasons": serde_json::json!([]),
+                    "unsupported_reasons": unsupported_reasons,
                 }));
             }
 
-            let recommended_ids = vec![1, 3, 4, 6, 7, 8, 9, 15, 35, 50, 60, 61, 70, 100];
-            for &rid in &recommended_ids {
+            let recommended_ids = freedpi_core::probe::strategy_map::known_recommendation_ids();
+            for &rid in recommended_ids {
                 if let Some(p) = registry.get_by_id(rid) {
                     probe_numeric_ids.push(serde_json::json!({
                         "strategy_id": rid,

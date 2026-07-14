@@ -26,6 +26,10 @@ pub struct StrategyRecommendation {
     pub rationale: String,
 }
 
+pub fn known_recommendation_ids() -> &'static [u32] {
+    &[1, 3, 4, 6, 7, 8, 9, 15, 35, 50, 60, 61, 70, 100]
+}
+
 /// Определить рекомендованные стратегии на основе результатов probe.
 pub fn recommend(result: &ProbeResult) -> Vec<StrategyRecommendation> {
     let mut recs = Vec::new();
